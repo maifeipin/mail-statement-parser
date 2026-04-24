@@ -2,7 +2,7 @@
 """163 邮箱邮件技能 - 支持发送、读取、搜索、下载（含 HTML 表格解析）"""
 
 import json, os, sys, smtplib, imaplib, poplib, email, re, glob
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from decimal import Decimal, InvalidOperation
 from email.mime.text import MIMEText
 from email.header import decode_header
@@ -143,6 +143,66 @@ def _resolve_monthly_day_date(v, statement_month):
         return datetime(year, month, day).date().isoformat()
     except ValueError:
         return None
+
+
+def _infer_cmb_due_date(body_text, statement_date):
+    """招商账单还款日兜底：优先标签匹配，失败时按账单日+18天择优估算。"""
+    if not body_text:
+        return None
+
+    # 1) 优先从中英标签附近提取
+    label_patterns = [
+        r'(?:到期还款日|最后还款日|Payment\s*Due\s*Date)\D{0,24}(20\d{2}[/-]\d{1,2}[/-]\d{1,2})',
+        r'(?:到期还款日|最后还款日|Payment\s*Due\s*Date)\D{0,24}(20\d{2}年\d{1,2}月\d{1,2}日)',
+    ]
+    for p in label_patterns:
+        m = re.search(p, body_text, flags=re.IGNORECASE)
+        if not m:
+            continue
+        d = _parse_date(m.group(1), ['%Y-%m-%d', '%Y/%m/%d', '%Y年%m月%d日'])
+        if d:
+            return d
+
+    # 2) 标签缺失时，从正文日期候选中按 statement_date+18 天择优
+    if not statement_date:
+        return None
+    try:
+        stmt_dt = datetime.strptime(statement_date, '%Y-%m-%d').date()
+    except ValueError:
+        return None
+
+    candidates = set(re.findall(r'(20\d{2}[/-]\d{1,2}[/-]\d{1,2})', body_text))
+    if not candidates:
+        return None
+
+    parsed_candidates = []
+    for c in candidates:
+        d = _parse_date(c, ['%Y-%m-%d', '%Y/%m/%d'])
+        if not d:
+            continue
+        try:
+            dd = datetime.strptime(d, '%Y-%m-%d').date()
+        except ValueError:
+            continue
+        # 常见信用卡还款日在账单日后 7~40 天内
+        if stmt_dt <= dd <= stmt_dt + timedelta(days=40):
+            parsed_candidates.append(dd)
+
+    if not parsed_candidates:
+        return None
+
+    expected = stmt_dt + timedelta(days=18)
+    best = min(parsed_candidates, key=lambda x: (abs((x - expected).days), x))
+    return best.isoformat()
+
+
+def _apply_due_date_fallbacks(rule, body_text, fields):
+    """银行特定兜底：当 due_date 为空时尝试补齐。"""
+    if fields.get('due_date'):
+        return
+    bank_code = (rule or {}).get('bank_code')
+    if bank_code == 'CMB':
+        fields['due_date'] = _infer_cmb_due_date(body_text, fields.get('statement_date'))
 
 
 def _infer_date_from_mmdd(mmdd, statement_month):
@@ -345,6 +405,66 @@ def parse_spdb_transactions_from_markdown(uid, statement_month, markdown_text):
         )
     return rows
 
+
+def parse_icbc_transactions_from_markdown(uid, statement_month, markdown_text):
+    """从工行账单 Markdown 表中提取交易明细。"""
+    if not markdown_text:
+        return []
+    rows = []
+    seen = set()
+    for line in markdown_text.splitlines():
+        s = line.strip()
+        if not s.startswith('|'):
+            continue
+        cols = [c.strip() for c in s.strip('|').split('|')]
+        if len(cols) < 7:
+            continue
+        if any(x in s for x in ('交易日', '记账日', '---', '主卡明细', '卡号后四位')):
+            continue
+
+        if not re.match(r'^\d{4}$', cols[0]):
+            continue
+        if not re.match(r'^\d{4}-\d{2}-\d{2}$', cols[1]):
+            continue
+        if not re.match(r'^\d{4}-\d{2}-\d{2}$', cols[2]):
+            continue
+
+        desc = cols[4]
+        if not desc:
+            continue
+
+        book_col = cols[6]
+        d = _safe_decimal(book_col, [',', ' ', '￥', '¥', '/RMB', '/CNY', '(支出)', '(收入)'])
+        if d is None:
+            continue
+
+        direction = 'debit'
+        if '收入' in book_col:
+            d = -d
+            direction = 'credit'
+        elif '支出' in book_col:
+            direction = 'debit'
+
+        key = (cols[0], cols[1], cols[2], desc, str(d))
+        if key in seen:
+            continue
+        seen.add(key)
+
+        rows.append(
+            StatementTransactionRecord(
+                uid=str(uid),
+                bank_code='ICBC',
+                txn_date=_parse_date(cols[1], ['%Y-%m-%d']),
+                post_date=_parse_date(cols[2], ['%Y-%m-%d']),
+                description=desc,
+                amount=str(d),
+                currency='CNY',
+                direction=direction,
+                raw_row_json=json.dumps({'cols': cols}, ensure_ascii=False),
+            )
+        )
+    return rows
+
 def load_rule_files():
     """加载规则文件（当前支持 JSON）。"""
     os.makedirs(RULES_DIR, exist_ok=True)
@@ -423,6 +543,8 @@ def extract_statement_by_rule(rule, subject, body_text):
 
     if fields.get('due_date'):
         fields['due_date'] = _parse_date(fields['due_date'], date_formats)
+
+    _apply_due_date_fallbacks(rule, body_text, fields)
 
     for amt_key in ('total_due', 'minimum_due'):
         if fields.get(amt_key) is not None:
@@ -556,6 +678,7 @@ def show_statement_report(months=3):
         'CMB': '招商银行',
         'SPDB': '浦发银行',
         'CMBC': '民生银行',
+        'ICBC': '工商银行',
     }
 
     print(f'📊 最近 {months} 个月按银行/月份汇总\n')
@@ -719,6 +842,8 @@ def validate_email_by_uid(uid):
             txns = parse_cmb_transactions_from_markdown(uid, statement.statement_month, content.get('markdown', ''))
         elif statement.bank_code == 'SPDB':
             txns = parse_spdb_transactions_from_markdown(uid, statement.statement_month, content.get('markdown', ''))
+        elif statement.bank_code == 'ICBC':
+            txns = parse_icbc_transactions_from_markdown(uid, statement.statement_month, content.get('markdown', ''))
         if txns:
             txn_count = replace_transactions(DB_PATH, str(uid), statement.bank_code, txns)
 
@@ -1136,7 +1261,7 @@ def download_recent_bank_emails(months=3, output_dir=None):
         print('❌ 未找到规则文件，请先在 rules 目录下放置 *.json')
         return
 
-    target_banks = {'HX', 'CMB', 'SPDB', 'CMBC'}
+    target_banks = {'HX', 'CMB', 'SPDB', 'CMBC', 'ICBC'}
     candidates, stats = _collect_recent_bill_uids(months, rules, target_banks)
     cutoff = stats['cutoff']
     keyword_map = stats['keyword_map']
@@ -1205,7 +1330,7 @@ def validate_recent_bank_emails(months=3):
         print('❌ 未找到规则文件，请先在 rules 目录下放置 *.json')
         return
 
-    target_banks = {'HX', 'CMB', 'SPDB', 'CMBC'}
+    target_banks = {'HX', 'CMB', 'SPDB', 'CMBC', 'ICBC'}
     candidates, stats = _collect_recent_bill_uids(months, rules, target_banks)
     cutoff = stats['cutoff']
 
@@ -1244,6 +1369,148 @@ def validate_recent_bank_emails(months=3):
         f'\n✅ 执行完成：成功 {ok} 封，已在库跳过 {skipped_db} 封，失败 {fail} 封，'
         f'过期邮件 {skipped_old} 封，未匹配 {skipped_unmatched} 封，异常 {skipped_error} 封'
     )
+
+
+def due_soon_bank_bills(months=3, days=7, output_dir=None):
+    """专用指令：先下载账单，再提取还款日并提示 N 天内到期账单。"""
+    rules = load_rule_files()
+    if not rules:
+        print('❌ 未找到规则文件，请先在 rules 目录下放置 *.json')
+        return
+
+    target_banks = {'HX', 'CMB', 'SPDB', 'CMBC', 'ICBC'}
+    candidates, stats = _collect_recent_bill_uids(months, rules, target_banks)
+    cutoff = stats['cutoff']
+
+    if output_dir is None:
+        output_dir = DOWNLOAD_DIR
+    os.makedirs(output_dir, exist_ok=True)
+
+    bank_name_map = {
+        'HX': '华夏银行',
+        'CMB': '招商银行',
+        'SPDB': '浦发银行',
+        'CMBC': '民生银行',
+        'ICBC': '工商银行',
+    }
+
+    print(f'🚀 执行专用指令：下载并检查最近 {months} 个月账单到期日（阈值 {days} 天）')
+    print(f'📅 时间范围：{cutoff.date().isoformat()} ~ {datetime.now(timezone.utc).date().isoformat()}')
+
+    if not candidates:
+        print(
+            f'📭 没有可处理账单：跳过旧邮件 {stats["skipped_old"]} 封，'
+            f'未匹配 {stats["skipped_unmatched"]} 封，异常 {stats["skipped_error"]} 封'
+        )
+        return
+
+    downloaded = 0
+    skipped_existing = 0
+    warn_missing_due = []
+    due_soon_items = []
+    failed = 0
+
+    today = datetime.now().date()
+
+    try:
+        config = load_config()
+        mail = poplib.POP3_SSL(config['email']['pop3']['host'], config['email']['pop3']['port'])
+        mail.user(config['email']['account'])
+        mail.pass_(config['email']['authCode'])
+
+        for uid in candidates:
+            try:
+                _, headers, _ = mail.retr(int(uid))
+                msg = email.message_from_bytes(b'\r\n'.join(headers))
+
+                existing = [f for f in os.listdir(output_dir) if f.startswith(f'email_uid{uid}_')]
+                if existing:
+                    skipped_existing += 1
+                else:
+                    _save_email_message(uid, msg, output_dir=output_dir, format='md')
+                    downloaded += 1
+
+                subj = decode_mime(msg.get('Subject', ''))
+                frm = decode_mime(msg.get('From', ''))
+                content = extract_email_content(msg)
+                body_text = (content.get('plain', '') + '\n' + content.get('markdown', '')).strip()
+
+                rule, _ = identify_rule(subj, frm, body_text, rules)
+                if not rule:
+                    warn_missing_due.append({
+                        'uid': str(uid),
+                        'bank_code': '-',
+                        'subject': subj,
+                        'reason': '未匹配到规则',
+                    })
+                    continue
+
+                fields = extract_statement_by_rule(rule, subj, body_text)
+                due_date = fields.get('due_date')
+                total_due = fields.get('total_due')
+                bank_code = rule.get('bank_code', '-')
+
+                if not due_date:
+                    warn_missing_due.append({
+                        'uid': str(uid),
+                        'bank_code': bank_code,
+                        'subject': subj,
+                        'reason': '未提取到还款日',
+                    })
+                    continue
+
+                due_dt = _parse_date(due_date, ['%Y-%m-%d'])
+                if not due_dt:
+                    warn_missing_due.append({
+                        'uid': str(uid),
+                        'bank_code': bank_code,
+                        'subject': subj,
+                        'reason': f'还款日格式异常: {due_date}',
+                    })
+                    continue
+
+                days_left = (datetime.strptime(due_dt, '%Y-%m-%d').date() - today).days
+                if 0 <= days_left <= int(days):
+                    due_soon_items.append({
+                        'uid': str(uid),
+                        'bank_code': bank_code,
+                        'bank_name': bank_name_map.get(bank_code, '未知银行'),
+                        'due_date': due_dt,
+                        'days_left': days_left,
+                        'total_due': total_due or '-',
+                        'subject': subj,
+                    })
+            except Exception:
+                failed += 1
+                continue
+
+        try:
+            mail.quit()
+        except Exception:
+            pass
+    except Exception as e:
+        print(f'❌ 到期日检查失败：{e}')
+        return
+
+    print(
+        f'\n✅ 执行完成：候选 {len(candidates)} 封，新增下载 {downloaded} 封，已下载跳过 {skipped_existing} 封，处理失败 {failed} 封'
+    )
+
+    if warn_missing_due:
+        print('\n⚠️ 还款日提取警告：')
+        for x in warn_missing_due:
+            print(f"  - UID={x['uid']} bank={x['bank_code']} reason={x['reason']} subj={x['subject'][:60]}")
+
+    if due_soon_items:
+        print(f'\n⏰ 还款日接近 {days} 天的账单：')
+        due_soon_items.sort(key=lambda x: (x['days_left'], x['due_date']))
+        for x in due_soon_items:
+            print(
+                f"  - {x['bank_code']}({x['bank_name']}) UID={x['uid']} due={x['due_date']} "
+                f"days_left={x['days_left']} total_due={x['total_due']}"
+            )
+    else:
+        print(f'\n📭 最近 {months} 个月内暂无还款日接近 {days} 天的账单')
 
 def download_email_pop3(uid, output_dir=None, format='md'):
     """下载邮件，支持 HTML 表格解析"""
@@ -1310,6 +1577,7 @@ def main():
   python mail_client.py search <kw> [limit]               - 搜索邮件
   python mail_client.py download <uid> [--html] [--md]    - 下载邮件 (支持表格)
     python mail_client.py download_bank_bills [months]      - 专用指令：下载多银行最近N个月账单
+        python mail_client.py due_soon_bills [months] [days]    - 专用指令：下载并提醒N天内到期账单
     python mail_client.py validate_bank_bills [months]      - 专用指令：批量写库（无需UID）
     python mail_client.py classify <uid>                    - 规则匹配（模板识别）
     python mail_client.py validate <uid>                    - 规则解析与校验报告
@@ -1323,6 +1591,7 @@ def main():
   python mail_client.py download 9982 --html
   python mail_client.py download 9982 --md
     python mail_client.py download_bank_bills
+        python mail_client.py due_soon_bills 3 7
     python mail_client.py validate_bank_bills 3
     python mail_client.py txns_over 500
     python mail_client.py txns_over 500 3
@@ -1361,6 +1630,10 @@ def main():
     elif cmd in ('download_bank_bills', 'exec3m'):
         months = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2].isdigit() else 3
         download_recent_bank_emails(months)
+    elif cmd == 'due_soon_bills':
+        months = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2].isdigit() else 3
+        days = int(sys.argv[3]) if len(sys.argv) > 3 and sys.argv[3].isdigit() else 7
+        due_soon_bank_bills(months, days)
     elif cmd in ('validate_bank_bills', 'validate3m'):
         months = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2].isdigit() else 3
         validate_recent_bank_emails(months)
