@@ -11,7 +11,11 @@ from html.parser import HTMLParser
 from statement_models import StatementRecord, ValidationIssue, ValidationResult, StatementTransactionRecord
 from statement_db import init_db, upsert_statement, save_validation_run, replace_transactions, get_recent_statements, get_summary_by_bank_month, get_reconciliation_rows, uid_exists, get_transactions_above_amount
 
-CONFIG_PATH = os.path.expanduser('email-config.json')
+CONFIG_CANDIDATES = [
+    os.path.expanduser('email-config.local.json'),
+    os.path.expanduser('email-config.json'),
+    os.path.expanduser('email-config.example.json'),
+]
 DOWNLOAD_DIR = os.path.expanduser('email-downloads')
 RULES_DIR = os.path.expanduser('rules')
 VALIDATION_REPORT_DIR = os.path.expanduser('validation-reports')
@@ -51,8 +55,11 @@ class HTMLTableParser(HTMLParser):
 
 def load_config():
     try:
-        with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
-            return json.load(f)
+        for config_path in CONFIG_CANDIDATES:
+            if os.path.exists(config_path):
+                with open(config_path, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+        raise FileNotFoundError('未找到配置文件：email-config.local.json / email-config.json / email-config.example.json')
     except Exception as e:
         print(f'错误：配置文件 - {e}')
         sys.exit(1)

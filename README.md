@@ -26,7 +26,7 @@
 - [rules/CMBC_TEMPLATE_V1.json](rules/CMBC_TEMPLATE_V1.json)：民生规则模板
 - [rules/HX_TEMPLATE_V1.json](rules/HX_TEMPLATE_V1.json)：华夏规则模板
 - [rules/SPDB_TEMPLATE_V1.json](rules/SPDB_TEMPLATE_V1.json)：浦发规则模板
-- [email-config.json](email-config.json)：示例邮箱配置
+- [email-config.example.json](email-config.example.json)：示例邮箱配置
 
 ## 环境要求
 
@@ -35,7 +35,21 @@
 
 ## 配置
 
-项目中的 [email-config.json](email-config.json) 是脱敏后的示例配置，请替换为你自己的邮箱参数：
+项目中的 [email-config.example.json](email-config.example.json) 是脱敏后的示例配置。
+
+推荐做法：
+
+- 复制一份为 `email-config.local.json`
+- 在 `email-config.local.json` 中填写你自己的邮箱参数
+- `email-config.local.json` 已加入 [.gitignore](.gitignore)，不会被推送到 GitHub
+
+程序读取优先级：
+
+1. `email-config.local.json`
+2. `email-config.json`
+3. `email-config.example.json`
+
+示例配置：
 
 ```json
 {
@@ -92,6 +106,7 @@ python .\mail_client.py txns_over 500 3
 
 仓库已通过 [.gitignore](.gitignore) 排除以下本地运行产物：
 
+- `email-config.local.json`
 - `email-downloads/`
 - `validation-reports/`
 - `statements.db`

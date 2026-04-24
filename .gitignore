@@ -2,6 +2,8 @@
 __pycache__/
 *.pyc
 
+email-config.local.json
+
 statements.db
 email-downloads/
 validation-reports/
