@@ -1,0 +1,95 @@
+{
+  "schema_version": "1.0",
+  "rule_id": "HX_TEMPLATE_V1",
+  "bank_code": "HX",
+  "status": "active",
+  "priority": 100,
+  "match_rules": {
+    "sender_patterns": [
+      "admin@creditcardmail.hxb.com.cn"
+    ],
+    "subject_patterns": [
+      "华夏信用卡-电子账单"
+    ],
+    "body_signatures": [
+      "账单日",
+      "到期还款日"
+    ]
+  },
+  "extract_rules": {
+    "statement_fields": {
+      "statement_month": {
+        "type": "regex",
+        "source": "subject",
+        "pattern": "((?:20\\d{2})年(?:0?[1-9]|1[0-2])月)",
+        "required": true
+      },
+      "statement_date": {
+        "type": "regex",
+        "source": "body_text",
+        "pattern": "(?:账单日)\\s*(每月\\d{1,2}日|20\\d{2}[-/.年]\\d{1,2}[-/.月]\\d{1,2}(?:日)?)",
+        "required": true
+      },
+      "due_date": {
+        "type": "regex",
+        "source": "body_text",
+        "pattern": "(?:到期还款日|最后还款日)\\s*(20\\d{2}[-/.年]\\d{1,2}[-/.月]\\d{1,2}(?:日)?)",
+        "required": true
+      },
+      "total_due": {
+        "type": "regex",
+        "source": "body_text",
+        "pattern": "(?:本期应还金额|本期应还款)\\s*[＄$]?[0-9,]+(?:\\.[0-9]{1,2})?\\s*[￥$]?([+-]?[0-9,]+(?:\\.[0-9]{1,2})?)",
+        "required": false
+      },
+      "minimum_due": {
+        "type": "regex",
+        "source": "body_text",
+        "pattern": "(?:最低还款额|最低应还款)\\s*[＄$]?[0-9,]+(?:\\.[0-9]{1,2})?\\s*[￥$]?([+-]?[0-9,]+(?:\\.[0-9]{1,2})?)",
+        "required": false
+      }
+    }
+  },
+  "normalize_rules": {
+    "date_formats": [
+      "%Y-%m-%d",
+      "%Y/%m/%d",
+      "%Y.%m.%d",
+      "%Y年%m月%d日",
+      "%Y年%m月%d"
+    ],
+    "amount_strip_tokens": [
+      ",",
+      " ",
+      "RMB",
+      "CNY",
+      "￥"
+    ]
+  },
+  "validate_rules": {
+    "required_statement_fields": [
+      "statement_month",
+      "statement_date",
+      "due_date"
+    ],
+    "rules": [
+      {
+        "id": "due_date_not_earlier",
+        "severity": "error",
+        "type": "date_compare",
+        "left": "due_date",
+        "op": ">=",
+        "right": "statement_date"
+      },
+      {
+        "id": "minimum_le_total",
+        "severity": "warning",
+        "type": "amount_compare",
+        "left": "minimum_due",
+        "op": "<=",
+        "right": "total_due",
+        "skip_if_missing": true
+      }
+    ]
+  }
+}

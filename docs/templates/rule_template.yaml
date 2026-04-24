@@ -1,0 +1,118 @@
+schema_version: 1.0
+rule_id: BANK_TEMPLATE_V1
+bank_code: HX
+status: active
+
+metadata:
+  owner: parser-team
+  created_at: 2026-04-24
+  notes: Deterministic statement parser rules
+
+match_rules:
+  sender_patterns:
+    - "admin@creditcardmail.hxb.com.cn"
+  subject_patterns:
+    - "华夏信用卡-电子账单"
+  body_signatures:
+    - "账单日"
+    - "到期还款日"
+
+extract_rules:
+  statement_fields:
+    statement_month:
+      type: regex
+      source: subject
+      pattern: "(20\\d{2})年(0?[1-9]|1[0-2])月"
+      required: true
+    statement_date:
+      type: regex
+      source: body_text
+      pattern: "账单日[:：]\\s*(20\\d{2}[-/.年]\\d{1,2}[-/.月]\\d{1,2})"
+      required: true
+    due_date:
+      type: regex
+      source: body_text
+      pattern: "到期还款日[:：]\\s*(20\\d{2}[-/.年]\\d{1,2}[-/.月]\\d{1,2})"
+      required: true
+    total_due:
+      type: regex
+      source: body_text
+      pattern: "本期应还金额[:：]\\s*([+-]?[0-9,]+(?:\\.[0-9]{1,2})?)"
+      required: true
+    minimum_due:
+      type: regex
+      source: body_text
+      pattern: "最低还款额[:：]\\s*([+-]?[0-9,]+(?:\\.[0-9]{1,2})?)"
+      required: true
+
+  transaction_table:
+    source: html_table
+    table_selector:
+      header_contains_all: ["交易日期", "交易描述", "交易金额"]
+    columns:
+      txn_date: "交易日期"
+      description: "交易描述"
+      amount: "交易金额"
+      merchant: "交易地点"
+      currency: "币种"
+
+normalize_rules:
+  dates:
+    input_formats:
+      - "%Y-%m-%d"
+      - "%Y/%m/%d"
+      - "%Y年%m月%d日"
+    output_format: "%Y-%m-%d"
+  amounts:
+    strip_chars: [",", " ", "RMB", "CNY", "￥"]
+    decimal_places: 2
+    type: decimal
+  direction_inference:
+    debit_keywords: ["消费", "支出", "扣款"]
+    credit_keywords: ["还款", "退款", "入账"]
+
+validate_rules:
+  required_statement_fields:
+    - statement_month
+    - statement_date
+    - due_date
+    - total_due
+    - minimum_due
+  statement_checks:
+    - id: due_date_not_earlier
+      expr: "due_date >= statement_date"
+      severity: error
+    - id: minimum_le_total
+      expr: "minimum_due <= total_due"
+      severity: error
+  transaction_checks:
+    - id: txn_required
+      expr: "txn_date != '' and description != '' and amount is not null"
+      severity: error
+  reconcile_checks:
+    - id: sum_consistency
+      expr: "abs(txn_sum - statement_txn_sum) <= 0.01"
+      severity: warning
+
+output_mapping:
+  statement:
+    bank_code: "HX"
+    card_last4: "card_last4"
+    statement_month: "statement_month"
+    statement_date: "statement_date"
+    due_date: "due_date"
+    total_due: "total_due"
+    minimum_due: "minimum_due"
+  transactions:
+    txn_date: "txn_date"
+    description: "description"
+    amount: "amount"
+    merchant: "merchant"
+    currency: "currency"
+
+error_codes:
+  - PARSE_NO_TEMPLATE_MATCH
+  - PARSE_REQUIRED_FIELD_MISSING
+  - PARSE_INVALID_DATE
+  - PARSE_INVALID_AMOUNT
+  - VALIDATION_RECONCILE_FAIL

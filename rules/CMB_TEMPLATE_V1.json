@@ -1,0 +1,102 @@
+{
+  "schema_version": "1.0",
+  "rule_id": "CMB_TEMPLATE_V1",
+  "bank_code": "CMB",
+  "status": "active",
+  "priority": 95,
+  "match_rules": {
+    "sender_patterns": [
+      "ccsvc@message.cmbchina.com"
+    ],
+    "subject_patterns": [
+      "招商银行信用卡电子账单"
+    ],
+    "body_signatures": [
+      "账单日",
+      "到期还款日",
+      "本期应还金额"
+    ]
+  },
+  "extract_rules": {
+    "statement_fields": {
+      "statement_month": {
+        "type": "regex",
+        "source": "body_text",
+        "pattern": "(20\\d{2}/\\d{2}/\\d{2})\\s*-\\s*(20\\d{2}/\\d{2}/\\d{2})",
+        "group": 2,
+        "required": true
+      },
+      "statement_date": {
+        "type": "regex",
+        "source": "body_text",
+        "pattern": "(20\\d{2}/\\d{2}/\\d{2})\\s*-\\s*(20\\d{2}/\\d{2}/\\d{2})",
+        "group": 2,
+        "required": true
+      },
+      "due_date": {
+        "type": "regex",
+        "source": "body_text",
+        "pattern": "(?:到期还款日|最后还款日)[:：]?\\s*(20\\d{2}[-/.年]\\d{1,2}[-/.月]\\d{1,2}(?:日)?)",
+        "required": false
+      },
+      "total_due": {
+        "type": "regex",
+        "source": "body_text",
+        "pattern": "\\|\\s*\\|\\s*\\|\\s*[¥￥]\\s*([0-9,]+(?:\\.[0-9]{1,2})?)\\s*\\|\\s*\\|\\s*[¥￥]\\s*([0-9,]+(?:\\.[0-9]{1,2})?)\\s*\\|",
+        "group": 1,
+        "required": true
+      },
+      "minimum_due": {
+        "type": "regex",
+        "source": "body_text",
+        "pattern": "\\|\\s*\\|\\s*\\|\\s*[¥￥]\\s*([0-9,]+(?:\\.[0-9]{1,2})?)\\s*\\|\\s*\\|\\s*[¥￥]\\s*([0-9,]+(?:\\.[0-9]{1,2})?)\\s*\\|",
+        "group": 2,
+        "required": true
+      }
+    }
+  },
+  "normalize_rules": {
+    "date_formats": [
+      "%Y-%m-%d",
+      "%Y/%m/%d",
+      "%Y.%m.%d",
+      "%Y年%m月%d日",
+      "%Y年%m月%d"
+    ],
+    "amount_strip_tokens": [
+      ",",
+      " ",
+      "RMB",
+      "CNY",
+      "￥"
+    ]
+  },
+  "validate_rules": {
+    "required_statement_fields": [
+      "statement_month",
+      "statement_date",
+      "total_due",
+      "minimum_due"
+    ],
+    "rules": [
+      {
+        "id": "due_date_not_earlier",
+        "severity": "warning",
+        "type": "date_compare",
+        "left": "due_date",
+        "op": ">=",
+        "right": "statement_date",
+        "skip_if_missing": true
+      },
+      {
+        "id": "minimum_le_total",
+        "severity": "warning",
+        "type": "amount_compare",
+        "left": "minimum_due",
+        "op": "<=",
+        "right": "total_due",
+        "skip_if_missing": true
+      }
+    ]
+  }
+}

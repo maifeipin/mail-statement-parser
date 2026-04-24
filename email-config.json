@@ -1,0 +1,22 @@
+{
+  "email": {
+    "provider": "163",
+    "account": "yourmail@163.com",
+    "authCode": "authCode",
+    "smtp": {
+      "host": "smtp.163.com",
+      "port": 465,
+      "secure": true
+    },
+    "imap": {
+      "host": "imap.163.com",
+      "port": 993,
+      "secure": true
+    },
+    "pop3": {
+      "host": "pop.163.com",
+      "port": 995,
+      "secure": true
+    }
+  }
+}

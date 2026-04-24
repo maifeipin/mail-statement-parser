@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+
+statements.db
+email-downloads/
+validation-reports/
+
+.DS_Store
+Thumbs.db

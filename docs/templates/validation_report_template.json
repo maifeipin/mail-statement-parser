@@ -1,0 +1,92 @@
+{
+  "report_meta": {
+    "report_id": "2026-04-24-batch-001",
+    "generated_at": "2026-04-24T10:30:00Z",
+    "parser_version": "0.1.0",
+    "rule_pack_version": "2026.04",
+    "run_mode": "full|recent3m"
+  },
+  "scope": {
+    "bank_codes": ["HX", "CMB", "SPDB"],
+    "period_start": "2025-01-01",
+    "period_end": "2026-04-24",
+    "messages_scanned": 0,
+    "messages_parsed": 0,
+    "messages_failed": 0
+  },
+  "quality_metrics": {
+    "statement_required_field_completeness": 0.0,
+    "transaction_required_field_completeness": 0.0,
+    "required_amount_parse_success": 0.0,
+    "required_date_parse_success": 0.0,
+    "statement_reconcile_pass_rate": 0.0,
+    "transaction_reconcile_pass_rate": 0.0,
+    "determinism_hash_match_rate": 0.0
+  },
+  "thresholds": {
+    "statement_required_field_completeness": 1.0,
+    "transaction_required_field_completeness": 0.995,
+    "required_amount_parse_success": 1.0,
+    "required_date_parse_success": 1.0,
+    "statement_reconcile_pass_rate": 0.995,
+    "determinism_hash_match_rate": 1.0
+  },
+  "gate_result": {
+    "passed": false,
+    "blocking_reasons": []
+  },
+  "bank_breakdown": [
+    {
+      "bank_code": "HX",
+      "messages_scanned": 0,
+      "messages_parsed": 0,
+      "messages_failed": 0,
+      "parse_success_rate": 0.0,
+      "critical_failures": 0,
+      "top_errors": []
+    }
+  ],
+  "error_taxonomy": [
+    {
+      "error_code": "PARSE_REQUIRED_FIELD_MISSING",
+      "count": 0,
+      "severity": "error",
+      "samples": [
+        {
+          "message_uid": "",
+          "message_id": "",
+          "bank_code": "",
+          "rule_id": "",
+          "field": "",
+          "source_ref": "",
+          "raw_excerpt": ""
+        }
+      ]
+    }
+  ],
+  "reconciliation_samples": [
+    {
+      "message_uid": "",
+      "bank_code": "",
+      "statement_total": "0.00",
+      "txn_sum": "0.00",
+      "delta": "0.00",
+      "within_tolerance": true
+    }
+  ],
+  "regression_diff": {
+    "golden_dataset_version": "2026.04",
+    "critical_diff_count": 0,
+    "non_critical_diff_count": 0,
+    "details": []
+  },
+  "actions": [
+    {
+      "priority": "P0|P1|P2",
+      "owner": "",
+      "issue": "",
+      "eta": "",
+      "status": "open|in_progress|done"
+    }
+  ]
+}
