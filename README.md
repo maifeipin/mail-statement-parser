@@ -4,11 +4,14 @@
 
 当前支持银行：
 
-- HX（华夏银行）
-- CMB（招商银行）
-- SPDB（浦发银行）
-- CMBC（民生银行）
-- ICBC（工商银行）
+| 银行代码 | 银行名称 | 规则文件 |
+|---|---|---|
+| HX | 华夏银行 | [rules/HX_TEMPLATE_V1.json](rules/HX_TEMPLATE_V1.json) |
+| CMB | 招商银行 | [rules/CMB_TEMPLATE_V1.json](rules/CMB_TEMPLATE_V1.json) |
+| SPDB | 浦发银行 | [rules/SPDB_TEMPLATE_V1.json](rules/SPDB_TEMPLATE_V1.json) |
+| CMBC | 民生银行 | [rules/CMBC_TEMPLATE_V1.json](rules/CMBC_TEMPLATE_V1.json) |
+| ICBC | 工商银行 | [rules/ICBC_TEMPLATE_V1.json](rules/ICBC_TEMPLATE_V1.json) |
+| CITIC | 中信银行 | [rules/CITIC_TEMPLATE_V1.json](rules/CITIC_TEMPLATE_V1.json) |
 
 ## 功能概览
 
@@ -24,11 +27,7 @@
 - [mail_client.py](mail_client.py)：命令行入口
 - [statement_db.py](statement_db.py)：SQLite 持久化与查询
 - [statement_models.py](statement_models.py)：数据模型
-- [rules/CMB_TEMPLATE_V1.json](rules/CMB_TEMPLATE_V1.json)：招商规则模板
-- [rules/CMBC_TEMPLATE_V1.json](rules/CMBC_TEMPLATE_V1.json)：民生规则模板
-- [rules/HX_TEMPLATE_V1.json](rules/HX_TEMPLATE_V1.json)：华夏规则模板
-- [rules/SPDB_TEMPLATE_V1.json](rules/SPDB_TEMPLATE_V1.json)：浦发规则模板
-- [rules/ICBC_TEMPLATE_V1.json](rules/ICBC_TEMPLATE_V1.json)：工商规则模板
+- [rules/](rules/)：各银行规则模板（见上表）
 - [email-config.example.json](email-config.example.json)：示例邮箱配置
 
 ## 环境要求

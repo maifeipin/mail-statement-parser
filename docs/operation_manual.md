@@ -8,7 +8,7 @@
 2. 对指定邮件做规则解析与校验（同时写入 SQLite）
 3. 查询最近账单、汇总报表、对账差异
 
-系统当前支持银行：HX / CMB / SPDB / CMBC。
+系统当前支持银行：HX / CMB / SPDB / CMBC / ICBC / CITIC。
 
 ---
 

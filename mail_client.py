@@ -205,6 +205,26 @@ def _apply_due_date_fallbacks(rule, body_text, fields):
         fields['due_date'] = _infer_cmb_due_date(body_text, fields.get('statement_date'))
 
 
+def _apply_statement_date_month_fallbacks(rule, email_date, fields):
+    """账单日期/月兜底：提取失败时，使用邮件头日期补齐。"""
+    if not fields:
+        return
+
+    bank_code = (rule or {}).get('bank_code')
+    msg_dt = _parse_email_datetime(email_date)
+
+    # SPDB 在部分模板中仅能稳定拿到还款日，账单日常缺失，优先用邮件日期兜底。
+    if not fields.get('statement_date') and bank_code == 'SPDB' and msg_dt:
+        fields['statement_date'] = msg_dt.date().isoformat()
+
+    if not fields.get('statement_month'):
+        m = re.match(r'^(\d{4})-(\d{2})-(\d{2})$', str(fields.get('statement_date') or '').strip())
+        if m:
+            fields['statement_month'] = f'{m.group(1)}-{m.group(2)}'
+        elif msg_dt:
+            fields['statement_month'] = f'{msg_dt.year:04d}-{msg_dt.month:02d}'
+
+
 def _infer_date_from_mmdd(mmdd, statement_month):
     """将 MM/DD 推断为 YYYY-MM-DD，优先使用账单月份年份。"""
     if not mmdd or not statement_month:
@@ -465,6 +485,63 @@ def parse_icbc_transactions_from_markdown(uid, statement_month, markdown_text):
         )
     return rows
 
+def parse_citic_transactions_from_body(uid, statement_month, body_text):
+    """从中信账单纯文本正文中提取交易明细。
+
+    中信账单交易行格式（HTML 转纯文本后，无固定分隔符）：
+      YYYYMMDDYYYYMMDD4234描述CNY金额CNY金额
+    例：20260117202601174234财付通－居家物业CNY1258.00CNY1258.00
+    """
+    if not body_text:
+        return []
+    rows = []
+    seen = set()
+    # 匹配: txn_date(8位) post_date(8位) card_last4(4位) desc CNY amount CNY amount
+    pattern = re.compile(
+        r'(\d{8})(\d{8})(\d{4})'          # txn_date, post_date, card_last4
+        r'(.+?)'                            # description (non-greedy)
+        r'CNY\s*([+-]?[0-9,]+\.[0-9]{2})'  # txn currency amount
+        r'CNY\s*([+-]?[0-9,]+\.[0-9]{2})', # settlement amount
+    )
+    for m in pattern.finditer(body_text):
+        txn_raw, post_raw, _card, desc, trx_amt_str, setl_amt_str = m.groups()
+        desc = desc.strip()
+        if not desc:
+            continue
+        # 用结算金额入库
+        d = _safe_decimal(setl_amt_str, [',', ' '])
+        if d is None:
+            continue
+        txn_date = _parse_date(
+            f'{txn_raw[:4]}-{txn_raw[4:6]}-{txn_raw[6:]}', ['%Y-%m-%d']
+        )
+        post_date = _parse_date(
+            f'{post_raw[:4]}-{post_raw[4:6]}-{post_raw[6:]}', ['%Y-%m-%d']
+        )
+        key = (txn_raw, post_raw, desc, str(d))
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append(
+            StatementTransactionRecord(
+                uid=str(uid),
+                bank_code='CITIC',
+                txn_date=txn_date,
+                post_date=post_date,
+                description=desc,
+                amount=str(d),
+                currency='CNY',
+                direction='credit' if d < 0 else 'debit',
+                raw_row_json=json.dumps(
+                    {'txn': txn_raw, 'post': post_raw, 'desc': desc,
+                     'trx_amt': trx_amt_str, 'setl_amt': setl_amt_str},
+                    ensure_ascii=False,
+                ),
+            )
+        )
+    return rows
+
+
 def load_rule_files():
     """加载规则文件（当前支持 JSON）。"""
     os.makedirs(RULES_DIR, exist_ok=True)
@@ -679,6 +756,7 @@ def show_statement_report(months=3):
         'SPDB': '浦发银行',
         'CMBC': '民生银行',
         'ICBC': '工商银行',
+        'CITIC': '中信银行',
     }
 
     print(f'📊 最近 {months} 个月按银行/月份汇总\n')
@@ -789,6 +867,7 @@ def validate_email_by_uid(uid):
             return
 
         fields = extract_statement_by_rule(rule, subj, body_text)
+        _apply_statement_date_month_fallbacks(rule, _to_text(msg.get('Date', '')), fields)
         vr = validate_statement_by_rule(rule, fields)
 
         validation_dict = _validation_result_to_dict(vr)
@@ -844,6 +923,8 @@ def validate_email_by_uid(uid):
             txns = parse_spdb_transactions_from_markdown(uid, statement.statement_month, content.get('markdown', ''))
         elif statement.bank_code == 'ICBC':
             txns = parse_icbc_transactions_from_markdown(uid, statement.statement_month, content.get('markdown', ''))
+        elif statement.bank_code == 'CITIC':
+            txns = parse_citic_transactions_from_body(uid, statement.statement_month, content.get('plain', ''))
         if txns:
             txn_count = replace_transactions(DB_PATH, str(uid), statement.bank_code, txns)
 
@@ -1261,7 +1342,7 @@ def download_recent_bank_emails(months=3, output_dir=None):
         print('❌ 未找到规则文件，请先在 rules 目录下放置 *.json')
         return
 
-    target_banks = {'HX', 'CMB', 'SPDB', 'CMBC', 'ICBC'}
+    target_banks = {'HX', 'CMB', 'SPDB', 'CMBC', 'ICBC', 'CITIC'}
     candidates, stats = _collect_recent_bill_uids(months, rules, target_banks)
     cutoff = stats['cutoff']
     keyword_map = stats['keyword_map']
@@ -1330,7 +1411,7 @@ def validate_recent_bank_emails(months=3):
         print('❌ 未找到规则文件，请先在 rules 目录下放置 *.json')
         return
 
-    target_banks = {'HX', 'CMB', 'SPDB', 'CMBC', 'ICBC'}
+    target_banks = {'HX', 'CMB', 'SPDB', 'CMBC', 'ICBC', 'CITIC'}
     candidates, stats = _collect_recent_bill_uids(months, rules, target_banks)
     cutoff = stats['cutoff']
 
@@ -1378,7 +1459,7 @@ def due_soon_bank_bills(months=3, days=7, output_dir=None):
         print('❌ 未找到规则文件，请先在 rules 目录下放置 *.json')
         return
 
-    target_banks = {'HX', 'CMB', 'SPDB', 'CMBC', 'ICBC'}
+    target_banks = {'HX', 'CMB', 'SPDB', 'CMBC', 'ICBC', 'CITIC'}
     candidates, stats = _collect_recent_bill_uids(months, rules, target_banks)
     cutoff = stats['cutoff']
 
@@ -1392,6 +1473,7 @@ def due_soon_bank_bills(months=3, days=7, output_dir=None):
         'SPDB': '浦发银行',
         'CMBC': '民生银行',
         'ICBC': '工商银行',
+        'CITIC': '中信银行',
     }
 
     print(f'🚀 执行专用指令：下载并检查最近 {months} 个月账单到期日（阈值 {days} 天）')
@@ -1446,6 +1528,7 @@ def due_soon_bank_bills(months=3, days=7, output_dir=None):
                     continue
 
                 fields = extract_statement_by_rule(rule, subj, body_text)
+                _apply_statement_date_month_fallbacks(rule, _to_text(msg.get('Date', '')), fields)
                 due_date = fields.get('due_date')
                 total_due = fields.get('total_due')
                 bank_code = rule.get('bank_code', '-')
