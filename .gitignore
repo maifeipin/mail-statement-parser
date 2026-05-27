@@ -10,3 +10,6 @@ validation-reports/
 
 .DS_Store
 Thumbs.db
+
+# Scratch and test files containing keys
+test_nvidia.py

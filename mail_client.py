@@ -3,6 +3,12 @@
 
 import json, os, sys, smtplib, imaplib, poplib, email, re, glob
 from datetime import datetime, timezone, timedelta
+
+# Windows 终端中文编码与 emoji 兼容性适配
+if sys.platform.startswith('win'):
+    import io
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 from decimal import Decimal, InvalidOperation
 from email.mime.text import MIMEText
 from email.header import decode_header
@@ -20,6 +26,92 @@ DOWNLOAD_DIR = os.path.expanduser('email-downloads')
 RULES_DIR = os.path.expanduser('rules')
 VALIDATION_REPORT_DIR = os.path.expanduser('validation-reports')
 DB_PATH = os.path.expanduser('statements.db')
+
+BANK_NAME_MAP = {
+    'HX': '华夏银行',
+    'CMB': '招商银行',
+    'SPDB': '浦发银行',
+    'CMBC': '民生银行',
+    'ICBC': '工商银行',
+    'CITIC': '中信银行',
+}
+
+def get_display_width(s):
+    if s is None:
+        return 0
+    s = str(s)
+    width = 0
+    for char in s:
+        o = ord(char)
+        if (0x1100 <= o <= 0x115F or
+            0x2E80 <= o <= 0x303F or
+            0x3040 <= o <= 0x309F or
+            0x30A0 <= o <= 0x30FF or
+            0x3100 <= o <= 0x312F or
+            0x3130 <= o <= 0x318F or
+            0x3190 <= o <= 0x319F or
+            0x31A0 <= o <= 0x31BF or
+            0x31C0 <= o <= 0x31EF or
+            0x31F0 <= o <= 0x31FF or
+            0x3200 <= o <= 0x32FF or
+            0x3300 <= o <= 0x33FF or
+            0x3400 <= o <= 0x4DBF or
+            0x4E00 <= o <= 0x9FFF or
+            0xF900 <= o <= 0xFAFF or
+            0xFE30 <= o <= 0xFE4F or
+            0xFF00 <= o <= 0xFFEF):
+            width += 2
+        else:
+            width += 1
+    return width
+
+def pad_string(s, width, alignment='left'):
+    s = str(s) if s is not None else ''
+    cur_width = get_display_width(s)
+    padding = width - cur_width
+    if padding <= 0:
+        return s
+    if alignment == 'right':
+        return ' ' * padding + s
+    elif alignment == 'center':
+        left = padding // 2
+        right = padding - left
+        return ' ' * left + s + ' ' * right
+    else:
+        return s + ' ' * padding
+
+def print_table(headers, rows, alignments=None):
+    if not headers:
+        return
+    
+    str_rows = []
+    for r in rows:
+        str_rows.append([str(x) if x is not None else '-' for x in r])
+        
+    cols_count = len(headers)
+    if alignments is None:
+        alignments = ['left'] * cols_count
+        
+    col_widths = []
+    for col_idx in range(cols_count):
+        max_w = get_display_width(headers[col_idx])
+        for row in str_rows:
+            if col_idx < len(row):
+                max_w = max(max_w, get_display_width(row[col_idx]))
+        col_widths.append(max_w)
+        
+    top_border = '┌─' + '─┬─'.join('─' * w for w in col_widths) + '─┐'
+    middle_border = '├─' + '─┼─'.join('─' * w for w in col_widths) + '─┤'
+    bottom_border = '└─' + '─┴─'.join('─' * w for w in col_widths) + '─┘'
+    
+    print(top_border)
+    header_line = '│ ' + ' │ '.join(pad_string(headers[i], col_widths[i], alignments[i]) for i in range(cols_count)) + ' │'
+    print(header_line)
+    print(middle_border)
+    for row in str_rows:
+        row_line = '│ ' + ' │ '.join(pad_string(row[i] if i < len(row) else '', col_widths[i], alignments[i]) for i in range(cols_count)) + ' │'
+        print(row_line)
+    print(bottom_border)
 
 class HTMLTableParser(HTMLParser):
     """解析 HTML 表格"""
@@ -736,12 +828,25 @@ def show_recent_statements(months=3):
         print(f'📭 最近 {months} 个月暂无账单记录')
         return
     print(f'📄 最近 {months} 个月账单记录（{len(rows)} 条）\n')
+    
+    headers = ["UID", "银行", "账单月份", "账单日期", "到期还款日", "应还款总额", "最低应还额", "明细笔数", "明细总值"]
+    alignments = ["left", "left", "center", "center", "center", "right", "right", "right", "right"]
+    
+    table_rows = []
     for r in rows:
-        print(
-            f"UID={r['uid']} bank={r['bank_code']} month={r['statement_month'] or '-'} "
-            f"due={r['due_date'] or '-'} total={r['total_due'] or '-'} min={r['minimum_due'] or '-'} "
-            f"txn_count={r['txn_count']} txn_sum={r['txn_sum']}"
-        )
+        bank_display = f"{r['bank_code']}({BANK_NAME_MAP.get(r['bank_code'], '未知银行')})"
+        table_rows.append([
+            r['uid'],
+            bank_display,
+            r['statement_month'] or '-',
+            r['statement_date'] or '-',
+            r['due_date'] or '-',
+            r['total_due'] or '-',
+            r['minimum_due'] or '-',
+            r['txn_count'],
+            r['txn_sum']
+        ])
+    print_table(headers, table_rows, alignments)
 
 def show_statement_report(months=3):
     init_db(DB_PATH)
@@ -750,25 +855,26 @@ def show_statement_report(months=3):
         print(f'📭 最近 {months} 个月暂无可汇总数据')
         return
 
-    bank_name_map = {
-        'HX': '华夏银行',
-        'CMB': '招商银行',
-        'SPDB': '浦发银行',
-        'CMBC': '民生银行',
-        'ICBC': '工商银行',
-        'CITIC': '中信银行',
-    }
-
     print(f'📊 最近 {months} 个月按银行/月份汇总\n')
-    print('bank\tym\tcount\tsum_total_due\tsum_minimum_due\tsum_txn_amount\tsum_reconcile_diff\tforeign_codes\tforeign_amount_breakdown')
+    headers = ["银行", "账单月份", "账单总数", "应还总额", "最低还款总额", "交易明细总额", "对账差额", "境外交易币种", "境外交易明细"]
+    alignments = ["left", "center", "right", "right", "right", "right", "right", "center", "left"]
+    
+    table_rows = []
     for r in rows:
         bank_code = r['bank_code']
-        bank_display = f"{bank_code}({bank_name_map.get(bank_code, '未知银行')})"
-        print(
-            f"{bank_display}\t{r['ym']}\t{r['statement_count']}\t"
-            f"{r['sum_total_due']}\t{r['sum_minimum_due']}\t{r['sum_txn_amount']}\t{r['sum_reconcile_diff']}\t"
-            f"{r['foreign_codes']}\t{r['foreign_amount_breakdown']}"
-        )
+        bank_display = f"{bank_code}({BANK_NAME_MAP.get(bank_code, '未知银行')})"
+        table_rows.append([
+            bank_display,
+            r['ym'],
+            r['statement_count'],
+            r['sum_total_due'],
+            r['sum_minimum_due'],
+            r['sum_txn_amount'],
+            r['sum_reconcile_diff'],
+            r['foreign_codes'],
+            r['foreign_amount_breakdown']
+        ])
+    print_table(headers, table_rows, alignments)
 
 
 def show_reconcile(months=3, tolerance=1.0):
@@ -779,14 +885,25 @@ def show_reconcile(months=3, tolerance=1.0):
         return
     tol = float(tolerance)
     print(f'🧾 最近 {months} 个月对账检查 (tolerance={tol})\n')
-    print('uid\tbank\tmonth\ttotal_due\ttxn_sum\tdiff\tstatus')
+    headers = ["UID", "银行", "账单月份", "应还款总额", "交易明细总额", "对账差额", "对账状态"]
+    alignments = ["left", "left", "center", "right", "right", "right", "center"]
+    
+    table_rows = []
     for r in rows:
+        bank_code = r['bank_code']
+        bank_display = f"{bank_code}({BANK_NAME_MAP.get(bank_code, '未知银行')})"
         diff = float(r['reconcile_diff'])
-        status = 'PASS' if abs(diff) <= tol else 'CHECK'
-        print(
-            f"{r['uid']}\t{r['bank_code']}\t{r['statement_month'] or '-'}\t"
-            f"{r['total_due'] or '-'}\t{r['txn_sum']}\t{r['reconcile_diff']}\t{status}"
-        )
+        status = '✅ PASS' if abs(diff) <= tol else '❌ CHECK'
+        table_rows.append([
+            r['uid'],
+            bank_display,
+            r['statement_month'] or '-',
+            r['total_due'] or '-',
+            r['txn_sum'],
+            r['reconcile_diff'],
+            status
+        ])
+    print_table(headers, table_rows, alignments)
 
 
 def show_transactions_over(amount, months=None):
@@ -805,13 +922,27 @@ def show_transactions_over(amount, months=None):
         scope_text = f'最近 {months} 个月'
 
     print(f'📌 {scope_text} 金额 >= {amount} 的交易明细（{len(rows)} 条）\n')
-    print('uid\tbank\tmonth\ttxn_date\tpost_date\tdescription\tamount\tcurrency\tlocation\toriginal_amount')
+    
+    headers = ["UID", "银行", "账单月份", "交易日期", "记账日期", "交易商户描述", "交易金额", "币种", "境外位置", "原币金额"]
+    alignments = ["left", "left", "center", "center", "center", "left", "right", "center", "center", "right"]
+    
+    table_rows = []
     for r in rows:
-        print(
-            f"{r['uid']}\t{r['bank_code']}\t{r['statement_month'] or '-'}\t"
-            f"{r['txn_date'] or '-'}\t{r['post_date'] or '-'}\t{r['description'] or '-'}\t"
-            f"{r['amount']}\t{r['currency'] or '-'}\t{r['txn_location_code'] or '-'}\t{r['original_amount']}"
-        )
+        bank_code = r['bank_code']
+        bank_display = f"{bank_code}({BANK_NAME_MAP.get(bank_code, '未知银行')})"
+        table_rows.append([
+            r['uid'],
+            bank_display,
+            r['statement_month'] or '-',
+            r['txn_date'] or '-',
+            r['post_date'] or '-',
+            r['description'] or '-',
+            r['amount'],
+            r['currency'] or '-',
+            r['txn_location_code'] or '-',
+            r['original_amount'] or '-'
+        ])
+    print_table(headers, table_rows, alignments)
 
 def pop3_fetch_message_by_uid(uid):
     """按 UID 拉取原始邮件，返回 message 对象。"""
@@ -1649,40 +1780,92 @@ def test_connection():
     except Exception as e:
         print(f'❌ IMAP: {e}')
 
+def interactive_menu():
+    init_db(DB_PATH)
+    while True:
+        print("\n" + "=" * 50)
+        print("         💳  信用卡账单助手 交互控制台  💳        ")
+        print("=" * 50)
+        print("  [1] 🔌  测试邮箱连通性 (POP3/SMTP/IMAP)")
+        print("  [2] 📥  批量下载最近账单邮件 (邮件 -> 本地Markdown)")
+        print("  [3] 📝  批量解析并导入数据库 (本地 -> SQLite)")
+        print("  [4] 🧾  查看对账差异报表 (应还款 vs 交易明细)")
+        print("  [5] 📊  生成银行/月度财务汇总报表 (含境外交易)")
+        print("  [6] ⏰  检查还款日临期账单 (还款提醒)")
+        print("  [7] 🔍  按金额筛选查询交易明细")
+        print("  [8] 📄  查看最近账单记录汇总")
+        print("  [0] ❌  退出程序")
+        print("=" * 50)
+        
+        choice = input("请输入选项 [0-8]: ").strip()
+        if choice == '0':
+            print("\n👋 感谢使用，再见！")
+            break
+        elif choice == '1':
+            print("\n🔌 开始测试邮箱连接...")
+            test_connection()
+        elif choice == '2':
+            months_str = input("请输入回溯月数 [默认 3]: ").strip()
+            months = int(months_str) if months_str.isdigit() else 3
+            print(f"\n📥 开始下载最近 {months} 个月的账单邮件...")
+            download_recent_bank_emails(months)
+        elif choice == '3':
+            months_str = input("请输入回溯月数 [默认 3]: ").strip()
+            months = int(months_str) if months_str.isdigit() else 3
+            print(f"\n📝 开始批量解析并导入 SQLite...")
+            validate_recent_bank_emails(months)
+        elif choice == '4':
+            months_str = input("请输入回溯月数 [默认 3]: ").strip()
+            months = int(months_str) if months_str.isdigit() else 3
+            tol_str = input("请输入允许对账偏差金额 [默认 1.0]: ").strip()
+            try:
+                tolerance = float(tol_str) if tol_str else 1.0
+            except ValueError:
+                tolerance = 1.0
+            print(f"\n🧾 最近 {months} 个月对账差异报表 (偏差偏差阈值: {tolerance}):")
+            show_reconcile(months, tolerance)
+        elif choice == '5':
+            months_str = input("请输入回溯月数 [默认 3]: ").strip()
+            months = int(months_str) if months_str.isdigit() else 3
+            print(f"\n📊 最近 {months} 个月财务汇总报表:")
+            show_statement_report(months)
+        elif choice == '6':
+            months_str = input("请输入回溯月数 [默认 3]: ").strip()
+            months = int(months_str) if months_str.isdigit() else 3
+            days_str = input("请输入临期天数阈值 [默认 7]: ").strip()
+            days = int(days_str) if days_str.isdigit() else 7
+            print(f"\n⏰ 临期还款日检查 (时间跨度: {months}个月, 临期天数: {days}天):")
+            due_soon_bank_bills(months, days)
+        elif choice == '7':
+            amount_str = input("请输入大额交易金额阈值 (例如 500): ").strip()
+            try:
+                amount = float(amount_str)
+            except ValueError:
+                print("⚠️ 输入金额格式错误，请输入有效的数字！")
+                continue
+            months_str = input("请输入回溯月数 [直接回车查询全部历史]: ").strip()
+            months = int(months_str) if months_str.isdigit() else None
+            print(f"\n🔍 查询金额 >= {amount} 的交易明细:")
+            show_transactions_over(amount, months)
+        elif choice == '8':
+            months_str = input("请输入回溯月数 [默认 3]: ").strip()
+            months = int(months_str) if months_str.isdigit() else 3
+            print(f"\n📄 最近 {months} 个月账单记录汇总:")
+            show_recent_statements(months)
+        else:
+            print("⚠️ 未知选项，请重新输入！")
+            
+        input("\n按回车键继续...")
+
 def main():
     if len(sys.argv) < 2:
-        print('''163 邮箱工具
-用法:
-  python mail_client.py test                              - 测试连接
-    python mail_client.py initdb                            - 初始化 SQLite 表
-  python mail_client.py send <to> <subj> <text>           - 发送邮件
-  python mail_client.py read [limit]                      - 读取最新邮件
-  python mail_client.py search <kw> [limit]               - 搜索邮件
-  python mail_client.py download <uid> [--html] [--md]    - 下载邮件 (支持表格)
-    python mail_client.py download_bank_bills [months]      - 专用指令：下载多银行最近N个月账单
-        python mail_client.py due_soon_bills [months] [days]    - 专用指令：下载并提醒N天内到期账单
-    python mail_client.py validate_bank_bills [months]      - 专用指令：批量写库（无需UID）
-    python mail_client.py classify <uid>                    - 规则匹配（模板识别）
-    python mail_client.py validate <uid>                    - 规则解析与校验报告
-    python mail_client.py recent [months]                   - 最近账单视图（默认3个月）
-    python mail_client.py report [months]                   - 银行/月份汇总（默认3个月）
-    python mail_client.py txns_over <amount> [months]      - 交易明细查询：金额阈值过滤（默认全部历史）
-    python mail_client.py reconcile [months] [tolerance]    - 对账差异检查
-
-示例:
-  python mail_client.py download 9982
-  python mail_client.py download 9982 --html
-  python mail_client.py download 9982 --md
-    python mail_client.py download_bank_bills
-        python mail_client.py due_soon_bills 3 7
-    python mail_client.py validate_bank_bills 3
-    python mail_client.py txns_over 500
-    python mail_client.py txns_over 500 3
-''')
+        interactive_menu()
         sys.exit(0)
     
     cmd = sys.argv[1]
-    if cmd == 'test':
+    if cmd in ('menu', 'interactive'):
+        interactive_menu()
+    elif cmd == 'test':
         test_connection()
     elif cmd == 'initdb':
         setup_storage()
