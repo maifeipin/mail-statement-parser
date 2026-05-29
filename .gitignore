@@ -14,4 +14,6 @@ Thumbs.db
 # Scratch and test files containing keys
 test_nvidia.py
 run_alert.py
+run.sh
+
 
