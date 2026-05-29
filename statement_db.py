@@ -426,7 +426,7 @@ def get_reconciliation_rows(db_path: str, months: int = 3) -> list[sqlite3.Row]:
         conn.close()
 
 
-def get_transactions_above_amount(db_path: str, min_amount: float, months: int | None = None) -> list[sqlite3.Row]:
+def get_transactions_above_amount(db_path: str, min_amount: float, months: int = None) -> list:
     """查询金额大于等于阈值的交易明细（按绝对值过滤）。"""
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
