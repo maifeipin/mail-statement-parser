@@ -176,9 +176,15 @@ def build_card(title, content, color="blue", footer=None):
         # 截断超长内容
         if len(content) > MAX_CARD_CONTENT_LEN:
             content = content[:MAX_CARD_CONTENT_LEN] + "\n\n... ✂️ 内容过长已截断"
+            
+        # 针对 Shell 脚本输出和 crontab 等，将内容用代码块包裹，防止 * 等符号被飞书识别为 Markdown
+        if "```" not in content:
+            content_md = f"```\n{content}\n```"
+        else:
+            content_md = content
 
         elements.append(
-            {"tag": "div", "text": {"tag": "lark_md", "content": content}}
+            {"tag": "div", "text": {"tag": "lark_md", "content": content_md}}
         )
 
     # 分隔线
@@ -294,10 +300,13 @@ def execute_shell(cmd_str, timeout=30):
         output = result.stdout.strip()
         if result.stderr.strip():
             stderr = result.stderr.strip()
-            if output:
-                output += f"\n\n⚠️ **stderr:**\n{stderr}"
-            else:
-                output = stderr
+            # 过滤掉 curl 下载进度条等无用 stderr
+            filtered_stderr = "\n".join([line for line in stderr.splitlines() if not re.match(r"^[\s\d:%\-a-zA-Z]+$", line) and "Dload  Upload" not in line and "% Total" not in line])
+            if filtered_stderr.strip():
+                if output:
+                    output += f"\n\n⚠️ **stderr:**\n{filtered_stderr.strip()}"
+                else:
+                    output = filtered_stderr.strip()
         if not output:
             output = f"✅ 命令执行完成 (exit code: {result.returncode})"
         return output, result.returncode == 0
@@ -406,15 +415,23 @@ def send_card_to_chat(chat_id, card_json):
 #  指令处理核心
 # ============================================================
 def extract_text(message):
-    """从消息中提取纯文本，去除 @mention 占位符"""
+    """从消息中提取纯文本，去除 @mention 占位符和回复前缀"""
     try:
         content = json.loads(message.content)
         text = content.get("text", "").strip()
     except (json.JSONDecodeError, AttributeError):
         return ""
 
+    # 去除飞书 @mention 占位符
     text = re.sub(r"@_user_\d+\s*", "", text).strip()
     text = re.sub(r"@_all\s*", "", text).strip()
+    
+    # 去除 "回复 xxx: " 前缀 (当用户使用回复功能时可能带入)
+    text = re.sub(r"^回复\s*.*?:[ \t]*\n?", "", text).strip()
+    
+    # 将全角斜杠替换为半角斜杠
+    text = text.replace("／", "/")
+    
     return text
 
 
