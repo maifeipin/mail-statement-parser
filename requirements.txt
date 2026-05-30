@@ -1,2 +1,6 @@
-# This project currently uses only Python standard library modules.
-# Recommended Python version: 3.11+
+# 核心账单解析引擎 (mail_client.py) ── 0 外部依赖，纯标准库
+# Recommended Python version: 3.8+
+
+# ---- 飞书 Bot 扩展 (feishu_bot.py) ----
+# 仅飞书双向交互机器人需要此依赖，核心解析功能不受影响
+lark-oapi>=1.3.0
