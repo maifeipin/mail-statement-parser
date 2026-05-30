@@ -546,6 +546,11 @@ def handle_command(message_id, text):
     reply_with_card(message_id, card)
 
 
+# 全局消息防重放缓存 (最多记录最近 1000 条)
+from collections import deque
+import threading
+processed_msg_ids = deque(maxlen=1000)
+
 # ============================================================
 #  飞书事件回调 (WebSocket 长连接)
 # ============================================================
