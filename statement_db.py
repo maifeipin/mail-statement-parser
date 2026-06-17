@@ -33,6 +33,8 @@ def init_db(db_path: str) -> None:
                 total_due TEXT,
                 minimum_due TEXT,
                 raw_fields_json TEXT,
+                is_paid INTEGER NOT NULL DEFAULT 0,
+                paid_at TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 UNIQUE(uid, bank_code)
@@ -482,6 +484,44 @@ def get_transactions_above_amount(db_path: str, min_amount: float, months: int =
                 """,
                 (threshold,),
             )
+        return list(cur.fetchall())
+    finally:
+        conn.close()
+
+def mark_statement_paid(db_path: str, bank_code: str, statement_month: str = None) -> int:
+    conn = sqlite3.connect(db_path)
+    try:
+        cur = conn.cursor()
+        now_str = _utc_now_iso()
+        if statement_month:
+            cur.execute(
+                "UPDATE statements SET is_paid=1, paid_at=?, updated_at=? WHERE bank_code=? AND statement_month=?",
+                (now_str, now_str, bank_code, statement_month)
+            )
+        else:
+            cur.execute(
+                "UPDATE statements SET is_paid=1, paid_at=?, updated_at=? WHERE id = (SELECT id FROM statements WHERE bank_code=? ORDER BY statement_date DESC LIMIT 1)",
+                (now_str, now_str, bank_code)
+            )
+        rowcount = cur.rowcount
+        conn.commit()
+        return rowcount
+    finally:
+        conn.close()
+
+def get_unpaid_statements(db_path: str) -> list[sqlite3.Row]:
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT uid, bank_code, subject, statement_month, statement_date, due_date, total_due, minimum_due
+            FROM statements
+            WHERE is_paid = 0 AND CAST(COALESCE(total_due, '0') AS REAL) > 0
+            ORDER BY due_date ASC, bank_code ASC
+            """
+        )
         return list(cur.fetchall())
     finally:
         conn.close()

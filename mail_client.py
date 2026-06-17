@@ -1584,147 +1584,76 @@ def validate_recent_bank_emails(months=3):
 
 
 def due_soon_bank_bills(months=3, days=7, output_dir=None):
-    """专用指令：先下载账单，再提取还款日并提示 N 天内到期账单。"""
-    rules = load_rule_files()
-    if not rules:
-        print('❌ 未找到规则文件，请先在 rules 目录下放置 *.json')
-        return
-
-    target_banks = {'HX', 'CMB', 'SPDB', 'CMBC', 'ICBC', 'CITIC'}
-    candidates, stats = _collect_recent_bill_uids(months, rules, target_banks)
-    cutoff = stats['cutoff']
-
-    if output_dir is None:
-        output_dir = DOWNLOAD_DIR
-    os.makedirs(output_dir, exist_ok=True)
-
-    bank_name_map = {
-        'HX': '华夏银行',
-        'CMB': '招商银行',
-        'SPDB': '浦发银行',
-        'CMBC': '民生银行',
-        'ICBC': '工商银行',
-        'CITIC': '中信银行',
-    }
-
-    print(f'🚀 执行专用指令：下载并检查最近 {months} 个月账单到期日（阈值 {days} 天）')
-    print(f'📅 时间范围：{cutoff.date().isoformat()} ~ {datetime.now(timezone.utc).date().isoformat()}')
-
-    if not candidates:
-        print(
-            f'📭 没有可处理账单：跳过旧邮件 {stats["skipped_old"]} 封，'
-            f'未匹配 {stats["skipped_unmatched"]} 封，异常 {stats["skipped_error"]} 封'
-        )
-        return
-
-    downloaded = 0
-    skipped_existing = 0
+    from statement_db import get_unpaid_statements
+    from datetime import datetime
+    today = datetime.now().date()
+    rows = get_unpaid_statements(DB_PATH)
+    
+    print(f"🚀 执行专用指令：查询最近未还款账单（临近 {days} 天）")
+    
     warn_missing_due = []
     due_soon_items = []
-    failed = 0
-
-    today = datetime.now().date()
-
-    try:
-        config = load_config()
-        mail = poplib.POP3_SSL(config['email']['pop3']['host'], config['email']['pop3']['port'])
-        mail.user(config['email']['account'])
-        mail.pass_(config['email']['authCode'])
-
-        for uid in candidates:
-            try:
-                _, headers, _ = mail.retr(int(uid))
-                msg = email.message_from_bytes(b'\r\n'.join(headers))
-
-                existing = [f for f in os.listdir(output_dir) if f.startswith(f'email_uid{uid}_')]
-                if existing:
-                    skipped_existing += 1
-                else:
-                    _save_email_message(uid, msg, output_dir=output_dir, format='md')
-                    downloaded += 1
-
-                subj = decode_mime(msg.get('Subject', ''))
-                frm = decode_mime(msg.get('From', ''))
-                content = extract_email_content(msg)
-                body_text = (content.get('plain', '') + '\n' + content.get('markdown', '')).strip()
-
-                rule, _ = identify_rule(subj, frm, body_text, rules)
-                if not rule:
-                    warn_missing_due.append({
-                        'uid': str(uid),
-                        'bank_code': '-',
-                        'subject': subj,
-                        'reason': '未匹配到规则',
-                    })
-                    continue
-
-                fields = extract_statement_by_rule(rule, subj, body_text)
-                _apply_statement_date_month_fallbacks(rule, _to_text(msg.get('Date', '')), fields)
-                due_date = fields.get('due_date')
-                total_due = fields.get('total_due')
-                bank_code = rule.get('bank_code', '-')
-
-                if not due_date:
-                    warn_missing_due.append({
-                        'uid': str(uid),
-                        'bank_code': bank_code,
-                        'subject': subj,
-                        'reason': '未提取到还款日',
-                    })
-                    continue
-
-                due_dt = _parse_date(due_date, ['%Y-%m-%d'])
-                if not due_dt:
-                    warn_missing_due.append({
-                        'uid': str(uid),
-                        'bank_code': bank_code,
-                        'subject': subj,
-                        'reason': f'还款日格式异常: {due_date}',
-                    })
-                    continue
-
-                days_left = (datetime.strptime(due_dt, '%Y-%m-%d').date() - today).days
-                if 0 <= days_left <= int(days):
-                    due_soon_items.append({
-                        'uid': str(uid),
-                        'bank_code': bank_code,
-                        'bank_name': bank_name_map.get(bank_code, '未知银行'),
-                        'due_date': due_dt,
-                        'days_left': days_left,
-                        'total_due': total_due or '-',
-                        'subject': subj,
-                    })
-            except Exception:
-                failed += 1
-                continue
-
+    
+    for r in rows:
+        due_date_str = r['due_date']
+        if not due_date_str:
+            warn_missing_due.append({'bank_code': r['bank_code'], 'subject': r['subject'], 'reason': '无还款日'})
+            continue
+            
         try:
-            mail.quit()
-        except Exception:
-            pass
-    except Exception as e:
-        print(f'❌ 到期日检查失败：{e}')
-        return
-
-    print(
-        f'\n✅ 执行完成：候选 {len(candidates)} 封，新增下载 {downloaded} 封，已下载跳过 {skipped_existing} 封，处理失败 {failed} 封'
-    )
-
-    if warn_missing_due:
-        print('\n⚠️ 还款日提取警告：')
-        for x in warn_missing_due:
-            print(f"  - UID={x['uid']} bank={x['bank_code']} reason={x['reason']} subj={x['subject'][:60]}")
-
+            due_dt = datetime.strptime(due_date_str, '%Y-%m-%d').date()
+            days_left = (due_dt - today).days
+            if 0 <= days_left <= int(days):
+                due_soon_items.append({
+                    'bank_code': r['bank_code'],
+                    'due_date': due_date_str,
+                    'days_left': days_left,
+                    'total_due': r['total_due'],
+                    'subject': r['subject']
+                })
+        except ValueError:
+            warn_missing_due.append({'bank_code': r['bank_code'], 'subject': r['subject'], 'reason': f"日期格式错误: {due_date_str}"})
+            
     if due_soon_items:
-        print(f'\n⏰ 还款日接近 {days} 天的账单：')
-        due_soon_items.sort(key=lambda x: (x['days_left'], x['due_date']))
-        for x in due_soon_items:
-            print(
-                f"  - {x['bank_code']}({x['bank_name']}) UID={x['uid']} due={x['due_date']} "
-                f"days_left={x['days_left']} total_due={x['total_due']}"
-            )
+        due_soon_items.sort(key=lambda x: x['days_left'])
+        print("
+=== ⚠️ 临期账单 (<= {}天) ===".format(days))
+        for item in due_soon_items:
+            print(f"[{item['bank_code']}] {item['subject']}")
+            print(f"   应还: {item['total_due']} RMB | 还款日: {item['due_date']} (剩余 {item['days_left']} 天)")
     else:
-        print(f'\n📭 最近 {months} 个月内暂无还款日接近 {days} 天的账单')
+        print("
+✅ 没有临近 {} 天内的待还账单。".format(days))
+        
+    if warn_missing_due:
+        print("
+=== ⚠️ 异常项 (无法判定临期) ===")
+        for w in warn_missing_due:
+            print(f"[{w['bank_code']}] {w['subject']} - {w['reason']}")
+
+def show_unpaid_statements():
+    from statement_db import get_unpaid_statements
+    rows = get_unpaid_statements(DB_PATH)
+    if not rows:
+        print("✅ 目前没有未还款的账单。")
+        return
+        
+    print("=== 待还款账单列表 ===")
+    for r in rows:
+        print(f"[{r['bank_code']}] {r['statement_month']} - {r['subject']}")
+        print(f"   应还: {r['total_due']} RMB | 还款日: {r['due_date'] or '未知'}")
+
+def mark_statement_paid_cmd(bank_code, statement_month=None):
+    from statement_db import mark_statement_paid
+    count = mark_statement_paid(DB_PATH, bank_code, statement_month)
+    if count > 0:
+        if statement_month:
+            print(f"✅ 已标记 {bank_code} 的 {statement_month} 账单为已还清。")
+        else:
+            print(f"✅ 已标记 {bank_code} 最新一期账单为已还清。")
+    else:
+        print(f"❌ 未找到匹配的 {bank_code} 账单记录。")
+
 
 def download_email_pop3(uid, output_dir=None, format='md'):
     """下载邮件，支持 HTML 表格解析"""
@@ -1896,6 +1825,17 @@ def main():
     elif cmd in ('download_bank_bills', 'exec3m'):
         months = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2].isdigit() else 3
         download_recent_bank_emails(months)
+
+    elif cmd == 'unpaid':
+        show_unpaid_statements()
+    elif cmd == 'mark_paid':
+        if len(sys.argv) < 3:
+            print('用法：mark_paid <bank_code> [statement_month]')
+            sys.exit(1)
+        bank_code = sys.argv[2]
+        month = sys.argv[3] if len(sys.argv) > 3 else None
+        mark_statement_paid_cmd(bank_code, month)
+
     elif cmd == 'due_soon_bills':
         months = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2].isdigit() else 3
         days = int(sys.argv[3]) if len(sys.argv) > 3 and sys.argv[3].isdigit() else 7
