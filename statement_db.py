@@ -101,6 +101,19 @@ def init_db(db_path: str) -> None:
         if 'original_amount' not in existing_cols:
             cur.execute("ALTER TABLE statement_transactions ADD COLUMN original_amount TEXT")
 
+        # 修复 1: 历史账单状态回填 (幂等)
+        cur.execute(
+            """
+            UPDATE statements
+            SET is_paid = 1,
+                paid_at = COALESCE(paid_at, datetime('now')),
+                updated_at = datetime('now')
+            WHERE due_date IS NOT NULL
+              AND date(due_date) < date('now')
+              AND is_paid = 0
+            """
+        )
+
         conn.commit()
     finally:
         conn.close()
@@ -495,12 +508,19 @@ def mark_statement_paid(db_path: str, bank_code: str, statement_month: str = Non
         now_str = _utc_now_iso()
         if statement_month:
             cur.execute(
-                "UPDATE statements SET is_paid=1, paid_at=?, updated_at=? WHERE bank_code=? AND statement_month=?",
+                "UPDATE statements SET is_paid=1, paid_at=?, updated_at=? WHERE bank_code=? AND statement_month=? AND is_paid=0",
                 (now_str, now_str, bank_code, statement_month)
             )
         else:
             cur.execute(
-                "UPDATE statements SET is_paid=1, paid_at=?, updated_at=? WHERE id = (SELECT id FROM statements WHERE bank_code=? ORDER BY statement_date DESC LIMIT 1)",
+                """
+                UPDATE statements SET is_paid=1, paid_at=?, updated_at=? WHERE id = (
+                    SELECT id FROM statements
+                    WHERE bank_code=? AND is_paid=0 AND CAST(COALESCE(total_due, '0') AS REAL) > 0
+                    ORDER BY date(due_date) DESC, date(statement_date) DESC, id DESC
+                    LIMIT 1
+                )
+                """,
                 (now_str, now_str, bank_code)
             )
         rowcount = cur.rowcount
@@ -509,19 +529,36 @@ def mark_statement_paid(db_path: str, bank_code: str, statement_month: str = Non
     finally:
         conn.close()
 
-def get_unpaid_statements(db_path: str) -> list[sqlite3.Row]:
+def get_unpaid_statements(db_path: str, months: int = None) -> list[sqlite3.Row]:
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     try:
         cur = conn.cursor()
-        cur.execute(
-            """
+        
+        query = """
+            WITH latest AS (
+              SELECT uid, bank_code, subject, statement_month, statement_date, due_date, total_due, minimum_due, email_date, updated_at,
+                     ROW_NUMBER() OVER (
+                       PARTITION BY bank_code, statement_month, due_date, total_due
+                       ORDER BY email_date DESC, id DESC
+                     ) AS rn
+              FROM statements
+              WHERE is_paid = 0
+                AND CAST(COALESCE(total_due, '0') AS REAL) > 0
+            )
             SELECT uid, bank_code, subject, statement_month, statement_date, due_date, total_due, minimum_due
-            FROM statements
-            WHERE is_paid = 0 AND CAST(COALESCE(total_due, '0') AS REAL) > 0
-            ORDER BY due_date ASC, bank_code ASC
-            """
-        )
+            FROM latest
+            WHERE rn = 1
+        """
+        
+        params = []
+        if months is not None:
+            query += " AND date(substr(updated_at, 1, 10)) >= date('now', ?)"
+            params.append(f'-{months} months')
+            
+        query += " ORDER BY due_date ASC, bank_code ASC"
+        
+        cur.execute(query, params)
         return list(cur.fetchall())
     finally:
         conn.close()

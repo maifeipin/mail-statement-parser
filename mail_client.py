@@ -1587,7 +1587,7 @@ def due_soon_bank_bills(months=3, days=7, output_dir=None):
     from statement_db import get_unpaid_statements
     from datetime import datetime
     today = datetime.now().date()
-    rows = get_unpaid_statements(DB_PATH)
+    rows = get_unpaid_statements(DB_PATH, months=int(months))
     
     print(f"🚀 执行专用指令：查询最近未还款账单（临近 {days} 天）")
     
@@ -1645,11 +1645,14 @@ def mark_statement_paid_cmd(bank_code, statement_month=None):
     count = mark_statement_paid(DB_PATH, bank_code, statement_month)
     if count > 0:
         if statement_month:
-            print(f"✅ 已标记 {bank_code} 的 {statement_month} 账单为已还清。")
+            if count > 1:
+                print(f"✅ 已标记 {bank_code} 的 {statement_month} 账单为已还清（共 {count} 条，同月重复账单一并核销）")
+            else:
+                print(f"✅ 已标记 {bank_code} 的 {statement_month} 账单为已还清（共 1 条）")
         else:
-            print(f"✅ 已标记 {bank_code} 最新一期账单为已还清。")
+            print(f"✅ 已标记 {bank_code} 最新一条未还账单为已还清（共 {count} 条）")
     else:
-        print(f"❌ 未找到匹配的 {bank_code} 账单记录。")
+        print(f"❌ 未找到匹配的 {bank_code} 未还账单记录。")
 
 
 def download_email_pop3(uid, output_dir=None, format='md'):
