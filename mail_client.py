@@ -297,6 +297,35 @@ def _apply_due_date_fallbacks(rule, body_text, fields):
         fields['due_date'] = _infer_cmb_due_date(body_text, fields.get('statement_date'))
 
 
+def _apply_amount_fallbacks(rule, body_text, fields):
+    """银行特定兜底：当 total_due/minimum_due 为空时尝试补齐。
+
+    ICBC 0 元账单不打印“需还款明细”表，主正则匹不到 → NULL，与解析失败不可区分。
+    0 元账单的特征：本期交易汇总合计行“本期余额”=0.00（欠款账单为负数）。
+    故当 total_due 缺失且本期余额合计=0 时，显式置 0，区分“已还清”与“解析失败”。
+    """
+    if fields.get('total_due'):
+        return
+    bank_code = (rule or {}).get('bank_code')
+    if bank_code != 'ICBC':
+        return
+    # 合计行：合计 上期余额/RMB 收入/RMB 支出/RMB 余额合计/RMB（空格可有可无）
+    # 取最后一个 4 段合计匹配（正文“本期交易汇总”段在后）。
+    matches = re.findall(
+        r'合计\s+([-0-9.,]+)/RMB\s*([-0-9.,]+)/RMB\s*([-0-9.,]+)/RMB\s*([-0-9.,]+)/RMB',
+        body_text or '',
+    )
+    if not matches:
+        return
+    try:
+        balance = float(matches[-1][3].replace(',', ''))
+    except (ValueError, IndexError):
+        return
+    if abs(balance) < 0.005:  # 本期余额合计 = 0 → 已还清
+        fields['total_due'] = '0'
+        fields['minimum_due'] = '0'
+
+
 def _apply_statement_date_month_fallbacks(rule, email_date, fields):
     """账单日期/月兜底：提取失败时，使用邮件头日期补齐。"""
     if not fields:
@@ -714,6 +743,7 @@ def extract_statement_by_rule(rule, subject, body_text):
         fields['due_date'] = _parse_date(fields['due_date'], date_formats)
 
     _apply_due_date_fallbacks(rule, body_text, fields)
+    _apply_amount_fallbacks(rule, body_text, fields)
 
     for amt_key in ('total_due', 'minimum_due'):
         if fields.get(amt_key) is not None:
