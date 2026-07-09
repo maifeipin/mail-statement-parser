@@ -231,8 +231,8 @@ def get_valid_oauth_token(email_config: dict) -> str:
 def run_outlook_device_flow(client_id: str):
     """微软设备码授权流 (头部无需浏览器，对 VPS 极其友好)"""
     device_url = "https://login.microsoftonline.com/consumers/oauth2/v2.0/devicecode"
-    # 需要 POP3 接收, SMTP 发送 和 离线刷新权限
-    scopes = "https://outlook.office.com/POP.AccessAsUser.All https://outlook.office.com/SMTP.Send offline_access"
+    # 需要 Microsoft Graph 的邮件读写和发送权限
+    scopes = "offline_access Mail.Read Mail.Send"
     
     print("🔑 [Microsoft OAuth] 正在向 Azure 请求设备验证码...")
     res = _http_post(device_url, {

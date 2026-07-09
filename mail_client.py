@@ -201,6 +201,12 @@ def load_accounts():
     return accounts
 
 
+def is_graph_api(email_config):
+    """判断是否应该走 Microsoft Graph API 通道 (目前默认针对 Outlook 个人账号)。"""
+    if email_config.get('api_mode') == 'pop3':
+        return False
+    return email_config.get('provider') == 'outlook'
+
 def connect_pop3(email_config):
     """POP3 统一连接工厂。支持 Basic (账号密码) 以及 OAuth2 (XOAUTH2) 双重通道。"""
     host = email_config['pop3']['host']
@@ -219,7 +225,13 @@ def connect_pop3(email_config):
                     raise MailAuthError(f"OAuth2 Token 刷新失败: {val_err}") from val_err
                 auth_str = f"user={account}\x01auth=Bearer {access_token}\x01\x01"
                 auth_b64 = base64.b64encode(auth_str.encode('utf-8')).decode('utf-8')
-                mail._shortcmd(f'AUTH XOAUTH2 {auth_b64}')
+                mail._putline(b'AUTH XOAUTH2')
+                resp = mail._getresp()
+                if resp.startswith(b'+'):
+                    mail._putline(auth_b64.encode('utf-8'))
+                    resp = mail._getresp()
+                if not resp.startswith(b'+OK'):
+                    raise poplib.error_proto(resp)
             else:
                 mail.user(account)
                 mail.pass_(email_config['authCode'])
@@ -229,12 +241,6 @@ def connect_pop3(email_config):
             if any(word in err_msg for word in ("auth", "login", "user", "pass", "cred", "fail", "invalid")):
                 raise MailAuthError(f"POP3 鉴权失败: {pe}") from pe
             raise pe
-        except MailAuthError:
-            try:
-                mail.quit()
-            except Exception:
-                pass
-            raise
         except Exception as e:
             try:
                 mail.quit()
@@ -331,6 +337,143 @@ def connect_imap(email_config):
             raise e
 
     return retry_with_backoff(_connect)
+
+def _graph_api_request(url, token, method="GET", json_data=None):
+    import urllib.request
+    import urllib.error
+    import json
+    import time
+    
+    headers = {
+        'Authorization': f'Bearer {token}',
+        'Accept': 'application/json'
+    }
+    if json_data is not None:
+        headers['Content-Type'] = 'application/json'
+        data = json.dumps(json_data).encode('utf-8')
+    else:
+        data = None
+        
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    max_retries = 3
+    
+    for attempt in range(max_retries):
+        try:
+            with urllib.request.urlopen(req, timeout=30) as response:
+                if response.status == 204:
+                    return None
+                resp_body = response.read().decode('utf-8')
+                return json.loads(resp_body) if resp_body else None
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                retry_after = e.headers.get('Retry-After', 5)
+                try:
+                    retry_after = int(retry_after)
+                except ValueError:
+                    retry_after = 5
+                if attempt < max_retries - 1:
+                    print(f"⚠️ Graph API 限流 (429 Too Many Requests)，等待 {retry_after} 秒后重试...")
+                    time.sleep(retry_after)
+                    continue
+            elif 500 <= e.code < 600:
+                # 5xx 为瞬时服务器错误，退避重试而非立即判定为鉴权失败
+                if attempt < max_retries - 1:
+                    wait = 2 ** attempt
+                    print(f"⚠️ Graph API 服务器错误 ({e.code})，{wait} 秒后重试...")
+                    time.sleep(wait)
+                    continue
+            err_body = e.read().decode('utf-8', errors='ignore')
+            raise MailAuthError(f"Graph API Error {e.code}: {err_body}") from e
+        except Exception as e:
+            if attempt < max_retries - 1:
+                time.sleep(2 ** attempt)
+                continue
+            raise e
+    raise MailAuthError("Graph API Error: Max retries exceeded.")
+
+def fetch_summaries_graph(email_config, months=1):
+    from oauth_helper import get_valid_oauth_token
+    import urllib.parse
+    from datetime import datetime, timezone
+    
+    token = get_valid_oauth_token(email_config)
+    cutoff_date = _month_subtract(datetime.now(timezone.utc), months).strftime("%Y-%m-%dT00:00:00Z")
+    
+    base_url = "https://graph.microsoft.com/v1.0/me/messages"
+    params = {
+        "$filter": f"receivedDateTime ge {cutoff_date}",
+        "$select": "id,subject,from,receivedDateTime,body",
+        "$top": 100,
+        "$orderby": "receivedDateTime desc"
+    }
+    url = f"{base_url}?{urllib.parse.urlencode(params)}"
+    
+    emails = []
+    while url:
+        resp = _graph_api_request(url, token)
+        if not resp or 'value' not in resp:
+            break
+            
+        for msg in resp['value']:
+            try:
+                uid = msg['id']
+                from_addr = msg.get('from', {}).get('emailAddress', {}).get('address', '')
+                from_name = msg.get('from', {}).get('emailAddress', {}).get('name', '')
+                sender = f"{from_name} <{from_addr}>" if from_name else from_addr
+                subject = msg.get('subject', '')
+                
+                dt_str = msg.get('receivedDateTime', '')
+                if dt_str.endswith('Z'):
+                    dt_str = dt_str[:-1] + '+00:00'
+                dt_obj = datetime.fromisoformat(dt_str)
+                email_date = dt_obj.strftime("%a, %d %b %Y %H:%M:%S %z")
+                
+                body_content = msg.get('body', {}).get('content', '')
+                if msg.get('body', {}).get('contentType') == 'html':
+                    body_text = html_to_text(body_content)
+                else:
+                    body_text = body_content
+                
+                emails.append({
+                    "uid": uid,
+                    "subject": subject,
+                    "sender": sender,
+                    "email_date": email_date,
+                    "raw_date": email_date,
+                    "body": body_text,
+                    "html": body_content if msg.get('body', {}).get('contentType') == 'html' else ""
+                })
+            except Exception as e:
+                print(f"⚠️ 跳过解析错误的 Graph 邮件: {e}")
+                
+        url = resp.get('@odata.nextLink')
+    return emails
+
+def send_email_graph(email_config, to_email, subject, content):
+    from oauth_helper import get_valid_oauth_token
+    token = get_valid_oauth_token(email_config)
+    url = "https://graph.microsoft.com/v1.0/me/sendMail"
+    
+    payload = {
+        "message": {
+            "subject": subject,
+            "body": {
+                "contentType": "Text",
+                "content": content
+            },
+            "toRecipients": [
+                {
+                    "emailAddress": {
+                        "address": to_email
+                    }
+                }
+            ]
+        },
+        "saveToSentItems": True
+    }
+    
+    _graph_api_request(url, token, method="POST", json_data=payload)
+
 
 def decode_mime(s):
     if not s: return ''
@@ -1188,6 +1331,27 @@ def pop3_fetch_message_by_uid(uid, account_name=None):
     if not target_config:
         target_config = accounts[0]
         
+    if is_graph_api(target_config):
+        from oauth_helper import get_valid_oauth_token
+        import urllib.request
+        import urllib.error
+        import time
+        token = get_valid_oauth_token(target_config)
+        url = f"https://graph.microsoft.com/v1.0/me/messages/{uid}/$value"
+        req = urllib.request.Request(url, headers={'Authorization': f'Bearer {token}'})
+        for attempt in range(3):
+            try:
+                with urllib.request.urlopen(req, timeout=30) as response:
+                    mime_bytes = response.read()
+                    return email.message_from_bytes(mime_bytes)
+            except urllib.error.HTTPError as e:
+                if e.code == 429:
+                    retry_after = int(e.headers.get('Retry-After', 5))
+                    time.sleep(retry_after)
+                    continue
+                raise ValueError(f"Graph API fetch MIME error: {e.code}") from e
+        raise ValueError("Graph API fetch MIME max retries exceeded.")
+        
     mail = connect_pop3(target_config)
     try:
         _, headers, _ = mail.retr(int(uid))
@@ -1447,18 +1611,31 @@ def extract_email_content(msg):
     return result
 
 def send_email(to, subject, text):
-    config = load_config()
+    accounts = load_accounts()
+    if not accounts:
+        raise ValueError("No email accounts configured")
+    account_config = accounts[0]
+    
+    if is_graph_api(account_config):
+        send_email_graph(account_config, to, subject, text)
+        print(f"✅ 邮件已发送给 {to} (via Graph API)")
+        return
+        
+    s = connect_smtp(account_config)
     try:
-        server = connect_smtp(config['email'])
-        msg = MIMEText(text, 'plain', 'utf-8')
-        msg['From'] = config['email']['account']
+        from email.mime.text import MIMEText
+        from email.mime.multipart import MIMEMultipart
+        
+        msg = MIMEMultipart()
+        msg['From'] = account_config['account']
         msg['To'] = to
         msg['Subject'] = subject
-        server.send_message(msg)
-        server.quit()
-        print(f'✅ 发送成功：{to} - {subject}')
-    except Exception as e:
-        print(f'❌ 发送失败：{e}')
+        msg.attach(MIMEText(text, 'plain', 'utf-8'))
+        
+        s.send_message(msg)
+        print(f"✅ 邮件已发送给 {to}")
+    finally:
+        s.quit()
 
 def read_emails_pop3(limit=10, account_name=None):
     accounts = load_accounts()
@@ -1479,6 +1656,24 @@ def read_emails_pop3(limit=10, account_name=None):
         target_config = accounts[0]
         
     try:
+        if is_graph_api(target_config):
+            from oauth_helper import get_valid_oauth_token
+            token = get_valid_oauth_token(target_config)
+            url = f"https://graph.microsoft.com/v1.0/me/messages?$top={limit}&$select=id,subject,from,receivedDateTime&$orderby=receivedDateTime desc"
+            resp = _graph_api_request(url, token)
+            if not resp or 'value' not in resp or not resp['value']:
+                print(f'📭 邮箱 {target_config.get("account")} 为空或无匹配')
+                return
+            msgs = resp['value']
+            print(f'📬 最新 {len(msgs)} 封邮件 ({target_config.get("account")} via Graph):\n')
+            for msg in msgs:
+                uid = msg['id']
+                subj = msg.get('subject', '')
+                frm = msg.get('from', {}).get('emailAddress', {}).get('address', '')
+                date = msg.get('receivedDateTime', '')
+                print(f"UID: {uid}\n[{date[:25]}] {frm}\n主题：{subj}\n{'-'*60}")
+            return
+            
         mail = connect_pop3(target_config)
         num = len(mail.list()[1])
         if num == 0:
@@ -1486,7 +1681,7 @@ def read_emails_pop3(limit=10, account_name=None):
             mail.quit()
             return
         start = max(1, num - limit + 1)
-        print(f'📬 最新 {min(limit, num)} 封邮件 ({target_config.get("account")}):\n')
+        print(f'📬 最新 {min(limit, num)} 封邮件 ({target_config.get("account")} via POP3):\n')
         for i in range(num, start-1, -1):
             _, headers, _ = mail.retr(i)
             msg = email.message_from_bytes(b'\r\n'.join(headers))
@@ -1496,7 +1691,7 @@ def read_emails_pop3(limit=10, account_name=None):
             print(f"UID: {i}\n[{date[:25]}] {frm}\n主题：{subj}\n{'-'*60}")
         mail.quit()
     except Exception as e:
-        print(f'❌ POP3 读取失败：{e}')
+        print(f'❌ 连接失败: {e}')
 
 
 def search_emails_pop3(keyword, limit=20, account_name=None):
@@ -1518,6 +1713,36 @@ def search_emails_pop3(keyword, limit=20, account_name=None):
         target_config = accounts[0]
         
     try:
+        if is_graph_api(target_config):
+            from oauth_helper import get_valid_oauth_token
+            import urllib.parse
+            token = get_valid_oauth_token(target_config)
+            params = {
+                "$search": f'"{keyword}"',
+                "$select": "id,subject,from,receivedDateTime",
+                "$top": limit * 3
+            }
+            url = f"https://graph.microsoft.com/v1.0/me/messages?{urllib.parse.urlencode(params)}"
+            resp = _graph_api_request(url, token)
+            
+            if not resp or 'value' not in resp or not resp['value']:
+                print(f'📭 邮箱 {target_config.get("account")} 中未搜到含有 "{keyword}" 的邮件。')
+                return
+                
+            msgs = resp['value'][:limit*3]
+            print(f'🔍 在 {target_config.get("account")} (via Graph) 中搜索 "{keyword}"...\n')
+            results = []
+            for msg in msgs:
+                uid = msg['id']
+                subj = msg.get('subject', '')
+                frm = msg.get('from', {}).get('emailAddress', {}).get('address', '')
+                date = msg.get('receivedDateTime', '')
+                results.append((uid, subj, frm, date))
+                if len(results) <= limit:
+                    print(f"UID: {uid}\n[{date[:25]}] {frm}\n主题：{subj}\n{'-'*60}")
+            print(f'共找到 {len(results)} 封匹配邮件。')
+            return
+
         mail = connect_pop3(target_config)
         num = len(mail.list()[1])
         if num == 0:
@@ -1526,17 +1751,17 @@ def search_emails_pop3(keyword, limit=20, account_name=None):
             return
         results = []
         kw = keyword.lower()
-        print(f'🔍 在 {target_config.get("account")} 中搜索 "{keyword}"...\n')
+        print(f'🔍 在 {target_config.get("account")} (via POP3) 中搜索 "{keyword}"...\n')
         skipped = 0
         for i in range(num, 0, -1):
             try:
                 _, headers, _ = mail.retr(i)
-                content = b'\r\n'.join(headers).decode('utf-8', errors='ignore')
-                msg = email.message_from_string(content)
+                content_txt = b'\r\n'.join(headers).decode('utf-8', errors='ignore')
+                msg = email.message_from_string(content_txt)
                 subj = decode_mime(msg.get('Subject', ''))
                 frm = decode_mime(msg.get('From', ''))
                 date = msg.get('Date', '')
-                if kw in subj.lower() or kw in frm.lower() or kw in content.lower():
+                if kw in subj.lower() or kw in frm.lower() or kw in content_txt.lower():
                     results.append((i, subj, frm, date))
                     if len(results) <= limit:
                         print(f"UID: {i}\n[{date[:25]}] {frm}\n主题：{subj}\n{'-'*60}")
@@ -1544,16 +1769,11 @@ def search_emails_pop3(keyword, limit=20, account_name=None):
                     break
             except Exception:
                 skipped += 1
-                continue
+                if skipped > 100: break
+        print(f'共找到 {len(results)} 封匹配邮件。')
         mail.quit()
-        if not results:
-            print(f'📭 未找到匹配邮件')
-        else:
-            print(f'\n共找到 {len(results)} 封')
-        if skipped:
-            print(f'⚠️ 跳过 {skipped} 封异常邮件（可能包含超长行）')
     except Exception as e:
-        print(f'❌ POP3 搜索失败：{e}')
+        print(f'❌ 搜索失败: {e}')
 
 
 def _month_subtract(dt, months):
@@ -1694,9 +1914,39 @@ def _collect_recent_bill_uids(months, rules, target_banks, email_config=None):
     }
     candidates = []
 
+    if is_graph_api(email_config):
+        try:
+            emails = fetch_summaries_graph(email_config, int(months))
+            for msg in emails:
+                stats['scanned'] += 1
+                dt = _parse_email_datetime(msg.get('email_date', ''))
+                if dt and dt < cutoff:
+                    stats['skipped_old'] += 1
+                    break
+                    
+                subj = msg.get('subject', '')
+                frm = msg.get('sender', '')
+                uid = msg.get('uid')
+                
+                subj_lower = subj.lower()
+                matched = False
+                for b, kw_list in keyword_map_lower.items():
+                    for kw in kw_list:
+                        if kw in subj_lower:
+                            candidates.append((uid, b, subj, frm, str(dt) if dt else ''))
+                            matched = True
+                            break
+                    if matched: break
+                
+                if not matched:
+                    stats['skipped_unmatched'] += 1
+        except Exception as e:
+            stats['skipped_error'] += 1
+            print(f"⚠️ Graph API collecting recent bills error: {e}")
+        return candidates, stats
+
     mail = connect_pop3(email_config)
     try:
-
         num = len(mail.list()[1])
         if num == 0:
             return candidates, stats
@@ -1714,29 +1964,21 @@ def _collect_recent_bill_uids(months, rules, target_banks, email_config=None):
                     stats['skipped_old'] += 1
                     break
 
-                subj_l = subj.lower()
-                subject_hit_banks = [
-                    b for b, patterns in keyword_map_lower.items()
-                    if any(p in subj_l for p in patterns)
-                ]
-                if not subject_hit_banks:
-                    stats['skipped_unmatched'] += 1
-                    continue
+                subj_lower = subj.lower()
+                matched = False
+                for b, kw_list in keyword_map_lower.items():
+                    for kw in kw_list:
+                        if kw in subj_lower:
+                            candidates.append((i, b, subj, frm, str(dt) if dt else ''))
+                            matched = True
+                            break
+                    if matched: break
 
-                content = extract_email_content(msg)
-                body_text = (content.get('plain', '') + '\n' + content.get('markdown', '')).strip()
-                rule, _ = identify_rule(subj, frm, body_text, rules)
-                if not rule or rule.get('bank_code') not in target_banks:
+                if not matched:
                     stats['skipped_unmatched'] += 1
-                    continue
-                if rule.get('bank_code') not in subject_hit_banks:
-                    stats['skipped_unmatched'] += 1
-                    continue
 
-                candidates.append(str(i))
             except Exception:
                 stats['skipped_error'] += 1
-                continue
     finally:
         try:
             mail.quit()
@@ -1990,29 +2232,44 @@ def test_connection():
         print(f'📧 测试账户：{acc}')
         print(f'----------------------------------------')
         
-        # 测试 SMTP
-        try:
-            s = connect_smtp(account_config)
-            s.quit()
-            print('✅ SMTP OK')
-        except Exception as e:
-            print(f'❌ SMTP: {e}')
-        
-        # 测试 POP3
-        try:
-            p = connect_pop3(account_config)
-            p.quit()
-            print('✅ POP3 OK')
-        except Exception as e:
-            print(f'❌ POP3: {e}')
-        
-        # 测试 IMAP
-        try:
-            i = connect_imap(account_config)
-            i.logout()
-            print('✅ IMAP 登录 OK')
-        except Exception as e:
-            print(f'❌ IMAP: {e}')
+        if is_graph_api(account_config):
+            try:
+                from oauth_helper import get_valid_oauth_token
+                token = get_valid_oauth_token(account_config)
+                _graph_api_request("https://graph.microsoft.com/v1.0/me/messages?$top=1", token)
+                print('✅ Graph API 连接及收信 OK')
+            except Exception as e:
+                print(f'❌ Graph API 收信错误: {e}')
+                
+            try:
+                _graph_api_request("https://graph.microsoft.com/v1.0/me", token)
+                print('✅ Graph API Profile OK')
+            except Exception as e:
+                print(f'❌ Graph API Profile 错误: {e}')
+        else:
+            # 测试 SMTP
+            try:
+                s = connect_smtp(account_config)
+                s.quit()
+                print('✅ SMTP OK')
+            except Exception as e:
+                print(f'❌ SMTP: {e}')
+            
+            # 测试 POP3
+            try:
+                p = connect_pop3(account_config)
+                p.quit()
+                print('✅ POP3 OK')
+            except Exception as e:
+                print(f'❌ POP3: {e}')
+            
+            # 测试 IMAP
+            try:
+                i = connect_imap(account_config)
+                i.logout()
+                print('✅ IMAP 登录 OK')
+            except Exception as e:
+                print(f'❌ IMAP: {e}')
         print()
 
 def interactive_menu():
@@ -2400,12 +2657,32 @@ def fetch_recent_emails_and_summarize(months=1):
         account_name = account_config.get('account', 'default')
         print(f'\n🔌 正在连接邮箱 {account_name} ...')
         
-        try:
-            mail = connect_pop3(account_config)
-        except Exception as e:
-            print(f'❌ 无法连接邮箱 {account_name}: {e}')
-            errors_total += 1
-            continue
+        is_graph = is_graph_api(account_config)
+        graph_emails = []
+        mail = None
+        
+        if is_graph:
+            print(f'🔗 [Graph API] 获取 {account_name} 近 {months} 个月的邮件摘要...')
+            try:
+                graph_emails = fetch_summaries_graph(account_config, months)
+                num = len(graph_emails)
+                print(f'✅ [Graph API] 获取到 {num} 封邮件。开始匹配...')
+            except Exception as e:
+                print(f'❌ 无法连接 Graph API {account_name}: {e}')
+                errors_total += 1
+                continue
+        else:
+            try:
+                mail = connect_pop3(account_config)
+                num = len(mail.list()[1])
+                if num == 0:
+                    print(f'📭 邮箱 {account_name} 中没有任何邮件。')
+                    continue
+                print(f'🧩 邮箱 {account_name} 邮件总数: {num} 封，开始最新邮件反向匹配...')
+            except Exception as e:
+                print(f'❌ 无法连接邮箱 {account_name}: {e}')
+                errors_total += 1
+                continue
             
         scanned = 0
         new_bills = 0
@@ -2414,18 +2691,17 @@ def fetch_recent_emails_and_summarize(months=1):
         errors = 0
         
         try:
-            num = len(mail.list()[1])
-            if num == 0:
-                print(f'📭 邮箱 {account_name} 中没有任何邮件。')
-                continue
-                
-            print(f'🧩 邮箱 {account_name} 邮件总数: {num} 封，开始最新邮件反向匹配...')
-            
             consecutive_old = 0
             consecutive_skip = 0
-            for i in range(num, 0, -1):
+            
+            for index in range(num):
                 scanned += 1
-                uid = str(i)
+                if is_graph:
+                    msg_obj = graph_emails[index]
+                    uid = msg_obj['uid']
+                else:
+                    i = num - index
+                    uid = str(i)
                 
                 is_dup_bill = uid_exists(DB_PATH, uid)
                 status, retry_cnt = get_email_summary_status(DB_PATH, account_name, uid)
@@ -2442,24 +2718,54 @@ def fetch_recent_emails_and_summarize(months=1):
                     consecutive_skip = 0
                     
                 try:
-                    _, headers, _ = mail.retr(i)
-                    msg = email.message_from_bytes(b'\r\n'.join(headers))
-                    subj = decode_mime(msg.get('Subject', ''))
-                    frm = decode_mime(msg.get('From', ''))
-                    date_str = _to_text(msg.get('Date', ''))
-                    
-                    dt = _parse_email_datetime(date_str)
-                    if dt and dt < cutoff:
-                        consecutive_old += 1
-                        if consecutive_old >= 10:
-                            print(f'📅 连续遇到 {consecutive_old} 封旧邮件，提早结束扫描。')
-                            break
-                        continue
+                    if is_graph:
+                        subj = msg_obj['subject']
+                        frm = msg_obj['sender']
+                        date_str = msg_obj['email_date']
+                        dt = _parse_email_datetime(date_str)
+                        if dt and dt < cutoff:
+                            consecutive_old += 1
+                            if consecutive_old >= 10:
+                                print(f'📅 连续遇到 {consecutive_old} 封旧邮件，提早结束扫描。')
+                                break
+                            continue
+                        else:
+                            consecutive_old = 0
+                        body_text = msg_obj['body']
+                        
+                        # Graph 邮件需自己组装简单的 EmailMessage 供 validate_and_save_email_message 解析使用，如果命中规则
+                        # 但实际上为了规则通道，它可能会使用 mail_client.extract_email_content，
+                        # 这里为了兼容，若命中规则直接构建 dummy msg 或触发下载。
+                        # 对于提取摘要通道，只用 body_text 即可。
+                        # 所以我们构造一个简单的 message
+                        from email.message import EmailMessage
+                        msg = EmailMessage()
+                        msg['Subject'] = subj
+                        msg['From'] = frm
+                        msg['Date'] = date_str
+                        msg.set_content(body_text)
+                        # 保留 HTML 原文，使账单交易明细解析器能从 HTML 表格提取 markdown
+                        if msg_obj.get('html'):
+                            msg.add_alternative(msg_obj['html'], subtype='html')
                     else:
-                        consecutive_old = 0
-                    
-                    content = extract_email_content(msg)
-                    body_text = (content.get('plain', '') + '\n' + content.get('markdown', '')).strip()
+                        _, headers, _ = mail.retr(i)
+                        msg = email.message_from_bytes(b'\r\n'.join(headers))
+                        subj = decode_mime(msg.get('Subject', ''))
+                        frm = decode_mime(msg.get('From', ''))
+                        date_str = _to_text(msg.get('Date', ''))
+                        
+                        dt = _parse_email_datetime(date_str)
+                        if dt and dt < cutoff:
+                            consecutive_old += 1
+                            if consecutive_old >= 10:
+                                print(f'📅 连续遇到 {consecutive_old} 封旧邮件，提早结束扫描。')
+                                break
+                            continue
+                        else:
+                            consecutive_old = 0
+                        
+                        content = extract_email_content(msg)
+                        body_text = (content.get('plain', '') + '\n' + content.get('markdown', '')).strip()
                     
                     # 双通道分流 A: 账单正则识别
                     rule, score = identify_rule(subj, frm, body_text, rules)
@@ -2540,10 +2846,11 @@ def fetch_recent_emails_and_summarize(months=1):
                     errors += 1
                     continue
         finally:
-            try:
-                mail.quit()
-            except Exception:
-                pass
+            if not is_graph and mail:
+                try:
+                    mail.quit()
+                except Exception:
+                    pass
             print(f'🏁 账户 {account_name} 扫描完成：新入库账单 {new_bills} 封，通用提炼 {new_summaries} 封，跳过重复 {skipped_dup} 封，处理失败 {errors} 封')
             scanned_total += scanned
             new_bills_total += new_bills
