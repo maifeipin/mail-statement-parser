@@ -1221,22 +1221,22 @@ def classify_email_by_uid(uid):
     except Exception as e:
         print(f'❌ 分类失败：{e}')
 
-def validate_email_by_uid(uid, account_name=None):
-    """按规则解析并输出校验报告。"""
-    rules = load_rule_files()
+def validate_and_save_email_message(msg, uid, rules=None, account_name=None):
+    """提取的重用逻辑：从已下载的 msg 解析、校验并落库账单"""
+    if rules is None:
+        rules = load_rule_files()
     if not rules:
-        print('❌ 未找到规则文件，请先在 rules 目录下放置 *.json')
+        print('未找到规则文件，请先在 rules 目录下放置 *.json')
         return
 
     try:
-        msg = pop3_fetch_message_by_uid(uid, account_name=account_name)
         subj = decode_mime(msg.get('Subject', ''))
         frm = decode_mime(msg.get('From', ''))
         content = extract_email_content(msg)
         body_text = (content.get('plain', '') + '\n' + content.get('markdown', '')).strip()
         rule, score = identify_rule(subj, frm, body_text, rules)
         if not rule:
-            print('❌ 未匹配到规则，无法验证')
+            print('未匹配到规则，无法验证')
             return
 
         fields = extract_statement_by_rule(rule, subj, body_text)
@@ -1312,14 +1312,22 @@ def validate_email_by_uid(uid, account_name=None):
             warnings=vr.warnings,
         )
 
-        status = '✅ 通过' if vr.passed else '❌ 未通过'
+        status = '通过' if vr.passed else '未通过'
         print(f'{status}：{out}')
         print(f'规则：{rule.get("rule_id")}')
         print(f'错误数：{len(vr.errors)}，告警数：{len(vr.warnings)}')
         print(f'交易入库数：{txn_count}')
         print(f'数据库记录 run_id：{run_id}')
     except Exception as e:
-        print(f'❌ 验证失败：{e}')
+        print(f'验证失败：{e}')
+
+def validate_email_by_uid(uid, account_name=None):
+    """按规则解析并输出校验报告。"""
+    try:
+        msg = pop3_fetch_message_by_uid(uid, account_name=account_name)
+        validate_and_save_email_message(msg, uid, account_name=account_name)
+    except Exception as e:
+        print(f'验证失败：{e}')
 
 def html_to_text(html):
     """将 HTML 转换为纯文本"""
