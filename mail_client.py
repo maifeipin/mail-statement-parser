@@ -185,7 +185,9 @@ def retry_with_backoff(func, *args, max_retries=3, initial_delay=2, backoff_fact
             print(f"⚠️ 连接暂时失败 (尝试 {attempt}/{max_retries}): {e}。将在 {delay:.1f} 秒后重试...")
             time.sleep(delay + random.uniform(0, 0.5))
             delay *= backoff_factor
-    raise last_err
+    if last_err is not None:
+        raise last_err
+    raise ValueError("max_retries must be greater than 0")
 
 
 def load_accounts():
