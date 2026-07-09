@@ -234,14 +234,14 @@ def run_outlook_device_flow(client_id: str):
     # 需要 POP3 接收, SMTP 发送 和 离线刷新权限
     scopes = "https://outlook.office.com/POP.AccessAsUser.All https://outlook.office.com/SMTP.Send offline_access"
     
-    print("[Microsoft OAuth] 正在向 Azure 请求设备验证码...")
+    print("🔑 [Microsoft OAuth] 正在向 Azure 请求设备验证码...")
     res = _http_post(device_url, {
         "client_id": client_id,
         "scope": scopes
     })
     
     if "error" in res:
-        print(f"请求失败: {res.get('error_description', res.get('error'))}")
+        print(f"❌ 请求失败: {res.get('error_description', res.get('error'))}")
         return
         
     device_code = res['device_code']
@@ -250,38 +250,41 @@ def run_outlook_device_flow(client_id: str):
     interval = res.get('interval', 5)
     
     print("\n=======================================================")
-    print(f"请在您的 PC 或手机浏览器上打开此链接:\n   {verification_uri}")
-    print(f"输入以下设备确认码:\n   【 {user_code} 】")
+    print(f"👉 请在您的 PC 或手机浏览器上打开此链接:\n   {verification_uri}")
+    print(f"👉 输入以下设备确认码:\n   【 {user_code} 】")
     print("=======================================================\n")
-    print("等待用户在浏览器端完成授权认证...")
+    print("⏳ 等待用户在浏览器端完成授权认证...")
     
     token_url = "https://login.microsoftonline.com/consumers/oauth2/v2.0/token"
     while True:
         time.sleep(interval)
-        token_res = _http_post(token_url, {
-            "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
-            "client_id": client_id,
-            "device_code": device_code
-        })
+        try:
+            token_res = _http_post(token_url, {
+                "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                "client_id": client_id,
+                "device_code": device_code
+            })
+        except (urllib.error.URLError, OSError):
+            continue
         
         if "error" in token_res:
             err = token_res["error"]
             if err == "authorization_pending":
                 continue
             elif err == "authorization_declined":
-                print("授权被拒绝。")
+                print("❌ 授权被拒绝。")
                 break
             elif err == "expired_token":
-                print("设备确认码已过期，请重新运行。")
+                print("❌ 设备确认码已过期，请重新运行。")
                 break
             else:
-                print(f"授权异常: {token_res.get('error_description', err)}")
+                print(f"❌ 授权异常: {token_res.get('error_description', err)}")
                 break
         else:
             # 授权成功
             token_res['created_at'] = int(time.time())
             save_encrypted_token("outlook", token_res)
-            print("\n[Microsoft] Outlook 邮箱 OAuth2 授权成功！密钥已安全加密落库。")
+            print("\n🎉 [Microsoft] Outlook 邮箱 OAuth2 授权成功！密钥已安全加密落库。")
             break
 
 
