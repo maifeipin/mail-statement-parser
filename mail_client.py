@@ -793,12 +793,15 @@ def validate_statement_by_rule(rule, fields):
             if dl is None or dr is None:
                 ok = False
             else:
-                if op == '>=':
-                    ok = dl >= dr
-                elif op == '<=':
-                    ok = dl <= dr
-                elif op == '==':
-                    ok = dl == dr
+                if dr < 0 and rid == 'minimum_le_total':
+                    ok = True
+                else:
+                    if op == '>=':
+                        ok = dl >= dr
+                    elif op == '<=':
+                        ok = dl <= dr
+                    elif op == '==':
+                        ok = dl == dr
 
         if not ok:
             payload = ValidationIssue(
