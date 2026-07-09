@@ -1,0 +1,63 @@
+{
+  "white_domains": [
+    "bank",
+    "secure",
+    "security",
+    "aliyun",
+    "tencent",
+    "github",
+    "paypal",
+    "stripe",
+    "microsoft",
+    "google",
+    "apple"
+  ],
+  "white_local_prefixes": [
+    "verify",
+    "code",
+    "order",
+    "receipt",
+    "bill",
+    "alert",
+    "notify",
+    "support",
+    "service"
+  ],
+  "spam_keywords": [
+    "广告",
+    "优惠券",
+    "促销",
+    "特惠",
+    "打折",
+    "限时特购",
+    "双十一",
+    "爆款",
+    "推广",
+    "理财推荐"
+  ],
+  "sensitive_words": [
+    "账单",
+    "订单",
+    "安全",
+    "密码",
+    "验证码",
+    "异常",
+    "登录",
+    "verify",
+    "code",
+    "security",
+    "password",
+    "alert",
+    "login",
+    "billing"
+  ],
+  "protected_domains": [
+    "qq.com",
+    "gmail.com",
+    "163.com",
+    "outlook.com",
+    "hotmail.com",
+    "yahoo.com",
+    "icloud.com"
+  ]
+}

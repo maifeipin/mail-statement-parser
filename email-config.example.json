@@ -1,22 +1,74 @@
 {
   "email": {
-    "provider": "163",
-    "account": "yourmail@163.com",
-    "authCode": "authCode",
+    "provider": "qq",
+    "account": "yourmail@qq.com",
+    "authCode": "your_app_password_here",
+    "auth_type": "basic",
     "smtp": {
-      "host": "smtp.163.com",
+      "host": "smtp.qq.com",
       "port": 465,
       "secure": true
     },
     "imap": {
-      "host": "imap.163.com",
+      "host": "imap.qq.com",
       "port": 993,
       "secure": true
     },
     "pop3": {
-      "host": "pop.163.com",
+      "host": "pop.qq.com",
       "port": 995,
       "secure": true
     }
+  },
+  "_comment_oauth2_example": {
+    "email": {
+      "provider": "gmail",
+      "account": "yourmail@gmail.com",
+      "auth_type": "oauth2",
+      "client_id": "your-google-oauth2-client-id.apps.googleusercontent.com",
+      "client_secret": "your-google-oauth2-client-secret",
+      "pop3": {
+        "host": "pop.gmail.com",
+        "port": 995,
+        "secure": true
+      }
+    }
+  },
+  "_comment_multi_account_example": {
+    "emails": [
+      {
+        "provider": "qq",
+        "account": "yourmail1@qq.com",
+        "authCode": "your_app_password_here",
+        "auth_type": "basic",
+        "smtp": {
+          "host": "smtp.qq.com",
+          "port": 465,
+          "secure": true
+        },
+        "imap": {
+          "host": "imap.qq.com",
+          "port": 993,
+          "secure": true
+        },
+        "pop3": {
+          "host": "pop.qq.com",
+          "port": 995,
+          "secure": true
+        }
+      },
+      {
+        "provider": "gmail",
+        "account": "yourmail2@gmail.com",
+        "auth_type": "oauth2",
+        "client_id": "your-google-oauth2-client-id.apps.googleusercontent.com",
+        "client_secret": "your-google-oauth2-client-secret",
+        "pop3": {
+          "host": "pop.gmail.com",
+          "port": 995,
+          "secure": true
+        }
+      }
+    ]
   }
 }

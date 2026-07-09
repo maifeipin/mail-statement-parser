@@ -53,3 +53,22 @@ class StatementTransactionRecord:
     original_amount: Optional[str] = None
     direction: Optional[str] = None
     raw_row_json: str = "{}"
+
+
+@dataclass
+class EmailSummaryRecord:
+    account_name: str
+    uid: str
+    sender: str
+    subject: str
+    email_date: str
+    category: Optional[str] = None
+    importance: Optional[str] = None
+    summary: Optional[str] = None
+    actions_json: str = "[]"
+    deadline: Optional[str] = None
+    deadline_raw: Optional[str] = None
+    status: str = "pending"
+    retry_count: int = 0
+    processed_at: Optional[str] = None
+    id: Optional[int] = None

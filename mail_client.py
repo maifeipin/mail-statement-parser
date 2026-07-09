@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """163 邮箱邮件技能 - 支持发送、读取、搜索、下载（含 HTML 表格解析）"""
 
-import json, os, sys, smtplib, imaplib, poplib, email, re, glob
+import json, os, sys, smtplib, imaplib, poplib, email, re, glob, base64
 from datetime import datetime, timezone, timedelta
 
 # Windows 终端中文编码与 emoji 兼容性适配
@@ -14,8 +14,8 @@ from email.mime.text import MIMEText
 from email.header import decode_header
 from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
-from statement_models import StatementRecord, ValidationIssue, ValidationResult, StatementTransactionRecord
-from statement_db import init_db, upsert_statement, save_validation_run, replace_transactions, get_recent_statements, get_summary_by_bank_month, get_reconciliation_rows, uid_exists, get_transactions_above_amount
+from statement_models import StatementRecord, ValidationIssue, ValidationResult, StatementTransactionRecord, EmailSummaryRecord
+from statement_db import init_db, upsert_statement, save_validation_run, replace_transactions, get_recent_statements, get_summary_by_bank_month, get_reconciliation_rows, uid_exists, get_transactions_above_amount, upsert_email_summary, get_email_summary_status, get_email_summary_by_id, get_recent_email_headers, get_potential_missed_emails
 
 CONFIG_CANDIDATES = [
     os.path.expanduser('email-config.local.json'),
@@ -155,6 +155,178 @@ def load_config():
     except Exception as e:
         print(f'错误：配置文件 - {e}')
         sys.exit(1)
+
+
+class MailAuthError(Exception):
+    """自定义邮件鉴权异常，遇到此类异常应当立即停止连接重试，防锁号"""
+    pass
+
+
+def retry_with_backoff(func, *args, max_retries=3, initial_delay=2, backoff_factor=2, **kwargs):
+    """带指数退避和抖动的连接重试包装器，不重试 MailAuthError"""
+    import time
+    import random
+    delay = initial_delay
+    last_err = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            return func(*args, **kwargs)
+        except MailAuthError as e:
+            # 鉴权错误直接向外抛，不重试
+            raise e
+        except Exception as e:
+            last_err = e
+            # 过滤不需要重试的致命本地/格式错误
+            err_name = e.__class__.__name__
+            if err_name in ("ValueError", "TypeError", "KeyError", "NameError", "AttributeError"):
+                raise e
+            print(f"⚠️ 连接暂时失败 (尝试 {attempt}/{max_retries}): {e}。将在 {delay:.1f} 秒后重试...")
+            time.sleep(delay + random.uniform(0, 0.5))
+            delay *= backoff_factor
+    raise last_err
+
+
+def load_accounts():
+    """从配置中加载所有邮箱账号。支持单邮箱（email）与多邮箱（emails）配置。"""
+    config = load_config()
+    accounts = []
+    if "emails" in config and isinstance(config["emails"], list):
+        accounts = config["emails"]
+    elif "email" in config and isinstance(config["email"], dict):
+        accounts = [config["email"]]
+    return accounts
+
+
+def connect_pop3(email_config):
+    """POP3 统一连接工厂。支持 Basic (账号密码) 以及 OAuth2 (XOAUTH2) 双重通道。"""
+    host = email_config['pop3']['host']
+    port = email_config['pop3']['port']
+    account = email_config['account']
+    auth_type = email_config.get('auth_type', 'basic')
+    
+    def _connect():
+        mail = poplib.POP3_SSL(host, port)
+        try:
+            if auth_type == 'oauth2':
+                from oauth_helper import get_valid_oauth_token
+                try:
+                    access_token = get_valid_oauth_token(email_config)
+                except ValueError as val_err:
+                    raise MailAuthError(f"OAuth2 Token 刷新失败: {val_err}") from val_err
+                auth_str = f"user={account}\x01auth=Bearer {access_token}\x01\x01"
+                auth_b64 = base64.b64encode(auth_str.encode('utf-8')).decode('utf-8')
+                mail._shortcmd(f'AUTH XOAUTH2 {auth_b64}')
+            else:
+                mail.user(account)
+                mail.pass_(email_config['authCode'])
+            return mail
+        except poplib.error_proto as pe:
+            err_msg = str(pe).lower()
+            if any(word in err_msg for word in ("auth", "login", "user", "pass", "cred", "fail", "invalid")):
+                raise MailAuthError(f"POP3 鉴权失败: {pe}") from pe
+            raise pe
+        except MailAuthError:
+            try:
+                mail.quit()
+            except Exception:
+                pass
+            raise
+        except Exception as e:
+            try:
+                mail.quit()
+            except Exception:
+                pass
+            raise e
+
+    return retry_with_backoff(_connect)
+
+
+def connect_smtp(email_config):
+    """SMTP 统一连接工厂。支持 Basic 登录及 XOAUTH2。"""
+    host = email_config['smtp']['host']
+    port = email_config['smtp']['port']
+    account = email_config['account']
+    auth_type = email_config.get('auth_type', 'basic')
+    secure = email_config['smtp'].get('secure', True)
+    
+    def _connect():
+        if secure:
+            server = smtplib.SMTP_SSL(host, port)
+        else:
+            server = smtplib.SMTP(host, port)
+            server.ehlo()
+            server.starttls()
+            server.ehlo()
+            
+        try:
+            if auth_type == 'oauth2':
+                from oauth_helper import get_valid_oauth_token
+                try:
+                    access_token = get_valid_oauth_token(email_config)
+                except ValueError as val_err:
+                    raise MailAuthError(f"OAuth2 Token 刷新失败: {val_err}") from val_err
+                auth_str = f"user={account}\x01auth=Bearer {access_token}\x01\x01"
+                server.auth('XOAUTH2', lambda response=None: auth_str)
+            else:
+                server.login(account, email_config['authCode'])
+            return server
+        except smtplib.SMTPAuthenticationError as sae:
+            raise MailAuthError(f"SMTP 鉴权失败 (代码 {sae.smtp_code}): {sae.smtp_error.decode('utf-8', errors='ignore') if isinstance(sae.smtp_error, bytes) else sae.smtp_error}") from sae
+        except MailAuthError:
+            try:
+                server.quit()
+            except Exception:
+                pass
+            raise
+        except Exception as e:
+            try:
+                server.quit()
+            except Exception:
+                pass
+            raise e
+
+    return retry_with_backoff(_connect)
+
+
+def connect_imap(email_config):
+    """IMAP 统一连接工厂。支持 Basic 登录及 XOAUTH2。"""
+    host = email_config['imap']['host']
+    port = email_config['imap']['port']
+    account = email_config['account']
+    auth_type = email_config.get('auth_type', 'basic')
+    
+    def _connect():
+        mail = imaplib.IMAP4_SSL(host, port)
+        try:
+            if auth_type == 'oauth2':
+                from oauth_helper import get_valid_oauth_token
+                try:
+                    access_token = get_valid_oauth_token(email_config)
+                except ValueError as val_err:
+                    raise MailAuthError(f"OAuth2 Token 刷新失败: {val_err}") from val_err
+                mail.authenticate('XOAUTH2', lambda x: f"user={account}\x01auth=Bearer {access_token}\x01\x01")
+            else:
+                mail.login(account, email_config['authCode'])
+            return mail
+        except imaplib.IMAP4.error as ie:
+            err_msg = str(ie).lower()
+            if any(word in err_msg for word in ("auth", "login", "cred", "fail", "invalid", "password")):
+                raise MailAuthError(f"IMAP 鉴权失败: {ie}") from ie
+            raise ie
+        except MailAuthError:
+            try:
+                mail.logout()
+            except Exception:
+                pass
+            raise
+        except Exception as e:
+            try:
+                mail.logout()
+            except Exception:
+                pass
+            raise e
+
+    return retry_with_backoff(_connect)
 
 def decode_mime(s):
     if not s: return ''
@@ -977,18 +1149,51 @@ def show_transactions_over(amount, months=None):
         ])
     print_table(headers, table_rows, alignments)
 
-def pop3_fetch_message_by_uid(uid):
-    """按 UID 拉取原始邮件，返回 message 对象。"""
-    config = load_config()
-    mail = poplib.POP3_SSL(config['email']['pop3']['host'], config['email']['pop3']['port'])
-    mail.user(config['email']['account'])
-    mail.pass_(config['email']['authCode'])
+def pop3_fetch_message_by_uid(uid, account_name=None):
+    """按 UID 拉取原始邮件，返回 message 对象。支持通过数据库反查或首账户兜底选定连接。"""
+    accounts = load_accounts()
+    if not accounts:
+        raise ValueError("No email configurations found.")
+        
+    target_config = None
+    if account_name:
+        for acc in accounts:
+            if acc.get('account') == account_name:
+                target_config = acc
+                break
+    else:
+        # 反查 email_summaries 中的 account_name
+        import sqlite3
+        conn = sqlite3.connect(DB_PATH)
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT account_name FROM email_summaries WHERE uid = ? LIMIT 1", (str(uid),))
+            row = cur.fetchone()
+            if row:
+                act_name = row[0]
+                for acc in accounts:
+                    if acc.get('account') == act_name:
+                        target_config = acc
+                        break
+        except Exception:
+            pass
+        finally:
+            conn.close()
+            
+    # 如果没查到，兜底用第一个配置账号
+    if not target_config:
+        target_config = accounts[0]
+        
+    mail = connect_pop3(target_config)
     try:
         _, headers, _ = mail.retr(int(uid))
         msg = email.message_from_bytes(b'\r\n'.join(headers))
         return msg
     finally:
-        mail.quit()
+        try:
+            mail.quit()
+        except Exception:
+            pass
 
 def classify_email_by_uid(uid):
     rules = load_rule_files()
@@ -1012,7 +1217,7 @@ def classify_email_by_uid(uid):
     except Exception as e:
         print(f'❌ 分类失败：{e}')
 
-def validate_email_by_uid(uid):
+def validate_email_by_uid(uid, account_name=None):
     """按规则解析并输出校验报告。"""
     rules = load_rule_files()
     if not rules:
@@ -1020,7 +1225,7 @@ def validate_email_by_uid(uid):
         return
 
     try:
-        msg = pop3_fetch_message_by_uid(uid)
+        msg = pop3_fetch_message_by_uid(uid, account_name=account_name)
         subj = decode_mime(msg.get('Subject', ''))
         frm = decode_mime(msg.get('From', ''))
         content = extract_email_content(msg)
@@ -1232,8 +1437,7 @@ def extract_email_content(msg):
 def send_email(to, subject, text):
     config = load_config()
     try:
-        server = smtplib.SMTP_SSL(config['email']['smtp']['host'], config['email']['smtp']['port'])
-        server.login(config['email']['account'], config['email']['authCode'])
+        server = connect_smtp(config['email'])
         msg = MIMEText(text, 'plain', 'utf-8')
         msg['From'] = config['email']['account']
         msg['To'] = to
@@ -1244,19 +1448,33 @@ def send_email(to, subject, text):
     except Exception as e:
         print(f'❌ 发送失败：{e}')
 
-def read_emails_pop3(limit=10):
-    config = load_config()
+def read_emails_pop3(limit=10, account_name=None):
+    accounts = load_accounts()
+    if not accounts:
+        print("❌ 未配置任何邮箱账户。")
+        return
+        
+    target_config = None
+    if account_name:
+        for acc in accounts:
+            if acc.get('account') == account_name:
+                target_config = acc
+                break
+        if not target_config:
+            print(f"❌ 找不到配置账号: {account_name}")
+            return
+    else:
+        target_config = accounts[0]
+        
     try:
-        mail = poplib.POP3_SSL(config['email']['pop3']['host'], config['email']['pop3']['port'])
-        mail.user(config['email']['account'])
-        mail.pass_(config['email']['authCode'])
+        mail = connect_pop3(target_config)
         num = len(mail.list()[1])
         if num == 0:
-            print('📭 邮箱为空')
+            print(f'📭 邮箱 {target_config.get("account")} 为空')
             mail.quit()
             return
         start = max(1, num - limit + 1)
-        print(f'📬 最新 {min(limit, num)} 封邮件:\n')
+        print(f'📬 最新 {min(limit, num)} 封邮件 ({target_config.get("account")}):\n')
         for i in range(num, start-1, -1):
             _, headers, _ = mail.retr(i)
             msg = email.message_from_bytes(b'\r\n'.join(headers))
@@ -1268,20 +1486,35 @@ def read_emails_pop3(limit=10):
     except Exception as e:
         print(f'❌ POP3 读取失败：{e}')
 
-def search_emails_pop3(keyword, limit=20):
-    config = load_config()
+
+def search_emails_pop3(keyword, limit=20, account_name=None):
+    accounts = load_accounts()
+    if not accounts:
+        print("❌ 未配置任何邮箱账户。")
+        return
+        
+    target_config = None
+    if account_name:
+        for acc in accounts:
+            if acc.get('account') == account_name:
+                target_config = acc
+                break
+        if not target_config:
+            print(f"❌ 找不到配置账号: {account_name}")
+            return
+    else:
+        target_config = accounts[0]
+        
     try:
-        mail = poplib.POP3_SSL(config['email']['pop3']['host'], config['email']['pop3']['port'])
-        mail.user(config['email']['account'])
-        mail.pass_(config['email']['authCode'])
+        mail = connect_pop3(target_config)
         num = len(mail.list()[1])
         if num == 0:
-            print('📭 邮箱为空')
+            print(f'📭 邮箱 {target_config.get("account")} 为空')
             mail.quit()
             return
         results = []
         kw = keyword.lower()
-        print(f'🔍 搜索 "{keyword}"...\n')
+        print(f'🔍 在 {target_config.get("account")} 中搜索 "{keyword}"...\n')
         skipped = 0
         for i in range(num, 0, -1):
             try:
@@ -1337,7 +1570,7 @@ def _parse_email_datetime(date_str):
         return None
 
 
-def _save_email_message(uid, msg, output_dir=None, format='md'):
+def _save_email_message(uid, msg, output_dir=None, format='md', account_name=None):
     """保存已拉取的 message 到本地（支持 Markdown/HTML）。"""
     if output_dir is None:
         output_dir = DOWNLOAD_DIR
@@ -1350,9 +1583,10 @@ def _save_email_message(uid, msg, output_dir=None, format='md'):
     # 提取邮件内容（包括 HTML 表格）
     content = extract_email_content(msg)
 
-    # 生成文件名，带 UID 避免批量下载时冲突
+    # 生成文件名，带 UID 避免批量下载时冲突，附加账户前缀隔离
     safe_subj = re.sub(r'[^\w\s-]', '', subj[:50]).strip().replace(' ', '_') or 'email'
-    fname = f'email_uid{uid}_{safe_subj}'
+    acc_prefix = f"acc_{account_name}_" if account_name else ""
+    fname = f'email_{acc_prefix}uid{uid}_{safe_subj}'
 
     saved_paths = {}
     write_html = format in ('html', 'both')
@@ -1417,9 +1651,12 @@ tr:nth-child(even) {{ background-color: #f2f2f2; }}
     return saved_paths
 
 
-def _collect_recent_bill_uids(months, rules, target_banks):
+def _collect_recent_bill_uids(months, rules, target_banks, email_config=None):
     """扫描最近N个月账单邮件，返回候选UID与统计信息。"""
-    config = load_config()
+    if not email_config:
+        accounts = load_accounts()
+        email_config = accounts[0] if accounts else {}
+        
     cutoff = _month_subtract(datetime.now(timezone.utc), int(months))
 
     keyword_map = {}
@@ -1445,10 +1682,8 @@ def _collect_recent_bill_uids(months, rules, target_banks):
     }
     candidates = []
 
-    mail = poplib.POP3_SSL(config['email']['pop3']['host'], config['email']['pop3']['port'])
+    mail = connect_pop3(email_config)
     try:
-        mail.user(config['email']['account'])
-        mail.pass_(config['email']['authCode'])
 
         num = len(mail.list()[1])
         if num == 0:
@@ -1506,65 +1741,68 @@ def download_recent_bank_emails(months=3, output_dir=None):
         print('❌ 未找到规则文件，请先在 rules 目录下放置 *.json')
         return
 
-    target_banks = {'HX', 'CMB', 'SPDB', 'CMBC', 'ICBC', 'CITIC'}
-    candidates, stats = _collect_recent_bill_uids(months, rules, target_banks)
-    cutoff = stats['cutoff']
-    keyword_map = stats['keyword_map']
-
-    print(f'🚀 执行专用指令：批量下载最近 {months} 个月账单')
-    print(f'📅 时间范围：{cutoff.date().isoformat()} ~ {datetime.now(timezone.utc).date().isoformat()}')
-    for b in sorted(keyword_map.keys()):
-        print(f'   {b} 关键字：{" | ".join(sorted(keyword_map[b]))}')
-
-    matched = len(candidates)
-    downloaded = 0
-    skipped_old = stats['skipped_old']
-    skipped_unmatched = stats['skipped_unmatched']
-    skipped_error = stats['skipped_error']
-
-    if not candidates:
-        print(
-            f'📭 没有可下载账单：跳过旧邮件 {skipped_old} 封，'
-            f'未匹配 {skipped_unmatched} 封，异常 {skipped_error} 封'
-        )
+    accounts = load_accounts()
+    if not accounts:
+        print("📭 未配置任何邮箱账户。")
         return
 
     if output_dir is None:
         output_dir = DOWNLOAD_DIR
     os.makedirs(output_dir, exist_ok=True)
 
-    try:
-        config = load_config()
-        mail = poplib.POP3_SSL(config['email']['pop3']['host'], config['email']['pop3']['port'])
-        mail.user(config['email']['account'])
-        mail.pass_(config['email']['authCode'])
+    target_banks = {'HX', 'CMB', 'SPDB', 'CMBC', 'ICBC', 'CITIC'}
+    
+    for account_config in accounts:
+        account_name = account_config.get('account', 'default')
+        print(f'\n🚀 开始同步账户 {account_name} 批量下载最近 {months} 个月账单')
+        
+        candidates, stats = _collect_recent_bill_uids(months, rules, target_banks, account_config)
+        cutoff = stats['cutoff']
+        keyword_map = stats['keyword_map']
 
-        for uid in candidates:
-            try:
-                # 幂等：检查是否已有该 uid 的文件
-                existing = [f for f in os.listdir(output_dir) if f.startswith(f'email_uid{uid}_')]
-                if existing:
-                    print(f'⏭️  UID={uid} 已下载，跳过')
-                    skipped_old += 1
-                    continue
-                _, headers, _ = mail.retr(int(uid))
-                msg = email.message_from_bytes(b'\r\n'.join(headers))
-                _save_email_message(uid, msg, output_dir=output_dir, format='md')
-                downloaded += 1
-            except Exception:
-                skipped_error += 1
-                continue
+        matched = len(candidates)
+        downloaded = 0
+        skipped_old = stats['skipped_old']
+        skipped_unmatched = stats['skipped_unmatched']
+        skipped_error = stats['skipped_error']
+
+        if not candidates:
+            print(
+                f'📭 账户 {account_name} 没有新匹配可下载账单：已处理/跳过旧邮件 {skipped_old} 封，'
+                f'未匹配 {skipped_unmatched} 封，异常 {skipped_error} 封'
+            )
+            continue
 
         try:
-            mail.quit()
-        except Exception:
-            pass
-        print(
-            f'\n✅ 执行完成：匹配 {matched} 封，下载 {downloaded} 封，'
-            f'跳过旧邮件 {skipped_old} 封，未匹配 {skipped_unmatched} 封，异常跳过 {skipped_error} 封'
-        )
-    except Exception as e:
-        print(f'❌ 批量下载失败：{e}')
+            mail = connect_pop3(account_config)
+
+            for uid in candidates:
+                try:
+                    # 幂等：检查是否已有该 uid 的文件（附加账户前缀）
+                    existing = [f for f in os.listdir(output_dir) if f.startswith(f'email_acc_{account_name}_uid{uid}_') or f.startswith(f'email_uid{uid}_')]
+                    if existing:
+                        print(f'⏭️  账户 {account_name} UID={uid} 已下载，跳过')
+                        skipped_old += 1
+                        continue
+                    _, headers, _ = mail.retr(int(uid))
+                    msg = email.message_from_bytes(b'\r\n'.join(headers))
+                    _save_email_message(uid, msg, output_dir=output_dir, format='md', account_name=account_name)
+                    downloaded += 1
+                except Exception as e:
+                    print(f"⚠️ UID={uid} 下载异常: {e}")
+                    skipped_error += 1
+                    continue
+
+            try:
+                mail.quit()
+            except Exception:
+                pass
+            print(
+                f'✅ 账户 {account_name} 执行完成：匹配 {matched} 封，下载 {downloaded} 封，'
+                f'已处理/旧邮件 {skipped_old} 封，未匹配 {skipped_unmatched} 封，异常跳过 {skipped_error} 封'
+            )
+        except Exception as e:
+            print(f'❌ 账户 {account_name} 批量下载失败：{e}')
 
 
 def validate_recent_bank_emails(months=3):
@@ -1575,45 +1813,52 @@ def validate_recent_bank_emails(months=3):
         print('❌ 未找到规则文件，请先在 rules 目录下放置 *.json')
         return
 
-    target_banks = {'HX', 'CMB', 'SPDB', 'CMBC', 'ICBC', 'CITIC'}
-    candidates, stats = _collect_recent_bill_uids(months, rules, target_banks)
-    cutoff = stats['cutoff']
-
-    print(f'🚀 执行专用指令：批量写库最近 {months} 个月账单')
-    print(f'📅 时间范围：{cutoff.date().isoformat()} ~ {datetime.now(timezone.utc).date().isoformat()}')
-
-    skipped_old = stats['skipped_old']
-    skipped_unmatched = stats['skipped_unmatched']
-    skipped_error = stats['skipped_error']
-
-    if not candidates:
-        print(
-            f'📭 没有可写库账单：跳过旧邮件 {skipped_old} 封，'
-            f'未匹配 {skipped_unmatched} 封，异常 {skipped_error} 封'
-        )
+    accounts = load_accounts()
+    if not accounts:
+        print("📭 未配置任何邮箱账户。")
         return
 
-    print(f'🧩 待写库账单 {len(candidates)} 封，开始校验并写库...')
-    ok = 0
-    fail = 0
-    skipped_db = 0
-    for uid in candidates:
-        # 幂等：检查是否已在 DB 中
-        if uid_exists(DB_PATH, str(uid)):
-            print(f'⏭️  UID={uid} 已在数据库，跳过')
-            skipped_db += 1
-            continue
-        try:
-            validate_email_by_uid(uid)
-            ok += 1
-        except Exception as e:
-            print(f'❌ UID={uid} 写库失败：{e}')
-            fail += 1
+    target_banks = {'HX', 'CMB', 'SPDB', 'CMBC', 'ICBC', 'CITIC'}
+    
+    for account_config in accounts:
+        account_name = account_config.get('account', 'default')
+        print(f'\n🚀 开始同步账户 {account_name} 批量写库最近 {months} 个月账单')
+        
+        candidates, stats = _collect_recent_bill_uids(months, rules, target_banks, account_config)
+        cutoff = stats['cutoff']
 
-    print(
-        f'\n✅ 执行完成：成功 {ok} 封，已在库跳过 {skipped_db} 封，失败 {fail} 封，'
-        f'过期邮件 {skipped_old} 封，未匹配 {skipped_unmatched} 封，异常 {skipped_error} 封'
-    )
+        skipped_old = stats['skipped_old']
+        skipped_unmatched = stats['skipped_unmatched']
+        skipped_error = stats['skipped_error']
+
+        if not candidates:
+            print(
+                f'📭 账户 {account_name} 没有新账单待写库：跳过旧邮件 {skipped_old} 封，'
+                f'未匹配 {skipped_unmatched} 封，异常 {skipped_error} 封'
+            )
+            continue
+
+        print(f'🧩 待写库账单 {len(candidates)} 封，开始校验并写库...')
+        ok = 0
+        fail = 0
+        skipped_db = 0
+        for uid in candidates:
+            # 幂等：检查是否已在 DB 中
+            if uid_exists(DB_PATH, str(uid)):
+                print(f'⏭️  UID={uid} 已在数据库，跳过')
+                skipped_db += 1
+                continue
+            try:
+                validate_email_by_uid(uid, account_name=account_name)
+                ok += 1
+            except Exception as e:
+                print(f'❌ UID={uid} 写库失败：{e}')
+                fail += 1
+
+        print(
+            f'✅ 账户 {account_name} 写库完成：成功 {ok} 封，已在库跳过 {skipped_db} 封，失败 {fail} 封，'
+            f'过期邮件 {skipped_old} 封，未匹配 {skipped_unmatched} 封，异常 {skipped_error} 封'
+        )
 
 
 def due_soon_bank_bills(months=3, days=7, output_dir=None):
@@ -1688,24 +1933,34 @@ def mark_statement_paid_cmd(bank_code, statement_month=None):
         print(f"❌ 未找到匹配的 {bank_code} 未还账单记录。")
 
 
-def download_email_pop3(uid, output_dir=None, format='md'):
+def download_email_pop3(uid, output_dir=None, format='md', account_name=None):
     """下载邮件，支持 HTML 表格解析"""
-    config = load_config()
     if output_dir is None:
         output_dir = DOWNLOAD_DIR
     os.makedirs(output_dir, exist_ok=True)
     
     try:
-        mail = poplib.POP3_SSL(config['email']['pop3']['host'], config['email']['pop3']['port'])
-        mail.user(config['email']['account'])
-        mail.pass_(config['email']['authCode'])
+        # 统一使用 pop3_fetch_message_by_uid 抓取（包含反查和探测逻辑）
+        msg = pop3_fetch_message_by_uid(uid, account_name=account_name)
         
-        _, headers, _ = mail.retr(int(uid))
-        msg = email.message_from_bytes(b'\r\n'.join(headers))
-        
-        _save_email_message(uid, msg, output_dir=output_dir, format=format)
-        
-        mail.quit()
+        # 确定实际的账户名以设置文件名隔离前缀
+        actual_account = account_name
+        if not actual_account:
+            import sqlite3
+            conn = sqlite3.connect(DB_PATH)
+            try:
+                cur = conn.cursor()
+                cur.execute("SELECT account_name FROM email_summaries WHERE uid = ? LIMIT 1", (str(uid),))
+                row = cur.fetchone()
+                if row:
+                    actual_account = row[0]
+            except Exception:
+                pass
+            finally:
+                conn.close()
+                
+        _save_email_message(uid, msg, output_dir=output_dir, format=format, account_name=actual_account)
+        print(f"✅ 下载成功: UID={uid}")
         
     except Exception as e:
         print(f'❌ 下载失败：{e}')
@@ -1713,34 +1968,40 @@ def download_email_pop3(uid, output_dir=None, format='md'):
         traceback.print_exc()
 
 def test_connection():
-    config = load_config()
-    acc = config['email']['account']
-    print(f'📧 测试：{acc}\n')
-    
-    try:
-        s = smtplib.SMTP_SSL(config['email']['smtp']['host'], config['email']['smtp']['port'])
-        s.login(acc, config['email']['authCode'])
-        s.quit()
-        print('✅ SMTP OK')
-    except Exception as e:
-        print(f'❌ SMTP: {e}')
-    
-    try:
-        p = poplib.POP3_SSL(config['email']['pop3']['host'], config['email']['pop3']['port'])
-        p.user(acc)
-        p.pass_(config['email']['authCode'])
-        p.quit()
-        print('✅ POP3 OK')
-    except Exception as e:
-        print(f'❌ POP3: {e}')
-    
-    try:
-        i = imaplib.IMAP4_SSL(config['email']['imap']['host'], config['email']['imap']['port'])
-        i.login(acc, config['email']['authCode'])
-        i.logout()
-        print('✅ IMAP 登录 OK')
-    except Exception as e:
-        print(f'❌ IMAP: {e}')
+    accounts = load_accounts()
+    if not accounts:
+        print("❌ 未配置任何邮箱账户。")
+        return
+        
+    for account_config in accounts:
+        acc = account_config['account']
+        print(f'📧 测试账户：{acc}')
+        print(f'----------------------------------------')
+        
+        # 测试 SMTP
+        try:
+            s = connect_smtp(account_config)
+            s.quit()
+            print('✅ SMTP OK')
+        except Exception as e:
+            print(f'❌ SMTP: {e}')
+        
+        # 测试 POP3
+        try:
+            p = connect_pop3(account_config)
+            p.quit()
+            print('✅ POP3 OK')
+        except Exception as e:
+            print(f'❌ POP3: {e}')
+        
+        # 测试 IMAP
+        try:
+            i = connect_imap(account_config)
+            i.logout()
+            print('✅ IMAP 登录 OK')
+        except Exception as e:
+            print(f'❌ IMAP: {e}')
+        print()
 
 def interactive_menu():
     init_db(DB_PATH)
@@ -1819,6 +2080,539 @@ def interactive_menu():
             
         input("\n按回车键继续...")
 
+def call_llm(prompt: str, system_instruction: str = None, json_mode: bool = False) -> str:
+    """使用 urllib 发送请求给 OpenAI 兼容 API 或 Gemini API。"""
+    import urllib.request
+    import json
+    import os
+
+    # 优先从环境配置获取
+    api_key = os.environ.get("LLM_API_KEY")
+    base_url = os.environ.get("LLM_BASE_URL", "https://api.openai.com/v1")
+    provider = os.environ.get("LLM_PROVIDER", "openai").lower()
+    model = os.environ.get("LLM_MODEL", "gpt-4o-mini")
+
+    if not api_key:
+        try:
+            config = load_config()
+            llm_cfg = config.get("llm", {})
+            api_key = llm_cfg.get("api_key")
+            if llm_cfg.get("base_url"):
+                base_url = llm_cfg.get("base_url")
+            if llm_cfg.get("provider"):
+                provider = llm_cfg.get("provider").lower()
+            if llm_cfg.get("model"):
+                model = llm_cfg.get("model")
+        except Exception:
+            pass
+
+    if not api_key:
+        raise ValueError("LLM API key not found. Please set LLM_API_KEY environment variable or config 'llm' block.")
+
+    if provider == "gemini":
+        if "generativelanguage.googleapis.com" not in base_url and "api.openai.com" in base_url:
+            base_url = "https://generativelanguage.googleapis.com"
+        
+        url = f"{base_url.rstrip('/')}/v1beta/models/{model}:generateContent?key={api_key}"
+        
+        contents_parts = [{"text": prompt}]
+        payload = {"contents": [{"parts": contents_parts}]}
+        if system_instruction:
+            payload["systemInstruction"] = {"parts": [{"text": system_instruction}]}
+        
+        generation_config = {}
+        if json_mode:
+            generation_config["responseMimeType"] = "application/json"
+        if generation_config:
+            payload["generationConfig"] = generation_config
+            
+        req_headers = {"Content-Type": "application/json"}
+    else:
+        url = f"{base_url.rstrip('/')}/chat/completions"
+        messages = []
+        if system_instruction:
+            messages.append({"role": "system", "content": system_instruction})
+        messages.append({"role": "user", "content": prompt})
+        
+        payload = {
+            "model": model,
+            "messages": messages,
+            "temperature": 0.1
+        }
+        if json_mode:
+            payload["response_format"] = {"type": "json_object"}
+            
+        req_headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}"
+        }
+
+    data_bytes = json.dumps(payload, ensure_ascii=False).encode('utf-8')
+    req = urllib.request.Request(url, data=data_bytes, headers=req_headers, method='POST')
+    
+    with urllib.request.urlopen(req, timeout=60) as response:
+        resp_data = json.loads(response.read().decode('utf-8'))
+        
+    if provider == "gemini":
+        try:
+            return resp_data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        except (KeyError, IndexError) as e:
+            raise ValueError(f"Failed to parse Gemini Response: {resp_data}. {e}")
+    else:
+        try:
+            return resp_data["choices"][0]["message"]["content"].strip()
+        except (KeyError, IndexError) as e:
+            raise ValueError(f"Failed to parse OpenAI Response: {resp_data}. {e}")
+
+
+def slice_and_summarize_long_email(body_text: str, max_chunk_len: int = 4000) -> str:
+    """若邮件内容过长，对内容进行切片（Slicing），分段提取摘要并拼接，防止直接截断丢失核心信息。"""
+    if len(body_text) <= max_chunk_len:
+        return body_text
+
+    print(f"📝 邮件正文过长 ({len(body_text)} 字符)，启动分段切片摘要提取...")
+    
+    chunks = []
+    start = 0
+    total_len = len(body_text)
+    
+    while start < total_len:
+        if start + max_chunk_len >= total_len:
+            chunks.append(body_text[start:])
+            break
+            
+        end_idx = start + max_chunk_len
+        search_min = start + 3500
+        boundary_idx = -1
+        
+        # 寻找最近的换行符
+        for idx in range(end_idx - 1, search_min - 1, -1):
+            if body_text[idx] == '\n':
+                boundary_idx = idx
+                break
+                
+        # 如果没有找到换行符，寻找句子终结符
+        if boundary_idx == -1:
+            for idx in range(end_idx - 1, search_min - 1, -1):
+                if body_text[idx] in ('.', '。', '?', '？', '!', '！'):
+                    boundary_idx = idx + 1
+                    break
+                    
+        if boundary_idx != -1:
+            chunk = body_text[start:boundary_idx].strip()
+            start = boundary_idx
+        else:
+            chunk = body_text[start:end_idx].strip()
+            start = end_idx
+            
+        chunks.append(chunk)
+
+    summaries = []
+    max_chunks = 5
+    truncated = len(chunks) > max_chunks
+    
+    for idx, chunk in enumerate(chunks[:max_chunks]):
+        prompt = (
+            f"以下是一封超长邮件的第 {idx+1}/{len(chunks)} 分块内容。请在 150 字内精确提取本段内容的关键核心信息、时间限制或待办事项：\n\n"
+            f"{chunk}"
+        )
+        system_instruction = (
+            "你是一个精炼的文本分段摘要提取助手。\n"
+            "⚠️ 注意：你必须在摘要中特别【原样保留】任何具体的日期时间（如“下周二之前”、“2026-07-15”）、"
+            "验证码/验证令牌、金额数字及重要专有名词，绝对不能对其进行任何转述、泛化或省略！"
+        )
+        try:
+            summary = call_llm(prompt, system_instruction=system_instruction)
+            summaries.append(f"[分块 {idx+1} 核心摘要]: {summary}")
+        except Exception as e:
+            print(f"⚠️ 分块 {idx+1} 摘要提取失败: {e}")
+            summaries.append(f"[分块 {idx+1} 截取]: {chunk[:200]}...")
+            
+    result = "\n\n".join(summaries)
+    if truncated:
+        result += "\n\n⚠️ [警告]: 邮件内容过长 (已超 20000 字符限制)，尾部内容已被自动截断。"
+        
+    return result
+
+
+def extract_email_summary_by_llm(subject: str, sender: str, body_text: str, email_date: str) -> dict:
+    """借助大模型分析邮件提取核心分类与摘要信息。"""
+    from datetime import datetime
+    import json
+    current_time_str = datetime.now().isoformat()
+    
+    # 启用长邮件切片与预提炼
+    sliced_body = slice_and_summarize_long_email(body_text)
+    
+    system_instruction = (
+        "你是一个电子邮件处理网关。请阅读下面的邮件，并输出一份完全符合指定 JSON 约束格式的内容。\n"
+        "不允许有任何代码块标记（如 ```json）或额外的包裹描述，必须直接输出合法的 JSON 对象本身。\n\n"
+        "JSON 输出约束格式如下：\n"
+        "{\n"
+        "  \"category\": \"Work\" | \"Finance\" | \"Security\" | \"Personal\" | \"Newsletter\" | \"Spam\",\n"
+        "  \"importance\": \"high\" | \"medium\" | \"low\",\n"
+        "  \"summary\": \"一至两句精确的中文字幕核心摘要。\",\n"
+        "  \"actions\": [\"动作项描述1\", \"动作项描述2\"],\n"
+        "  \"deadline\": \"YYYY-MM-DD HH:MM\" | null,\n"
+        "  \"deadline_raw\": \"截止时间在邮件中的最原始文本描述\" | null\n"
+        "}\n\n"
+        "注意事项：\n"
+        "1. category 分类：'Work'(工作计划、会议通知)、'Finance'(退款、发票、除了银行月度对账单以外的财务往来)、'Security'(验证码、登录风险提醒)、'Personal'(个人联络)、'Newsletter'(周报、新闻、日常订阅订阅)、'Spam'(垃圾推广/广告)\n"
+        "2. importance 分级：'high'(含明确重要时间限制的通知、账号密码等安全修改、财务重大变动)、'medium'(普通通知、日常会议安排)、'low'(常规无须回馈的报告、推广)\n"
+        "3. deadline 计算：必须以“当前系统时间”和邮件的“发件时间”为准，将邮件中的相对表述（如：下周一下午）换算为归一化 ISO 绝对日期时间，若没有则填 null。"
+    )
+    
+    prompt = (
+        f"当前系统时间 (基准参考): {current_time_str}\n"
+        f"发信时间: {email_date}\n"
+        f"发件人: {sender}\n"
+        f"主题: {subject}\n\n"
+        f"正文内容:\n{sliced_body}"
+    )
+    
+    response_text = call_llm(prompt, system_instruction=system_instruction, json_mode=True)
+    
+    if response_text.startswith("```"):
+        lines = response_text.splitlines()
+        if len(lines) >= 2:
+            if lines[0].startswith("```json") or lines[0].startswith("```"):
+                response_text = "\n".join(lines[1:-1])
+                
+    response_text = response_text.strip()
+    return json.loads(response_text)
+
+
+def load_static_noise_rules() -> dict:
+    """载入 noise_rules.json，包含 whitelists 和 spam_keywords 等"""
+    default_rules = {
+        "white_domains": ["bank", "secure", "security", "aliyun", "tencent", "github", "paypal", "stripe", "microsoft", "google", "apple"],
+        "white_local_prefixes": ["verify", "code", "order", "receipt", "bill", "alert", "notify", "support", "service"],
+        "spam_keywords": ["广告", "优惠券", "促销", "特惠", "打折", "限时特购", "双十一", "爆款", "推广", "理财推荐"],
+        "sensitive_words": ["账单", "订单", "安全", "密码", "验证码", "异常", "登录", "verify", "code", "security", "password", "alert", "login", "billing"],
+        "protected_domains": ["qq.com", "gmail.com", "163.com", "outlook.com", "hotmail.com", "yahoo.com", "icloud.com"]
+    }
+    
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    rules_path = os.path.join(current_dir, "noise_rules.json")
+    if os.path.exists(rules_path):
+        try:
+            with open(rules_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"⚠️ 无法加载 noise_rules.json: {e}，将使用内置默认规则。")
+            
+    return default_rules
+
+
+def is_noise_email(sender: str, subject: str, body_text: str) -> tuple[bool, str, str]:
+    """启发式邮件前置过滤，拦截无须大模型消费的明显的自动通知。"""
+    from email.utils import parseaddr
+    sender_l = sender.lower()
+    subject_l = subject.lower()
+    
+    _, addr = parseaddr(sender_l)
+    addr_l = addr.lower()
+    local, domain = addr_l.split('@') if '@' in addr_l else (addr_l, '')
+    
+    # 1. 载入静态过滤规则
+    rules = load_static_noise_rules()
+    white_domains = rules.get("white_domains", [])
+    white_local_prefixes = rules.get("white_local_prefixes", [])
+    spam_keywords = rules.get("spam_keywords", [])
+    sensitive_words = rules.get("sensitive_words", [])
+    
+    # 2. 显式的白名单放行（绝对优先）：安全告警、验证码、交易订单确认、重要资产
+    is_whitelisted = False
+    if any(d in domain for d in white_domains):
+        is_whitelisted = True
+    elif any(local.startswith(p) or f".{p}" in local or f"_{p}" in local or local == p for p in white_local_prefixes):
+        is_whitelisted = True
+        
+    if is_whitelisted:
+        return False, '', ''
+        
+    # 3. 动态黑名单库校验
+    from statement_db import load_noise_rules
+    dynamic_rules = load_noise_rules(DB_PATH)
+    for p_type, p_val in dynamic_rules:
+        p_val_l = p_val.lower()
+        if p_type == 'sender_domain' and p_val_l == domain:
+            return True, 'Newsletter', 'low'
+        elif p_type == 'sender_email' and p_val_l == addr_l:
+            return True, 'Newsletter', 'low'
+            
+    # 4. 垃圾推广与促销广告 (Spam)
+    if any(k in subject_l for k in spam_keywords):
+        return True, 'Spam', 'low'
+        
+    # 5. 显式的邮件订阅与 Newsletter
+    body_l = body_text.lower()
+    has_sensitive = any(w in subject_l or w in body_l for w in sensitive_words)
+    if ('unsubscribe' in body_l or '退订' in body_text) and not has_sensitive:
+        return True, 'Newsletter', 'low'
+        
+    # 仅针对明确是自动日报/周报/订阅号的 sender 进行拦截
+    noise_senders = ['newsletter', 'weekly-report', 'daily-report', 'digest', 'weekly-digest']
+    if any(s in sender_l for s in noise_senders):
+        return True, 'Newsletter', 'low'
+        
+    return False, '', ''
+
+
+def fetch_recent_emails_and_summarize(months=1):
+    """双通道收网网关命令：批量抓取解析正则账单，并对其他邮件进行 LLM 结构化摘要提炼。"""
+    import json
+    from datetime import datetime, timezone
+    
+    init_db(DB_PATH)
+    rules = load_rule_files()
+    
+    cutoff = _month_subtract(datetime.now(timezone.utc), int(months))
+    print(f'🚀 正在执行双通道同步指令：获取最近 {months} 个月邮件...')
+    print(f'📅 统计截止范围：{cutoff.date().isoformat()} 起')
+    
+    accounts = load_accounts()
+    if not accounts:
+        print("📭 未配置任何邮箱账户。")
+        return
+        
+    scanned_total = 0
+    new_bills_total = 0
+    new_summaries_total = 0
+    skipped_dup_total = 0
+    errors_total = 0
+    
+    high_importance_summaries = []
+    
+    for account_config in accounts:
+        account_name = account_config.get('account', 'default')
+        print(f'\n🔌 正在连接邮箱 {account_name} ...')
+        
+        try:
+            mail = connect_pop3(account_config)
+        except Exception as e:
+            print(f'❌ 无法连接邮箱 {account_name}: {e}')
+            errors_total += 1
+            continue
+            
+        scanned = 0
+        new_bills = 0
+        new_summaries = 0
+        skipped_dup = 0
+        errors = 0
+        
+        try:
+            num = len(mail.list()[1])
+            if num == 0:
+                print(f'📭 邮箱 {account_name} 中没有任何邮件。')
+                continue
+                
+            print(f'🧩 邮箱 {account_name} 邮件总数: {num} 封，开始最新邮件反向匹配...')
+            
+            consecutive_old = 0
+            consecutive_skip = 0
+            for i in range(num, 0, -1):
+                scanned += 1
+                uid = str(i)
+                
+                is_dup_bill = uid_exists(DB_PATH, uid)
+                status, retry_cnt = get_email_summary_status(DB_PATH, account_name, uid)
+                is_dup_summary = (status in ('processed', 'skipped', 'noise') or (status == 'failed' and retry_cnt >= 3))
+                
+                if is_dup_bill or is_dup_summary:
+                    skipped_dup += 1
+                    consecutive_skip += 1
+                    if consecutive_skip >= 10:
+                        print(f'📅 连续遇到 {consecutive_skip} 封已处理邮件，提早结束扫描。')
+                        break
+                    continue
+                else:
+                    consecutive_skip = 0
+                    
+                try:
+                    _, headers, _ = mail.retr(i)
+                    msg = email.message_from_bytes(b'\r\n'.join(headers))
+                    subj = decode_mime(msg.get('Subject', ''))
+                    frm = decode_mime(msg.get('From', ''))
+                    date_str = _to_text(msg.get('Date', ''))
+                    
+                    dt = _parse_email_datetime(date_str)
+                    if dt and dt < cutoff:
+                        consecutive_old += 1
+                        if consecutive_old >= 10:
+                            print(f'📅 连续遇到 {consecutive_old} 封旧邮件，提早结束扫描。')
+                            break
+                        continue
+                    else:
+                        consecutive_old = 0
+                    
+                    content = extract_email_content(msg)
+                    body_text = (content.get('plain', '') + '\n' + content.get('markdown', '')).strip()
+                    
+                    # 双通道分流 A: 账单正则识别
+                    rule, score = identify_rule(subj, frm, body_text, rules)
+                    if rule:
+                        print(f'💳 [账单通道] 命中规则 {rule.get("rule_id")} (UID={uid}) 主题: {subj[:30]}')
+                        validate_and_save_email_message(msg, uid, rules=rules)
+                        new_bills += 1
+                        continue
+                    
+                    # 双通道分流 B: 启发式降噪
+                    is_noise, cat, imp = is_noise_email(frm, subj, body_text)
+                    if is_noise:
+                        print(f'🔕 [降噪拦截] 自动匹配规则 (UID={uid}) 主题: {subj[:30]}')
+                        rec = EmailSummaryRecord(
+                            account_name=account_name,
+                            uid=uid,
+                            sender=frm,
+                            subject=subj,
+                            email_date=date_str,
+                            category=cat,
+                            importance=imp,
+                            summary="[自动降噪拦截] 发件人或主题命中过滤规则",
+                            actions_json="[]",
+                            status="noise",
+                            retry_count=0,
+                            processed_at=datetime.now(timezone.utc).isoformat()
+                        )
+                        rec_id = upsert_email_summary(DB_PATH, rec)
+                        rec.id = rec_id
+                        new_summaries += 1
+                        continue
+                    
+                    # 双通道分流 C: LLM 通用提炼
+                    print(f'🤖 [大模型通道] 开始处理 (UID={uid}) 主题: {subj[:30]}')
+                    try:
+                        res = extract_email_summary_by_llm(subj, frm, body_text, date_str)
+                        rec = EmailSummaryRecord(
+                            account_name=account_name,
+                            uid=uid,
+                            sender=frm,
+                            subject=subj,
+                            email_date=date_str,
+                            category=res.get("category", "Work"),
+                            importance=res.get("importance", "low"),
+                            summary=res.get("summary", ""),
+                            actions_json=json.dumps(res.get("actions", []), ensure_ascii=False),
+                            deadline=res.get("deadline"),
+                            deadline_raw=res.get("deadline_raw"),
+                            status="processed",
+                            retry_count=retry_cnt,
+                            processed_at=datetime.now(timezone.utc).isoformat()
+                        )
+                        rec_id = upsert_email_summary(DB_PATH, rec)
+                        rec.id = rec_id
+                        new_summaries += 1
+                        
+                        if rec.importance == 'high':
+                            high_importance_summaries.append(rec)
+                    except Exception as llm_err:
+                        print(f'❌ [大模型通道] 提取失败 (UID={uid}): {llm_err}')
+                        new_retry = retry_cnt + 1
+                        rec = EmailSummaryRecord(
+                            account_name=account_name,
+                            uid=uid,
+                            sender=frm,
+                            subject=subj,
+                            email_date=date_str,
+                            summary=f"[大模型分析失败]: {llm_err}",
+                            status="failed",
+                            retry_count=new_retry
+                        )
+                        rec_id = upsert_email_summary(DB_PATH, rec)
+                        rec.id = rec_id
+                        errors += 1
+                        
+                except Exception as mail_err:
+                    print(f'❌ [邮件错误] 解析出错 (UID={uid}): {mail_err}')
+                    errors += 1
+                    continue
+        finally:
+            try:
+                mail.quit()
+            except Exception:
+                pass
+            print(f'🏁 账户 {account_name} 扫描完成：新入库账单 {new_bills} 封，通用提炼 {new_summaries} 封，跳过重复 {skipped_dup} 封，处理失败 {errors} 封')
+            scanned_total += scanned
+            new_bills_total += new_bills
+            new_summaries_total += new_summaries
+            skipped_dup_total += skipped_dup
+            errors_total += errors
+
+    print(f'\n🏁 全局同步完成：总扫描 {scanned_total} 封，新入库账单 {new_bills_total} 封，通用提炼 {new_summaries_total} 封，跳过重复 {skipped_dup_total} 封，全局失败 {errors_total} 封')
+    
+    if high_importance_summaries:
+        print("\n=== 🔥 发现高优待推送邮件 ===")
+        high_summaries_list = []
+        for r in high_importance_summaries:
+            summary_dict = {
+                "id": r.id,
+                "account_name": r.account_name,
+                "uid": r.uid,
+                "sender": r.sender,
+                "subject": r.subject,
+                "email_date": r.email_date,
+                "category": r.category,
+                "importance": r.importance,
+                "summary": r.summary,
+                "actions": json.loads(r.actions_json),
+                "deadline": r.deadline,
+                "deadline_raw": r.deadline_raw
+            }
+            high_summaries_list.append(summary_dict)
+            print(f"[{r.account_name}] [{r.category}] 重要度: {r.importance} | {r.subject}")
+            print(f"   摘要: {r.summary}")
+            if r.deadline:
+                print(f"   截止时间: {r.deadline} (原文: {r.deadline_raw})")
+        
+        # 打印输出 JSON_PUSH 区域，便于 lite_agent 捕获推送
+        print("\n--- JSON_PUSH_START ---")
+        print(json.dumps(high_summaries_list, ensure_ascii=False))
+        print("--- JSON_PUSH_END ---")
+
+
+def show_headers(limit=15):
+    """CLI subcommand: 打印最近拉取的邮件标题列表，输出格式为 JSON"""
+    init_db(DB_PATH)
+    rows = get_recent_email_headers(DB_PATH, limit)
+    result = []
+    for r in rows:
+        result.append({
+            "id": r["id"],
+            "account_name": r["account_name"],
+            "uid": r["uid"],
+            "sender": r["sender"],
+            "subject": r["subject"],
+            "email_date": r["email_date"],
+            "category": r["category"],
+            "importance": r["importance"],
+            "status": r["status"],
+            "processed_at": r["processed_at"]
+        })
+    print(json.dumps(result, ensure_ascii=False))
+
+
+def show_missed(limit=15):
+    """CLI subcommand: 打印可能错过的非高优邮件列表，输出格式为 JSON"""
+    init_db(DB_PATH)
+    rows = get_potential_missed_emails(DB_PATH, limit)
+    result = []
+    for r in rows:
+        result.append({
+            "id": r["id"],
+            "account_name": r["account_name"],
+            "uid": r["uid"],
+            "sender": r["sender"],
+            "subject": r["subject"],
+            "email_date": r["email_date"],
+            "category": r["category"],
+            "importance": r["importance"],
+            "summary": r["summary"],
+            "status": r["status"]
+        })
+    print(json.dumps(result, ensure_ascii=False))
+
+
 def main():
     if len(sys.argv) < 2:
         interactive_menu()
@@ -1838,15 +2632,19 @@ def main():
         send_email(sys.argv[2], sys.argv[3], ' '.join(sys.argv[4:]))
     elif cmd == 'read':
         limit = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2].isdigit() else 10
-        read_emails_pop3(limit)
+        account_name = sys.argv[3] if len(sys.argv) > 3 else None
+        read_emails_pop3(limit, account_name)
     elif cmd == 'search':
         if len(sys.argv) < 3:
-            print('用法：search <keyword>')
+            print('用法：search <keyword> [limit] [account_name]')
             sys.exit(1)
-        search_emails_pop3(sys.argv[2], int(sys.argv[3]) if len(sys.argv) > 3 and sys.argv[3].isdigit() else 20)
+        keyword = sys.argv[2]
+        limit = int(sys.argv[3]) if len(sys.argv) > 3 and sys.argv[3].isdigit() else 20
+        account_name = sys.argv[4] if len(sys.argv) > 4 else None
+        search_emails_pop3(keyword, limit, account_name)
     elif cmd == 'download':
         if len(sys.argv) < 3:
-            print('用法：download <uid>')
+            print('用法：download <uid> [account_name]')
             sys.exit(1)
         uid = sys.argv[2]
         format = 'both'
@@ -1854,7 +2652,9 @@ def main():
             format = 'html'
         elif '--md' in sys.argv:
             format = 'md'
-        download_email_pop3(uid, format=format)
+        args = [arg for arg in sys.argv[3:] if not arg.startswith('--')]
+        account_name = args[0] if args else None
+        download_email_pop3(uid, format=format, account_name=account_name)
     elif cmd in ('download_bank_bills', 'exec3m'):
         months = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2].isdigit() else 3
         download_recent_bank_emails(months)
@@ -1873,6 +2673,15 @@ def main():
         months = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2].isdigit() else 3
         days = int(sys.argv[3]) if len(sys.argv) > 3 and sys.argv[3].isdigit() else 7
         due_soon_bank_bills(months, days)
+    elif cmd == 'fetch_summaries':
+        months = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2].isdigit() else 1
+        fetch_recent_emails_and_summarize(months)
+    elif cmd == 'show_headers':
+        limit = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2].isdigit() else 15
+        show_headers(limit)
+    elif cmd == 'show_missed':
+        limit = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2].isdigit() else 15
+        show_missed(limit)
     elif cmd in ('validate_bank_bills', 'validate3m'):
         months = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2].isdigit() else 3
         validate_recent_bank_emails(months)

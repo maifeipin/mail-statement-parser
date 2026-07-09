@@ -3,9 +3,9 @@
 
 import sqlite3
 from datetime import datetime, timezone
-from typing import Iterable
+from typing import Iterable, Optional
 
-from statement_models import StatementRecord, ValidationIssue, StatementTransactionRecord
+from statement_models import StatementRecord, ValidationIssue, StatementTransactionRecord, EmailSummaryRecord
 
 
 def _utc_now_iso() -> str:
@@ -89,6 +89,40 @@ def init_db(db_path: str) -> None:
                 direction TEXT,
                 raw_row_json TEXT,
                 created_at TEXT NOT NULL
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS email_summaries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_name TEXT NOT NULL,
+                uid TEXT NOT NULL,
+                sender TEXT,
+                subject TEXT,
+                email_date TEXT,
+                category TEXT,
+                importance TEXT,
+                summary TEXT,
+                actions_json TEXT,
+                deadline TEXT,
+                deadline_raw TEXT,
+                status TEXT DEFAULT 'pending',
+                retry_count INTEGER DEFAULT 0,
+                processed_at TEXT,
+                created_at TEXT NOT NULL,
+                UNIQUE(account_name, uid)
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS noise_rules (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                pattern_type TEXT NOT NULL, -- 'sender_domain', 'sender_email'
+                pattern_value TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(pattern_type, pattern_value)
             )
             """
         )
@@ -559,6 +593,196 @@ def get_unpaid_statements(db_path: str, months: int = None) -> list[sqlite3.Row]
         query += " ORDER BY due_date ASC, bank_code ASC"
         
         cur.execute(query, params)
+        return list(cur.fetchall())
+    finally:
+        conn.close()
+
+
+def upsert_email_summary(db_path: str, record: EmailSummaryRecord) -> int:
+    conn = sqlite3.connect(db_path)
+    try:
+        cur = conn.cursor()
+        now = _utc_now_iso()
+        cur.execute(
+            """
+            INSERT INTO email_summaries (
+                account_name, uid, sender, subject, email_date, category,
+                importance, summary, actions_json, deadline, deadline_raw,
+                status, retry_count, processed_at, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(account_name, uid) DO UPDATE SET
+                sender = excluded.sender,
+                subject = excluded.subject,
+                email_date = excluded.email_date,
+                category = excluded.category,
+                importance = excluded.importance,
+                summary = excluded.summary,
+                actions_json = excluded.actions_json,
+                deadline = excluded.deadline,
+                deadline_raw = excluded.deadline_raw,
+                status = excluded.status,
+                retry_count = excluded.retry_count,
+                processed_at = excluded.processed_at
+            """,
+            (
+                record.account_name,
+                record.uid,
+                record.sender,
+                record.subject,
+                record.email_date,
+                record.category,
+                record.importance,
+                record.summary,
+                record.actions_json,
+                record.deadline,
+                record.deadline_raw,
+                record.status,
+                record.retry_count,
+                record.processed_at,
+                now
+            )
+        )
+        if cur.lastrowid:
+            row_id = cur.lastrowid
+        else:
+            cur.execute(
+                "SELECT id FROM email_summaries WHERE account_name = ? AND uid = ? LIMIT 1",
+                (record.account_name, record.uid)
+            )
+            row_id = cur.fetchone()[0]
+        conn.commit()
+        return row_id
+    finally:
+        conn.close()
+
+
+def get_email_summary_status(db_path: str, account_name: str, uid: str) -> tuple[Optional[str], int]:
+    """获取邮件的当前状态和已重试次数。返回 (status, retry_count)。如果不存在则返回 (None, 0)。"""
+    conn = sqlite3.connect(db_path)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT status, retry_count FROM email_summaries WHERE account_name = ? AND uid = ? LIMIT 1",
+            (account_name, uid)
+        )
+        row = cur.fetchone()
+        if row:
+            return row[0], row[1] or 0
+        return None, 0
+    finally:
+        conn.close()
+
+
+def add_noise_rule(db_path: str, pattern_type: str, pattern_value: str) -> None:
+    """插入一条降噪过滤规则（具有唯一约束，幂等）"""
+    conn = sqlite3.connect(db_path)
+    try:
+        cur = conn.cursor()
+        now = _utc_now_iso()
+        cur.execute(
+            """
+            INSERT OR IGNORE INTO noise_rules (pattern_type, pattern_value, created_at)
+            VALUES (?, ?, ?)
+            """,
+            (pattern_type, pattern_value, now)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def delete_noise_rule(db_path: str, pattern_type: str, pattern_value: str) -> bool:
+    """删除一条指定的降噪过滤规则"""
+    conn = sqlite3.connect(db_path)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "DELETE FROM noise_rules WHERE pattern_type = ? AND pattern_value = ?",
+            (pattern_type, pattern_value)
+        )
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def load_noise_rules(db_path: str) -> list[tuple[str, str]]:
+    """加载所有自定义的降噪规则，返回 list[(pattern_type, pattern_value)]"""
+    conn = sqlite3.connect(db_path)
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT pattern_type, pattern_value FROM noise_rules")
+        return cur.fetchall()
+    finally:
+        conn.close()
+
+
+def update_summary_status(db_path: str, summary_id: int, status: str) -> bool:
+    """依据数据库自增主键 ID，更新邮件摘要的状态 (status)"""
+    conn = sqlite3.connect(db_path)
+    try:
+        cur = conn.cursor()
+        now = _utc_now_iso()
+        cur.execute(
+            "UPDATE email_summaries SET status = ?, processed_at = ? WHERE id = ?",
+            (status, now, summary_id)
+        )
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def get_email_summary_by_id(db_path: str, summary_id: int) -> Optional[sqlite3.Row]:
+    """依据数据库自增主键 ID，获取单条邮件摘要记录"""
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM email_summaries WHERE id = ?", (summary_id,))
+        return cur.fetchone()
+    finally:
+        conn.close()
+
+
+def get_recent_email_headers(db_path: str, limit: int = 15) -> list[sqlite3.Row]:
+    """获取最近拉取的邮件摘要记录用于标题列表展示"""
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT id, account_name, uid, sender, subject, email_date, category, importance, status, processed_at
+            FROM email_summaries 
+            ORDER BY email_date DESC, id DESC 
+            LIMIT ?
+            """,
+            (limit,)
+        )
+        return list(cur.fetchall())
+    finally:
+        conn.close()
+
+
+def get_potential_missed_emails(db_path: str, limit: int = 15) -> list[sqlite3.Row]:
+    """获取可能错过的非高优邮件记录 (最近7天内，importance != 'high', category != 'Spam')"""
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        cur = conn.cursor()
+        import datetime
+        cutoff_date = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=7)).isoformat()
+        cur.execute(
+            """
+            SELECT id, account_name, uid, sender, subject, email_date, category, importance, summary, status
+            FROM email_summaries 
+            WHERE importance != 'high' AND category != 'Spam' AND status IN ('processed', 'skipped') AND email_date >= ?
+            ORDER BY email_date DESC, id DESC 
+            LIMIT ?
+            """,
+            (cutoff_date, limit)
+        )
         return list(cur.fetchall())
     finally:
         conn.close()
