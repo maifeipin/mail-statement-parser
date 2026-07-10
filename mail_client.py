@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """163 邮箱邮件技能 - 支持发送、读取、搜索、下载（含 HTML 表格解析）"""
 
-import json, os, sys, smtplib, imaplib, poplib, email, re, glob, base64
+import json, os, sys, email, re, glob
 from datetime import datetime, timezone, timedelta
 
 # Windows 终端中文编码与 emoji 兼容性适配
@@ -11,13 +11,8 @@ if sys.platform.startswith('win'):
         sys.stderr.reconfigure(encoding='utf-8')
     except Exception:
         pass
-from decimal import Decimal, InvalidOperation
-from email.mime.text import MIMEText
-from email.header import decode_header
-from email.utils import parsedate_to_datetime
-from html.parser import HTMLParser
-from statement_models import StatementRecord, ValidationIssue, ValidationResult, StatementTransactionRecord, EmailSummaryRecord
-from statement_db import init_db, upsert_statement, save_validation_run, replace_transactions, get_recent_statements, get_summary_by_bank_month, get_reconciliation_rows, uid_exists, get_transactions_above_amount, upsert_email_summary, get_email_summary_status, get_email_summary_by_id, get_recent_email_headers, get_potential_missed_emails
+from statement_models import EmailSummaryRecord
+from statement_db import init_db, get_recent_statements, get_summary_by_bank_month, get_reconciliation_rows, uid_exists, get_transactions_above_amount, upsert_email_summary, get_email_summary_status, get_email_summary_by_id, get_recent_email_headers, get_potential_missed_emails
 
 
 from mail_connect import (MailAuthError, retry_with_backoff, is_graph_api, connect_pop3, connect_smtp, connect_imap, _graph_api_request, fetch_summaries_graph, send_email_graph, _month_subtract)
