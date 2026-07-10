@@ -19,6 +19,42 @@ from html.parser import HTMLParser
 from statement_models import StatementRecord, ValidationIssue, ValidationResult, StatementTransactionRecord, EmailSummaryRecord
 from statement_db import init_db, upsert_statement, save_validation_run, replace_transactions, get_recent_statements, get_summary_by_bank_month, get_reconciliation_rows, uid_exists, get_transactions_above_amount, upsert_email_summary, get_email_summary_status, get_email_summary_by_id, get_recent_email_headers, get_potential_missed_emails
 
+
+def _load_llm_env_from_dotenv():
+    """从候选 .env 文件加载 LLM_* 环境变量(仅当未设置时),使直接 CLI 运行也能读到密钥。
+
+    与 oauth_helper.get_encryption_token 的候选路径一致,支持读取 ../lite_agent/.env,
+    实现 lite_agent 与 mail-statement-parser 跨项目共享同一份 .env,无需重复配置。
+    仅加载 LLM_* 相关变量且不覆盖已存在的环境变量(lite_agent 子进程注入优先)。
+    """
+    _LLM_KEYS = ("LLM_API_KEY", "LLM_BASE_URL", "LLM_PROVIDER", "LLM_MODEL")
+    if all(os.environ.get(k) for k in _LLM_KEYS):
+        return
+    _cur = os.path.dirname(os.path.abspath(__file__))
+    _candidates = [
+        os.path.join(_cur, ".env"),
+        os.path.join(_cur, "..", ".env"),
+        os.path.join(_cur, "..", "lite_agent", ".env"),
+        os.path.join(_cur, "..", "lite-agent", ".env"),
+    ]
+    for _env_path in _candidates:
+        if not os.path.exists(_env_path):
+            continue
+        try:
+            with open(_env_path, "r", encoding="utf-8") as _f:
+                for _line in _f:
+                    if "=" not in _line or _line.strip().startswith("#"):
+                        continue
+                    _k, _v = _line.split("=", 1)
+                    _k = _k.strip()
+                    if _k in _LLM_KEYS and not os.environ.get(_k):
+                        os.environ[_k] = _v.strip().strip("'").strip('"')
+        except Exception:
+            pass
+
+
+_load_llm_env_from_dotenv()
+
 CONFIG_CANDIDATES = [
     os.path.expanduser('email-config.local.json'),
     os.path.expanduser('email-config.json'),
@@ -2419,7 +2455,7 @@ def call_llm(prompt: str, system_instruction: str = None, json_mode: bool = Fals
     data_bytes = json.dumps(payload, ensure_ascii=False).encode('utf-8')
     req = urllib.request.Request(url, data=data_bytes, headers=req_headers, method='POST')
     
-    with urllib.request.urlopen(req, timeout=60) as response:
+    with urllib.request.urlopen(req, timeout=120) as response:
         resp_data = json.loads(response.read().decode('utf-8'))
         
     if provider == "gemini":
@@ -2434,7 +2470,7 @@ def call_llm(prompt: str, system_instruction: str = None, json_mode: bool = Fals
             raise ValueError(f"Failed to parse OpenAI Response: {resp_data}. {e}")
 
 
-def slice_and_summarize_long_email(body_text: str, max_chunk_len: int = 4000) -> str:
+def slice_and_summarize_long_email(body_text: str, max_chunk_len: int = 30000) -> str:
     """若邮件内容过长，对内容进行切片（Slicing），分段提取摘要并拼接，防止直接截断丢失核心信息。"""
     if len(body_text) <= max_chunk_len:
         return body_text
@@ -2499,7 +2535,7 @@ def slice_and_summarize_long_email(body_text: str, max_chunk_len: int = 4000) ->
             
     result = "\n\n".join(summaries)
     if truncated:
-        result += "\n\n⚠️ [警告]: 邮件内容过长 (已超 20000 字符限制)，尾部内容已被自动截断。"
+        result += f"\n\n⚠️ [警告]: 邮件内容过长 (已超 {max_chunk_len * max_chunks} 字符限制)，尾部内容已被自动截断。"
         
     return result
 
