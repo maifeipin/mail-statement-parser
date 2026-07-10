@@ -1405,7 +1405,7 @@ def reprocess_failed_emails(db_path=None):
     支持 POP3 与 Graph API 双通道，每封间隔 2s 防限流，
     异常路径也落库递增 retry_count 以避免无限重试。
     """
-    import urllib.error
+    import urllib.error, sqlite3, time
     from collections import defaultdict
     from statement_db import init_db as _init_db, upsert_email_summary as _upsert
     from statement_models import EmailSummaryRecord
