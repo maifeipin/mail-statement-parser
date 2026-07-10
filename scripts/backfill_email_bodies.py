@@ -7,7 +7,7 @@ POP3/Graph API 逐一拉取正文写入，不触发 LLM 摘要。
 用法: python scripts/backfill_email_bodies.py
 """
 
-import sys, os, time, sqlite3
+import sys, os, time, sqlite3, poplib
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
