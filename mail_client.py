@@ -20,6 +20,7 @@ from statement_models import StatementRecord, ValidationIssue, ValidationResult,
 from statement_db import init_db, upsert_statement, save_validation_run, replace_transactions, get_recent_statements, get_summary_by_bank_month, get_reconciliation_rows, uid_exists, get_transactions_above_amount, upsert_email_summary, get_email_summary_status, get_email_summary_by_id, get_recent_email_headers, get_potential_missed_emails
 
 
+from mail_parse import (HTMLTableParser, decode_mime, _to_text, html_to_text, parse_html_tables, tables_to_markdown, extract_email_content, _parse_email_datetime)
 from mail_llm import (
     call_llm,
     slice_and_summarize_long_email,
@@ -124,38 +125,6 @@ def print_table(headers, rows, alignments=None):
         row_line = '│ ' + ' │ '.join(pad_string(row[i] if i < len(row) else '', col_widths[i], alignments[i]) for i in range(cols_count)) + ' │'
         print(row_line)
     print(bottom_border)
-
-class HTMLTableParser(HTMLParser):
-    """解析 HTML 表格"""
-    def __init__(self):
-        super().__init__()
-        self.tables = []
-        self.current_table = []
-        self.current_row = []
-        self.current_cell = []
-        self.in_cell = False
-    
-    def handle_starttag(self, tag, attrs):
-        if tag == 'table':
-            self.current_table = []
-        elif tag == 'tr':
-            self.current_row = []
-        elif tag in ['td', 'th']:
-            self.in_cell = True
-            self.current_cell = []
-    
-    def handle_endtag(self, tag):
-        if tag == 'table' and self.current_table:
-            self.tables.append(self.current_table)
-        elif tag == 'tr' and self.current_row:
-            self.current_table.append(self.current_row)
-        elif tag in ['td', 'th']:
-            self.in_cell = False
-            self.current_row.append(''.join(self.current_cell).strip())
-    
-    def handle_data(self, data):
-        if self.in_cell:
-            self.current_cell.append(data.strip())
 
 def load_config():
     try:
@@ -484,23 +453,6 @@ def send_email_graph(email_config, to_email, subject, content):
     
     _graph_api_request(url, token, method="POST", json_data=payload)
 
-
-def decode_mime(s):
-    if not s: return ''
-    result = []
-    for part, enc in decode_header(s):
-        if isinstance(part, bytes):
-            result.append(part.decode(enc or 'utf-8', errors='ignore'))
-        else:
-            result.append(str(part))
-    return ''.join(result)
-
-def _to_text(v):
-    if v is None:
-        return ''
-    if isinstance(v, bytes):
-        return v.decode('utf-8', errors='ignore')
-    return str(v)
 
 def _safe_decimal(v, strip_tokens=None):
     if v is None:
@@ -1503,123 +1455,6 @@ def validate_email_by_uid(uid, account_name=None):
     except Exception as e:
         print(f'验证失败：{e}')
 
-def html_to_text(html):
-    """将 HTML 转换为纯文本"""
-    if not html:
-        return ''
-    
-    # 移除 script 和 style
-    html = re.sub(r'<script[^>]*>.*?</script>', '', html, flags=re.DOTALL|re.IGNORECASE)
-    html = re.sub(r'<style[^>]*>.*?</style>', '', html, flags=re.DOTALL|re.IGNORECASE)
-    
-    # 替换常见标签
-    html = re.sub(r'<br\s*/?>', '\n', html, flags=re.IGNORECASE)
-    html = re.sub(r'</p>', '\n\n', html, flags=re.IGNORECASE)
-    html = re.sub(r'</div>', '\n', html, flags=re.IGNORECASE)
-    html = re.sub(r'</h[1-6]>', '\n', html, flags=re.IGNORECASE)
-    
-    # 移除所有 HTML 标签
-    text = re.sub(r'<[^>]+>', '', html)
-    
-    # 解码 HTML 实体
-    text = text.replace('&nbsp;', ' ')
-    text = text.replace('&lt;', '<')
-    text = text.replace('&gt;', '>')
-    text = text.replace('&amp;', '&')
-    text = text.replace('&quot;', '"')
-    text = text.replace('&#39;', "'")
-    
-    # 清理空白
-    text = re.sub(r'\n\s*\n', '\n\n', text)
-    text = text.strip()
-    
-    return text
-
-def parse_html_tables(html):
-    """解析 HTML 中的表格"""
-    parser = HTMLTableParser()
-    try:
-        parser.feed(html)
-    except:
-        pass
-    return parser.tables
-
-def tables_to_markdown(tables):
-    """将表格转换为 Markdown 格式"""
-    if not tables:
-        return ''
-    
-    md_parts = []
-    for table_idx, table in enumerate(tables, 1):
-        if len(table) < 2:
-            continue
-        
-        md_parts.append(f'\n### 表格 {table_idx}\n')
-        
-        # 表头
-        header = table[0]
-        md_parts.append('| ' + ' | '.join(header) + ' |')
-        md_parts.append('| ' + ' | '.join(['---'] * len(header)) + ' |')
-        
-        # 数据行
-        for row in table[1:]:
-            # 确保行长度与表头一致
-            while len(row) < len(header):
-                row.append('')
-            md_parts.append('| ' + ' | '.join(row[:len(header)]) + ' |')
-        
-        md_parts.append('')
-    
-    return '\n'.join(md_parts)
-
-def extract_email_content(msg):
-    """提取邮件正文（支持 HTML 和纯文本）"""
-    result = {
-        'plain': '',
-        'html': '',
-        'tables': [],
-        'markdown': ''
-    }
-    
-    if msg.is_multipart():
-        for part in msg.walk():
-            content_type = part.get_content_type()
-            charset = part.get_content_charset() or 'utf-8'
-            
-            try:
-                payload = part.get_payload(decode=True)
-                if not payload:
-                    continue
-                
-                content = payload.decode(charset, errors='ignore')
-                
-                if content_type == 'text/plain':
-                    result['plain'] += content
-                elif content_type == 'text/html':
-                    result['html'] += content
-            except:
-                pass
-    else:
-        try:
-            payload = msg.get_payload(decode=True)
-            if payload:
-                charset = msg.get_content_charset() or 'utf-8'
-                content = payload.decode(charset, errors='ignore')
-                if msg.get_content_type() == 'text/html':
-                    result['html'] = content
-                else:
-                    result['plain'] = content
-        except:
-            pass
-    
-    # 如果有 HTML，转换为文本并提取表格
-    if result['html']:
-        result['plain'] = html_to_text(result['html']) or result['plain']
-        result['tables'] = parse_html_tables(result['html'])
-        result['markdown'] = tables_to_markdown(result['tables'])
-    
-    return result
-
 def send_email(to, subject, text):
     accounts = load_accounts()
     if not accounts:
@@ -1796,20 +1631,6 @@ def _month_subtract(dt, months):
     day = min(dt.day, [31, 29 if (year % 4 == 0 and (year % 100 != 0 or year % 400 == 0)) else 28,
                        31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1])
     return dt.replace(year=year, month=month, day=day)
-
-
-def _parse_email_datetime(date_str):
-    if not date_str:
-        return None
-    try:
-        dt = parsedate_to_datetime(str(date_str))
-        if dt is None:
-            return None
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc)
-    except Exception:
-        return None
 
 
 def _save_email_message(uid, msg, output_dir=None, format='md', account_name=None):
