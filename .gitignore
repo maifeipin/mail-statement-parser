@@ -3,6 +3,7 @@ __pycache__/
 *.pyc
 
 email-config.local.json
+feishu_config.json
 
 statements.db
 email-downloads/
