@@ -718,6 +718,11 @@ def validate_and_save_email_message(msg, uid, rules=None, account_name=None):
         frm = decode_mime(msg.get('From', ''))
         content = extract_email_content(msg)
         body_text = (content.get('plain', '') + '\n' + content.get('markdown', '')).strip()
+        from statement_db import upsert_email_body
+        upsert_email_body(DB_PATH, account_name or 'default', str(uid),
+                          raw_html=content.get('html'),
+                          plain_text=body_text,
+                          markdown_tables=content.get('markdown'))
         rule, score = identify_rule(subj, frm, body_text, rules)
         if not rule:
             print('未匹配到规则，无法验证')

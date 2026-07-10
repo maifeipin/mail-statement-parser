@@ -1233,6 +1233,11 @@ def fetch_recent_emails_and_summarize(months=1):
                         
                         content = extract_email_content(msg)
                         body_text = (content.get('plain', '') + '\n' + content.get('markdown', '')).strip()
+                        from statement_db import upsert_email_body as _upsert_body
+                        _upsert_body(DB_PATH, account_name, uid,
+                                     raw_html=content.get('html'),
+                                     plain_text=body_text,
+                                     markdown_tables=content.get('markdown'))
                     
                     # 双通道分流 A: 账单正则识别
                     rule, score = identify_rule(subj, frm, body_text, rules)
@@ -1479,6 +1484,11 @@ def reprocess_failed_emails(db_path=None):
                             time.sleep(1)
                             continue
                         body_text = (ge.get("body", "") + "\n" + ge.get("html", "")).strip()
+                        from statement_db import upsert_email_body as _upsert_body
+                        _upsert_body(db_path, acct_name, uid,
+                                     raw_html=ge.get("html", ""),
+                                     plain_text=ge.get("body", ""),
+                                     markdown_tables="")
                     else:
                         raw_lines = None
                         for _att in range(3):
@@ -1502,6 +1512,11 @@ def reprocess_failed_emails(db_path=None):
                         msg = email.message_from_bytes(b"\r\n".join(raw_lines))
                         content = extract_email_content(msg)
                         body_text = (content.get("plain", "") + "\n" + content.get("markdown", "")).strip()
+                        from statement_db import upsert_email_body as _upsert_body
+                        _upsert_body(db_path, acct_name, uid,
+                                     raw_html=content.get("html"),
+                                     plain_text=body_text,
+                                     markdown_tables=content.get("markdown"))
 
                     if not body_text:
                         body_text = subj

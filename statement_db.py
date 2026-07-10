@@ -126,6 +126,21 @@ def init_db(db_path: str) -> None:
             )
             """
         )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS email_bodies (
+                id INTEGER PRIMARY KEY,
+                account_name TEXT NOT NULL,
+                uid TEXT NOT NULL,
+                raw_html TEXT,
+                plain_text TEXT,
+                markdown_tables TEXT,
+                content_len INTEGER,
+                fetched_at TEXT NOT NULL,
+                UNIQUE(account_name, uid)
+            )
+            """
+        )
 
         # 兼容历史库：为已存在表补齐新增字段
         cur.execute("PRAGMA table_info(statement_transactions)")
@@ -594,6 +609,35 @@ def get_unpaid_statements(db_path: str, months: int = None) -> list[sqlite3.Row]
         
         cur.execute(query, params)
         return list(cur.fetchall())
+    finally:
+        conn.close()
+
+
+def upsert_email_body(db_path: str, account_name: str, uid: str,
+                      raw_html: str = None, plain_text: str = None,
+                      markdown_tables: str = None) -> int:
+    """同步 upsert 正文（与 upsert_email_summary 同级调用）。"""
+    conn = sqlite3.connect(db_path)
+    try:
+        content_len = (len(plain_text or "") + len(raw_html or ""))
+        now = _utc_now_iso()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO email_bodies (account_name, uid, raw_html, plain_text,
+                                       markdown_tables, content_len, fetched_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(account_name, uid) DO UPDATE SET
+                raw_html = excluded.raw_html,
+                plain_text = excluded.plain_text,
+                markdown_tables = excluded.markdown_tables,
+                content_len = excluded.content_len,
+                fetched_at = excluded.fetched_at
+            """,
+            (account_name, uid, raw_html, plain_text, markdown_tables, content_len, now)
+        )
+        conn.commit()
+        return cur.lastrowid
     finally:
         conn.close()
 
