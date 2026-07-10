@@ -27,7 +27,10 @@ def main():
     cur.execute(
         "SELECT es.id, es.account_name, es.uid "
         "FROM email_summaries es "
-        "WHERE es.id NOT IN (SELECT id FROM email_bodies) "
+        "WHERE NOT EXISTS ("
+        "  SELECT 1 FROM email_bodies eb "
+        "  WHERE eb.account_name = es.account_name AND eb.uid = es.uid"
+        ") "
         "ORDER BY es.account_name, es.id"
     )
     rows = cur.fetchall()
