@@ -1173,6 +1173,24 @@ def fetch_recent_emails_and_summarize(months=1):
                 is_dup_bill = uid_exists(DB_PATH, uid)
                 status, retry_cnt = get_email_summary_status(DB_PATH, account_name, uid)
                 is_dup_summary = (status in ('processed', 'skipped', 'noise') or (status == 'failed' and retry_cnt >= 3))
+                # 防 POP3 UID 回收: 取邮件标题头校验 subject 是否匹配
+                if is_dup_summary and status == 'processed':
+                    # 用 TOP 只取标题头(不拉正文), 确认 uid 是否对应同一封
+                    _check_subj = None
+                    if is_graph:
+                        _check_subj = msg_obj.get('subject', '')
+                    elif mail:
+                        try:
+                            _resp, _lines, _size = mail.top(int(uid), 0)
+                            _hdr = email.message_from_bytes(b"\r\n".join(_lines))
+                            _check_subj = decode_mime(_hdr.get('Subject', ''))
+                        except Exception:
+                            pass
+                    if _check_subj:
+                        from statement_db import check_summary_uid_match
+                        if not check_summary_uid_match(DB_PATH, account_name, uid, _check_subj):
+                            is_dup_summary = False
+                            print(f'  ⚠️ UID={uid} 已被回收 (新主题={_check_subj[:30]}), 重新处理')
                 
                 if is_dup_bill or is_dup_summary:
                     skipped_dup += 1

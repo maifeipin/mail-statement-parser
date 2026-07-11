@@ -717,6 +717,23 @@ def get_email_summary_status(db_path: str, account_name: str, uid: str) -> tuple
         conn.close()
 
 
+def check_summary_uid_match(db_path: str, account_name: str, uid: str, subject: str) -> bool:
+    """校验 uid 是否仍对应同一条邮件（防 POP3 UID 回收误判）。
+
+    返回 True 表示 subject 匹配（同一封邮件），False 表示 UID 已被回收重用。
+    """
+    conn = sqlite3.connect(db_path)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT 1 FROM email_summaries WHERE account_name = ? AND uid = ? AND subject = ? LIMIT 1",
+            (account_name, uid, subject)
+        )
+        return cur.fetchone() is not None
+    finally:
+        conn.close()
+
+
 def add_noise_rule(db_path: str, pattern_type: str, pattern_value: str) -> None:
     """插入一条降噪过滤规则（具有唯一约束，幂等）"""
     conn = sqlite3.connect(db_path)
