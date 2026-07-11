@@ -150,6 +150,11 @@ def init_db(db_path: str) -> None:
         if 'original_amount' not in existing_cols:
             cur.execute("ALTER TABLE statement_transactions ADD COLUMN original_amount TEXT")
 
+        cur.execute("PRAGMA table_info(email_summaries)")
+        summar_cols = {row[1] for row in cur.fetchall()}
+        if 'pushed' not in summar_cols:
+            cur.execute("ALTER TABLE email_summaries ADD COLUMN pushed INTEGER NOT NULL DEFAULT 0")
+
         # 修复 1: 历史账单状态回填 (幂等)
         cur.execute(
             """
@@ -745,6 +750,34 @@ def check_summary_uid_match(db_path: str, account_name: str, uid: str, subject: 
             (account_name, uid, subject)
         )
         return cur.fetchone() is not None
+    finally:
+        conn.close()
+
+
+def get_unpushed_high(db_path: str) -> list[sqlite3.Row]:
+    """获取 importance=high 且 pushed=0 的邮件（含正文 snippet）。"""
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        return conn.execute(
+            "SELECT * FROM email_summaries WHERE importance='high' AND pushed=0 "
+            "ORDER BY id ASC"
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+def mark_pushed(db_path: str, ids: list[int]) -> None:
+    """批量标记高优邮件已推送。"""
+    if not ids:
+        return
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            f"UPDATE email_summaries SET pushed=1 WHERE id IN ({','.join('?'*len(ids))})",
+            ids
+        )
+        conn.commit()
     finally:
         conn.close()
 
