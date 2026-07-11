@@ -776,7 +776,7 @@ def download_recent_bank_emails(months=3, output_dir=None):
         try:
             mail = connect_pop3(account_config)
 
-            for uid in candidates:
+            for uid, bank_code, subj, frm, date_str in candidates:
                 try:
                     # 幂等：检查是否已有该 uid 的文件（附加账户前缀）
                     existing = [f for f in os.listdir(output_dir) if f.startswith(f'email_acc_{account_name}_uid{uid}_') or f.startswith(f'email_uid{uid}_')]
@@ -842,10 +842,11 @@ def validate_recent_bank_emails(months=3):
         ok = 0
         fail = 0
         skipped_db = 0
-        for uid in candidates:
+        for uid, bank_code, subj, frm, date_str in candidates:
             # 幂等：检查是否已在 DB 中
-            if uid_exists(DB_PATH, str(uid), account_name):
-                print(f'⏭️  UID={uid} 已在数据库，跳过')
+            _uid_str = str(uid)
+            if uid_exists(DB_PATH, _uid_str, account_name):
+                print(f'⏭️  UID={_uid_str} 已在数据库，跳过')
                 skipped_db += 1
                 continue
             try:
