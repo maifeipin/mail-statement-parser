@@ -844,7 +844,7 @@ def validate_recent_bank_emails(months=3):
         skipped_db = 0
         for uid in candidates:
             # 幂等：检查是否已在 DB 中
-            if uid_exists(DB_PATH, str(uid)):
+            if uid_exists(DB_PATH, str(uid), account_name):
                 print(f'⏭️  UID={uid} 已在数据库，跳过')
                 skipped_db += 1
                 continue
@@ -1170,7 +1170,7 @@ def fetch_recent_emails_and_summarize(months=1):
                     i = num - index
                     uid = str(i)
                 
-                is_dup_bill = uid_exists(DB_PATH, uid)
+                is_dup_bill = uid_exists(DB_PATH, uid, account_name)
                 status, retry_cnt = get_email_summary_status(DB_PATH, account_name, uid)
                 is_dup_summary = (status in ('processed', 'skipped', 'noise') or (status == 'failed' and retry_cnt >= 3))
                 # 防 POP3 UID 回收: 取邮件标题头校验 subject 是否匹配

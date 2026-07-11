@@ -341,13 +341,28 @@ def replace_transactions(db_path: str, uid: str, bank_code: str, txns: Iterable[
         conn.close()
 
 
-def uid_exists(db_path: str, uid: str) -> bool:
-    """检查 uid 是否已存在于 statements 表（任意 bank_code）。"""
+def uid_exists(db_path: str, uid: str, account_name: str = None) -> bool:
+    """检查 uid 是否已存在于 statements 表。
+
+    若提供 account_name，则先通过 email_summaries 找到对应 bank_code，
+    再精确匹配 uid + bank_code（防跨账户 UID 碰撞）。
+    """
     conn = sqlite3.connect(db_path)
     try:
         cur = conn.cursor()
-        cur.execute("SELECT 1 FROM statements WHERE uid = ? LIMIT 1", (uid,))
-        return cur.fetchone() is not None
+        if account_name:
+            # 精确: 通过 email_summaries 桥接, 确认该账户此 uid 在 statements 中
+            cur.execute(
+                "SELECT 1 FROM statements s "
+                "INNER JOIN email_summaries es ON es.uid = s.uid "
+                "WHERE es.account_name = ? AND s.uid = ? LIMIT 1",
+                (account_name, uid)
+            )
+            return cur.fetchone() is not None
+        else:
+            # 兼容旧调用（无 account_name 上下文）
+            cur.execute("SELECT 1 FROM statements WHERE uid = ? LIMIT 1", (uid,))
+            return cur.fetchone() is not None
     finally:
         conn.close()
 
