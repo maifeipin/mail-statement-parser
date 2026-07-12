@@ -4,6 +4,7 @@ __pycache__/
 
 email-config.local.json
 feishu_config.json
+feishu_push_target.json
 
 statements.db
 email-downloads/
@@ -19,3 +20,9 @@ run.sh
 
 # Token cache files
 token_*.json
+
+# Generic sensitive files
+*.log
+*.db
+*.sqlite
+*.env
