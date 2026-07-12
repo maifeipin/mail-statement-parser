@@ -59,6 +59,39 @@ def is_graph_api(email_config):
     return email_config.get('provider') == 'outlook'
 
 
+# 账号别名 -> provider 映射（provider 是通用标识，非密钥）
+_ALIAS_TO_PROVIDER = {
+    'qq': 'qq', 'qqmail': 'qq',
+    'wy': '163', '163': '163', 'netease': '163',
+    'g': 'gmail', 'gmail': 'gmail', 'google': 'gmail',
+    'o': 'outlook', 'outlook': 'outlook', 'ms': 'outlook',
+}
+
+
+def _resolve_account(arg, accounts):
+    """把账号参数解析为 account_config。支持 别名 / provider / 完整邮箱。返回匹配项或 None。"""
+    if not arg or not accounts:
+        return None
+    arg_l = str(arg).strip().lower()
+    if not arg_l:
+        return None
+    # 1. 别名 -> provider
+    provider = _ALIAS_TO_PROVIDER.get(arg_l)
+    if provider:
+        for acc in accounts:
+            if str(acc.get('provider', '')).lower() == provider:
+                return acc
+    # 2. 直接 provider 匹配
+    for acc in accounts:
+        if str(acc.get('provider', '')).lower() == arg_l:
+            return acc
+    # 3. 完整邮箱匹配
+    for acc in accounts:
+        if str(acc.get('account', '')).lower() == arg_l:
+            return acc
+    return None
+
+
 def connect_pop3(email_config):
     """POP3 统一连接工厂。支持 Basic (账号密码) 以及 OAuth2 (XOAUTH2) 双重通道。"""
     host = email_config['pop3']['host']

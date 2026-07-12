@@ -48,18 +48,22 @@ def _load_llm_env_from_dotenv():
 _load_llm_env_from_dotenv()
 
 
-def call_llm(prompt: str, system_instruction: str = None, json_mode: bool = False) -> str:
-    """使用 urllib 发送请求给 OpenAI 兼容 API 或 Gemini API。"""
-    import urllib.request
-    import json
-    import os
-
-    # 优先从环境配置获取
+def _resolve_llm_pool():
+    """解析 LLM 端点池。优先 LLM_POOL(JSON 列表)，否则退回单端点 env/config。返回端点 dict 列表。"""
+    import os, json
+    pool_raw = os.environ.get("LLM_POOL")
+    if pool_raw:
+        try:
+            pool = json.loads(pool_raw)
+            if isinstance(pool, list) and pool:
+                return pool
+        except Exception:
+            pass
+    # 退回单端点（兼容旧用法）
     api_key = os.environ.get("LLM_API_KEY")
     base_url = os.environ.get("LLM_BASE_URL", "https://api.openai.com/v1")
     provider = os.environ.get("LLM_PROVIDER", "openai").lower()
     model = os.environ.get("LLM_MODEL", "gpt-4o-mini")
-
     if not api_key:
         try:
             from mail_client import load_config  # 延迟导入避免循环依赖
@@ -74,27 +78,29 @@ def call_llm(prompt: str, system_instruction: str = None, json_mode: bool = Fals
                 model = llm_cfg.get("model")
         except Exception:
             pass
+    return [{"api_key": api_key, "base_url": base_url, "provider": provider, "model": model}]
 
-    if not api_key:
-        raise ValueError("LLM API key not found. Please set LLM_API_KEY environment variable or config 'llm' block.")
+
+def _build_llm_request(endpoint, prompt, system_instruction, json_mode):
+    """根据单个端点构造 urllib Request。返回 (req, provider)。"""
+    import urllib.request, json
+    api_key = endpoint.get("api_key")
+    base_url = endpoint.get("base_url", "https://api.openai.com/v1")
+    provider = endpoint.get("provider", "openai").lower()
+    model = endpoint.get("model", "gpt-4o-mini")
 
     if provider == "gemini":
         if "generativelanguage.googleapis.com" not in base_url and "api.openai.com" in base_url:
             base_url = "https://generativelanguage.googleapis.com"
-
         url = f"{base_url.rstrip('/')}/v1beta/models/{model}:generateContent?key={api_key}"
-
-        contents_parts = [{"text": prompt}]
-        payload = {"contents": [{"parts": contents_parts}]}
+        payload = {"contents": [{"parts": [{"text": prompt}]}]}
         if system_instruction:
             payload["systemInstruction"] = {"parts": [{"text": system_instruction}]}
-
         generation_config = {}
         if json_mode:
             generation_config["responseMimeType"] = "application/json"
         if generation_config:
             payload["generationConfig"] = generation_config
-
         req_headers = {"Content-Type": "application/json"}
     else:
         url = f"{base_url.rstrip('/')}/chat/completions"
@@ -102,26 +108,18 @@ def call_llm(prompt: str, system_instruction: str = None, json_mode: bool = Fals
         if system_instruction:
             messages.append({"role": "system", "content": system_instruction})
         messages.append({"role": "user", "content": prompt})
-
-        payload = {
-            "model": model,
-            "messages": messages,
-            "temperature": 0.1
-        }
+        payload = {"model": model, "messages": messages, "temperature": 0.1}
         if json_mode:
             payload["response_format"] = {"type": "json_object"}
-
-        req_headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}"
-        }
+        req_headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
 
     data_bytes = json.dumps(payload, ensure_ascii=False).encode('utf-8')
     req = urllib.request.Request(url, data=data_bytes, headers=req_headers, method='POST')
+    return req, provider
 
-    with urllib.request.urlopen(req, timeout=120) as response:
-        resp_data = json.loads(response.read().decode('utf-8'))
 
+def _parse_llm_response(resp_data, provider):
+    """解析 OpenAI 兼容 / Gemini 响应，返回文本。"""
     if provider == "gemini":
         try:
             return resp_data["candidates"][0]["content"]["parts"][0]["text"].strip()
@@ -132,6 +130,37 @@ def call_llm(prompt: str, system_instruction: str = None, json_mode: bool = Fals
             return resp_data["choices"][0]["message"]["content"].strip()
         except (KeyError, IndexError) as e:
             raise ValueError(f"Failed to parse OpenAI Response: {resp_data}. {e}")
+
+
+def call_llm(prompt: str, system_instruction: str = None, json_mode: bool = False) -> str:
+    """使用 urllib 发送请求给 OpenAI 兼容 API 或 Gemini API。
+    支持 LLM_POOL 端点轮换：遇 429/5xx/连接错误自动切换下一个端点，全尽才抛错。
+    无 LLM_POOL 时退回单端点（向后兼容）。"""
+    import urllib.request, urllib.error, json
+
+    pool = _resolve_llm_pool()
+    if not pool or not pool[0].get("api_key"):
+        raise ValueError("LLM API key not found. Please set LLM_API_KEY/LLM_POOL env or config 'llm' block.")
+
+    last_err = None
+    for endpoint in pool:
+        req, provider = _build_llm_request(endpoint, prompt, system_instruction, json_mode)
+        try:
+            with urllib.request.urlopen(req, timeout=120) as response:
+                resp_data = json.loads(response.read().decode('utf-8'))
+            return _parse_llm_response(resp_data, provider)
+        except urllib.error.HTTPError as e:
+            last_err = e
+            # 429/5xx 视为端点侧限流/故障，轮换下一个；其余 4xx 多为请求本身问题，直接抛
+            if e.code == 429 or e.code >= 500:
+                print(f"⚠️ LLM 端点 {endpoint.get('model')} 返回 {e.code}，切换下一个池端点...")
+                continue
+            raise
+        except urllib.error.URLError as e:
+            last_err = e
+            print(f"⚠️ LLM 端点 {endpoint.get('model')} 连接失败: {e}，切换下一个池端点...")
+            continue
+    raise last_err if last_err else RuntimeError("LLM pool exhausted with no error")
 
 
 def slice_and_summarize_long_email(body_text: str, max_chunk_len: int = 30000) -> str:

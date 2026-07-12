@@ -662,6 +662,21 @@ def upsert_email_body(db_path: str, account_name: str, uid: str,
         conn.close()
 
 
+def get_email_body(db_path: str, account_name: str, uid: str) -> Optional[str]:
+    """从 email_bodies 读取本地缓存的纯文本正文。无则返回 None（供 enrich 离线读取）。"""
+    conn = sqlite3.connect(db_path)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT plain_text FROM email_bodies WHERE account_name = ? AND uid = ? LIMIT 1",
+            (account_name, uid)
+        )
+        row = cur.fetchone()
+        return row[0] if row else None
+    finally:
+        conn.close()
+
+
 def upsert_email_summary(db_path: str, record: EmailSummaryRecord) -> int:
     conn = sqlite3.connect(db_path)
     try:
