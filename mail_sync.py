@@ -225,7 +225,7 @@ def fetch_recent_emails_and_summarize(months=1, llm_enabled=True):
                     rule, score = identify_rule(subj, frm, body_text, rules)
                     if rule:
                         print(f'💳 [账单通道] 命中规则 {rule.get("rule_id")} (UID={uid}) 主题: {subj[:30]}')
-                        validate_and_save_email_message(msg, uid, rules=rules)
+                        validate_and_save_email_message(msg, uid, rules=rules, account_name=account_name)
                         new_bills += 1
                         continue
 

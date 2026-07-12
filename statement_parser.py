@@ -713,6 +713,7 @@ def validate_and_save_email_message(msg, uid, rules=None, account_name=None):
         print('未找到规则文件，请先在 rules 目录下放置 *.json')
         return
 
+    account_name = account_name or 'default'
     try:
         subj = decode_mime(msg.get('Subject', ''))
         frm = decode_mime(msg.get('From', ''))
@@ -759,6 +760,7 @@ def validate_and_save_email_message(msg, uid, rules=None, account_name=None):
         # 落库：结构化账单 + 本次校验运行记录
         init_db(DB_PATH)
         statement = StatementRecord(
+            account_name=account_name,
             uid=str(uid),
             message_id=_to_text(msg.get('Message-ID', '')).strip(),
             bank_code=_to_text(rule.get('bank_code', '')),
@@ -788,10 +790,13 @@ def validate_and_save_email_message(msg, uid, rules=None, account_name=None):
         elif statement.bank_code == 'CITIC':
             txns = parse_citic_transactions_from_body(uid, statement.statement_month, content.get('plain', ''))
         if txns:
-            txn_count = replace_transactions(DB_PATH, str(uid), statement.bank_code, txns)
+            for _t in txns:
+                _t.account_name = account_name
+            txn_count = replace_transactions(DB_PATH, account_name, str(uid), statement.bank_code, txns)
 
         run_id = save_validation_run(
             DB_PATH,
+            account_name,
             uid=str(uid),
             bank_code=_to_text(rule.get('bank_code', '')),
             rule_id=_to_text(rule.get('rule_id', '')),

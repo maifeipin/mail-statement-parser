@@ -32,6 +32,7 @@ class StatementRecord:
     subject: str
     sender: str
     email_date: str
+    account_name: str = 'default'
     statement_month: Optional[str] = None
     statement_date: Optional[str] = None
     due_date: Optional[str] = None
@@ -44,6 +45,7 @@ class StatementRecord:
 class StatementTransactionRecord:
     uid: str
     bank_code: str
+    account_name: str = 'default'
     txn_date: Optional[str] = None
     post_date: Optional[str] = None
     description: str = ""

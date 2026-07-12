@@ -12,6 +12,72 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _migrate_account_name(cur) -> None:
+    """账单存储层加 account_name 列，防跨账号 UID 碰撞覆盖。幂等。
+    statements 改 UNIQUE 须重建表；statement_transactions/validation_runs 无 UNIQUE，ALTER+UPDATE 回填。
+    单账户 uid 可还原归属；多账号同号(碰撞幸存行) -> '__orphan__'。"""
+    # --- statements: 重建表（UNIQUE(uid,bank_code) -> UNIQUE(account_name,uid,bank_code)）---
+    stmt_cols = {r[1] for r in cur.execute("PRAGMA table_info(statements)").fetchall()}
+    if 'account_name' not in stmt_cols:
+        cur.execute("""
+            CREATE TABLE statements_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_name TEXT NOT NULL DEFAULT '__orphan__',
+                uid TEXT NOT NULL, message_id TEXT, bank_code TEXT NOT NULL, rule_id TEXT NOT NULL,
+                subject TEXT, sender TEXT, email_date TEXT,
+                statement_month TEXT, statement_date TEXT, due_date TEXT,
+                total_due TEXT, minimum_due TEXT, raw_fields_json TEXT,
+                is_paid INTEGER NOT NULL DEFAULT 0, paid_at TEXT,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                UNIQUE(account_name, uid, bank_code)
+            )
+        """)
+        cur.execute("""
+            INSERT INTO statements_new (
+                account_name, uid, message_id, bank_code, rule_id, subject, sender, email_date,
+                statement_month, statement_date, due_date, total_due, minimum_due, raw_fields_json,
+                is_paid, paid_at, created_at, updated_at)
+            SELECT
+                COALESCE(es.account_name, '__orphan__'),
+                s.uid, s.message_id, s.bank_code, s.rule_id, s.subject, s.sender, s.email_date,
+                s.statement_month, s.statement_date, s.due_date, s.total_due, s.minimum_due, s.raw_fields_json,
+                s.is_paid, s.paid_at, s.created_at, s.updated_at
+            FROM statements s
+            LEFT JOIN (
+                SELECT uid, MIN(account_name) AS account_name
+                FROM email_summaries GROUP BY uid HAVING COUNT(DISTINCT account_name)=1
+            ) es ON es.uid = s.uid
+        """)
+        cur.execute("DROP TABLE statements")
+        cur.execute("ALTER TABLE statements_new RENAME TO statements")
+
+    # --- statement_transactions: ALTER + UPDATE 回填 ---
+    txn_cols = {r[1] for r in cur.execute("PRAGMA table_info(statement_transactions)").fetchall()}
+    if 'account_name' not in txn_cols:
+        cur.execute("ALTER TABLE statement_transactions ADD COLUMN account_name TEXT NOT NULL DEFAULT '__orphan__'")
+        cur.execute("""
+            UPDATE statement_transactions SET account_name = COALESCE(
+                (SELECT es.account_name FROM (
+                    SELECT uid, MIN(account_name) AS account_name FROM email_summaries
+                    GROUP BY uid HAVING COUNT(DISTINCT account_name)=1
+                ) es WHERE es.uid = statement_transactions.uid),
+                '__orphan__')
+        """)
+
+    # --- validation_runs: ALTER + UPDATE 回填（无数据丢失风险，仅补归属）---
+    vr_cols = {r[1] for r in cur.execute("PRAGMA table_info(validation_runs)").fetchall()}
+    if 'account_name' not in vr_cols:
+        cur.execute("ALTER TABLE validation_runs ADD COLUMN account_name TEXT NOT NULL DEFAULT '__orphan__'")
+        cur.execute("""
+            UPDATE validation_runs SET account_name = COALESCE(
+                (SELECT es.account_name FROM (
+                    SELECT uid, MIN(account_name) AS account_name FROM email_summaries
+                    GROUP BY uid HAVING COUNT(DISTINCT account_name)=1
+                ) es WHERE es.uid = validation_runs.uid),
+                '__orphan__')
+        """)
+
+
 def init_db(db_path: str) -> None:
     conn = sqlite3.connect(db_path)
     try:
@@ -20,6 +86,7 @@ def init_db(db_path: str) -> None:
             """
             CREATE TABLE IF NOT EXISTS statements (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_name TEXT NOT NULL DEFAULT '__orphan__',
                 uid TEXT NOT NULL,
                 message_id TEXT,
                 bank_code TEXT NOT NULL,
@@ -37,7 +104,7 @@ def init_db(db_path: str) -> None:
                 paid_at TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
-                UNIQUE(uid, bank_code)
+                UNIQUE(account_name, uid, bank_code)
             )
             """
         )
@@ -45,6 +112,7 @@ def init_db(db_path: str) -> None:
             """
             CREATE TABLE IF NOT EXISTS validation_runs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_name TEXT NOT NULL DEFAULT '__orphan__',
                 uid TEXT NOT NULL,
                 bank_code TEXT NOT NULL,
                 rule_id TEXT NOT NULL,
@@ -77,6 +145,7 @@ def init_db(db_path: str) -> None:
             """
             CREATE TABLE IF NOT EXISTS statement_transactions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_name TEXT NOT NULL DEFAULT '__orphan__',
                 uid TEXT NOT NULL,
                 bank_code TEXT NOT NULL,
                 txn_date TEXT,
@@ -168,6 +237,9 @@ def init_db(db_path: str) -> None:
             """
         )
 
+        # account_name 迁移：账单存储层加账号维度，防跨账号 UID 碰撞覆盖（幂等）
+        _migrate_account_name(cur)
+
         conn.commit()
     finally:
         conn.close()
@@ -181,11 +253,11 @@ def upsert_statement(db_path: str, s: StatementRecord) -> None:
         cur.execute(
             """
             INSERT INTO statements (
-                uid, message_id, bank_code, rule_id, subject, sender, email_date,
+                account_name, uid, message_id, bank_code, rule_id, subject, sender, email_date,
                 statement_month, statement_date, due_date, total_due, minimum_due,
                 raw_fields_json, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(uid, bank_code) DO UPDATE SET
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(account_name, uid, bank_code) DO UPDATE SET
                 message_id = excluded.message_id,
                 rule_id = excluded.rule_id,
                 subject = excluded.subject,
@@ -200,6 +272,7 @@ def upsert_statement(db_path: str, s: StatementRecord) -> None:
                 updated_at = excluded.updated_at
             """,
             (
+                s.account_name,
                 s.uid,
                 s.message_id,
                 s.bank_code,
@@ -224,6 +297,7 @@ def upsert_statement(db_path: str, s: StatementRecord) -> None:
 
 def save_validation_run(
     db_path: str,
+    account_name: str,
     uid: str,
     bank_code: str,
     rule_id: str,
@@ -240,10 +314,11 @@ def save_validation_run(
         cur.execute(
             """
             INSERT INTO validation_runs (
-                uid, bank_code, rule_id, passed, error_count, warning_count, report_path, run_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                account_name, uid, bank_code, rule_id, passed, error_count, warning_count, report_path, run_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
+                account_name or 'default',
                 uid,
                 bank_code,
                 rule_id,
@@ -302,7 +377,7 @@ def save_validation_run(
         conn.close()
 
 
-def replace_transactions(db_path: str, uid: str, bank_code: str, txns: Iterable[StatementTransactionRecord]) -> int:
+def replace_transactions(db_path: str, account_name: str, uid: str, bank_code: str, txns: Iterable[StatementTransactionRecord]) -> int:
     items = list(txns)
     conn = sqlite3.connect(db_path)
     try:
@@ -310,21 +385,22 @@ def replace_transactions(db_path: str, uid: str, bank_code: str, txns: Iterable[
         cur.execute(
             """
             DELETE FROM statement_transactions
-            WHERE uid = ? AND bank_code = ?
+            WHERE account_name = ? AND uid = ? AND bank_code = ?
             """,
-            (uid, bank_code),
+            (account_name or 'default', uid, bank_code),
         )
 
         for t in items:
             cur.execute(
                 """
                 INSERT INTO statement_transactions (
-                    uid, bank_code, txn_date, post_date, description, amount,
+                    account_name, uid, bank_code, txn_date, post_date, description, amount,
                     currency, txn_location_code, original_amount, direction,
                     raw_row_json, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
+                    t.account_name or 'default',
                     t.uid,
                     t.bank_code,
                     t.txn_date,
@@ -356,11 +432,9 @@ def uid_exists(db_path: str, uid: str, account_name: str = None) -> bool:
     try:
         cur = conn.cursor()
         if account_name:
-            # 精确: 通过 email_summaries 桥接, 确认该账户此 uid 在 statements 中
+            # statements 现自带 account_name，直查（不再桥接 email_summaries）
             cur.execute(
-                "SELECT 1 FROM statements s "
-                "INNER JOIN email_summaries es ON es.uid = s.uid "
-                "WHERE es.account_name = ? AND s.uid = ? LIMIT 1",
+                "SELECT 1 FROM statements WHERE account_name = ? AND uid = ? LIMIT 1",
                 (account_name, uid)
             )
             return cur.fetchone() is not None
