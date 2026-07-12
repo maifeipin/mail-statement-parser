@@ -100,14 +100,23 @@ def decrypt_token_data(blob: bytes, api_token: str) -> bytes:
 # 统一网络 HTTP 请求助手 (0 外部依赖)
 # ==========================================
 
-def _http_post(url: str, params: dict) -> dict:
+def _http_post(url: str, params: dict, proxy: str = None) -> dict:
+    import socket
     data = urllib.parse.urlencode(params).encode('utf-8')
     req = urllib.request.Request(
         url,
         data=data,
         headers={'Content-Type': 'application/x-www-form-urlencoded'}
     )
+    
+    orig_socket = socket.socket
     try:
+        if proxy:
+            import socks
+            host, port = proxy.split(":")
+            socks.set_default_proxy(socks.SOCKS5, host, int(port))
+            socket.socket = socks.socksocket
+            
         with urllib.request.urlopen(req, timeout=30) as response:
             return json.loads(response.read().decode('utf-8'))
     except urllib.error.HTTPError as e:
@@ -116,6 +125,8 @@ def _http_post(url: str, params: dict) -> dict:
             return json.loads(error_body)
         except Exception:
             raise e
+    finally:
+        socket.socket = orig_socket
 
 # ==========================================
 # OAuth 2.0 刷新与授权核心业务
@@ -207,7 +218,7 @@ def get_valid_oauth_token(email_config: dict) -> str:
         else:
             raise ValueError(f"不支持的 OAuth2 Provider: {provider}")
             
-        res = _http_post(url, params)
+        res = _http_post(url, params, proxy=email_config.get("imap_proxy"))
         if "error" in res:
             raise ValueError(f"刷新失败: {res.get('error_description', res.get('error'))}")
             
