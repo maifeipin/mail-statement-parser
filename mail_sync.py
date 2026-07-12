@@ -226,6 +226,24 @@ def fetch_recent_emails_and_summarize(months=1, llm_enabled=True):
                     if rule:
                         print(f'💳 [账单通道] 命中规则 {rule.get("rule_id")} (UID={uid}) 主题: {subj[:30]}')
                         validate_and_save_email_message(msg, uid, rules=rules, account_name=account_name)
+                        
+                        # 补充插入 email_summaries，确保账单能在 Meilisearch 搜索引擎和前端界面中展示
+                        rec = EmailSummaryRecord(
+                            account_name=account_name,
+                            uid=uid,
+                            sender=frm,
+                            subject=subj,
+                            email_date=date_str,
+                            category='BILL',
+                            importance='high',
+                            summary=f"💳 信用卡账单已解析 ({rule.get('bank_code')})",
+                            actions_json="[]",
+                            status="processed",
+                            retry_count=0,
+                            processed_at=datetime.now(timezone.utc).isoformat()
+                        )
+                        upsert_email_summary(DB_PATH, rec)
+                        
                         new_bills += 1
                         continue
 
