@@ -101,22 +101,33 @@ def decrypt_token_data(blob: bytes, api_token: str) -> bytes:
 # ==========================================
 
 def _http_post(url: str, params: dict, proxy: str = None) -> dict:
-    import socket
+    import urllib.parse
+    import json
+    
+    # 优先使用 curl 以确保 socks5-hostname DNS 解析稳定性 (用户建议)
+    if proxy:
+        import subprocess
+        cmd = ["curl", "-s", "--socks5-hostname", proxy]
+        cmd += ["-H", "Content-Type: application/x-www-form-urlencoded"]
+        data_str = urllib.parse.urlencode(params)
+        cmd += ["-d", data_str, url]
+        try:
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            if res.returncode == 0:
+                return json.loads(res.stdout)
+            else:
+                print(f"⚠️ curl failed: {res.stderr}")
+        except Exception as e:
+            print(f"⚠️ curl fallback to urlopen: {e}")
+            
+    # 兜底使用标准 urllib
     data = urllib.parse.urlencode(params).encode('utf-8')
     req = urllib.request.Request(
         url,
         data=data,
         headers={'Content-Type': 'application/x-www-form-urlencoded'}
     )
-    
-    orig_socket = socket.socket
     try:
-        if proxy:
-            import socks
-            host, port = proxy.split(":")
-            socks.set_default_proxy(socks.SOCKS5, host, int(port))
-            socket.socket = socks.socksocket
-            
         with urllib.request.urlopen(req, timeout=30) as response:
             return json.loads(response.read().decode('utf-8'))
     except urllib.error.HTTPError as e:
@@ -125,8 +136,6 @@ def _http_post(url: str, params: dict, proxy: str = None) -> dict:
             return json.loads(error_body)
         except Exception:
             raise e
-    finally:
-        socket.socket = orig_socket
 
 # ==========================================
 # OAuth 2.0 刷新与授权核心业务
