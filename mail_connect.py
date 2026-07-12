@@ -100,7 +100,7 @@ def connect_pop3(email_config):
     auth_type = email_config.get('auth_type', 'basic')
 
     def _connect():
-        mail = poplib.POP3_SSL(host, port)
+        mail = poplib.POP3_SSL(host, port, timeout=30)
         try:
             if auth_type == 'oauth2':
                 from oauth_helper import get_valid_oauth_token
@@ -146,9 +146,9 @@ def connect_smtp(email_config):
 
     def _connect():
         if secure:
-            server = smtplib.SMTP_SSL(host, port)
+            server = smtplib.SMTP_SSL(host, port, timeout=30)
         else:
-            server = smtplib.SMTP(host, port)
+            server = smtplib.SMTP(host, port, timeout=30)
             server.ehlo()
             server.starttls()
             server.ehlo()
@@ -193,7 +193,7 @@ def connect_imap(email_config):
     auth_type = email_config.get('auth_type', 'basic')
 
     def _connect():
-        mail = imaplib.IMAP4_SSL(host, port)
+        mail = imaplib.IMAP4_SSL(host, port, timeout=30)
         try:
             if auth_type == 'oauth2':
                 from oauth_helper import get_valid_oauth_token
