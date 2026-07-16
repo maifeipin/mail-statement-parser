@@ -32,8 +32,7 @@ def main():
     # 查出所有已解析的账单，并看是否已经有 summaries 记录
     try:
         cur.execute("""
-            SELECT s.uid, s.subject, s.sender, s.email_date, s.bank_code, 
-                   (SELECT account_name FROM email_bodies WHERE uid = s.uid LIMIT 1) as account_name
+            SELECT s.account_name, s.uid, s.subject, s.sender, s.email_date, s.bank_code
             FROM statements s
         """)
         statements = cur.fetchall()
@@ -45,11 +44,10 @@ def main():
     added = 0
     for stmt in statements:
         uid = stmt['uid']
-        # 若 statements 没有 account_name 字段，尝试从 email_bodies 表中获取，如果还没有则降级为 default
         acct = stmt['account_name'] if stmt['account_name'] else 'default'
         
-        # 检查是否已存在
-        cur.execute("SELECT id FROM email_summaries WHERE uid = ? LIMIT 1", (uid,))
+        # 检查是否已存在 (以 account_name, uid 为唯一键去重)
+        cur.execute("SELECT id FROM email_summaries WHERE account_name = ? AND uid = ? LIMIT 1", (acct, uid))
         if cur.fetchone():
             continue
             

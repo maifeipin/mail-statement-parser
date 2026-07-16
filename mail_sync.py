@@ -242,7 +242,7 @@ def fetch_recent_emails_and_summarize(months=1, llm_enabled=True):
                             retry_count=0,
                             processed_at=datetime.now(timezone.utc).isoformat()
                         )
-                        upsert_email_summary(DB_PATH, rec)
+                        rec.id = upsert_email_summary(DB_PATH, rec)
                         
                         new_bills += 1
                         continue
@@ -391,7 +391,7 @@ def _enrich_one(db_path, r, body_text):
             status="noise", retry_count=r["retry_count"],
             processed_at=datetime.now(timezone.utc).isoformat(),
         )
-        upsert_email_summary(db_path, rec)
+        rec.id = upsert_email_summary(db_path, rec)
         return 'noise', rec
 
     res, err = _retry_llm_summary(subj, frm, body_text, date_str)
@@ -408,7 +408,7 @@ def _enrich_one(db_path, r, body_text):
             status="processed", retry_count=r["retry_count"],
             processed_at=datetime.now(timezone.utc).isoformat(),
         )
-        upsert_email_summary(db_path, rec)
+        rec.id = upsert_email_summary(db_path, rec)
         return 'ok', rec
 
     new_retry = r["retry_count"] + 1
@@ -417,7 +417,7 @@ def _enrich_one(db_path, r, body_text):
         email_date=date_str, summary=f"[大模型分析失败]: {err}",
         status="failed", retry_count=new_retry,
     )
-    upsert_email_summary(db_path, rec)
+    rec.id = upsert_email_summary(db_path, rec)
     return 'fail', rec
 
 
@@ -444,6 +444,7 @@ def _emit_high_imp_push(high_importance_summaries):
         }
         high_summaries_list.append(summary_dict)
         print(f"[{r.account_name}] [{r.category}] 重要度: {r.importance} | {r.subject}")
+        print(f"   时间: {r.email_date}")
         print(f"   摘要: {r.summary}")
         if r.deadline:
             print(f"   截止时间: {r.deadline} (原文: {r.deadline_raw})")
