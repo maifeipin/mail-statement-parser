@@ -93,11 +93,12 @@ def _resolve_account(arg, accounts):
 
 
 def connect_pop3(email_config):
-    """POP3 统一连接工厂。支持 Basic (账号密码) 以及 OAuth2 (XOAUTH2) 双重通道。"""
+    """POP3 统一连接工厂。支持 Basic (账号密码) 以及 OAuth2 (XOAUTH2) 自动回退机制。"""
     host = email_config['pop3']['host']
     port = email_config['pop3']['port']
     account = email_config['account']
     auth_type = email_config.get('auth_type', 'basic')
+    auth_code = email_config.get('authCode')
 
     def _connect():
         mail = poplib.POP3_SSL(host, port, timeout=30)
@@ -106,21 +107,35 @@ def connect_pop3(email_config):
                 from oauth_helper import get_valid_oauth_token
                 try:
                     access_token = get_valid_oauth_token(email_config)
-                except ValueError as val_err:
-                    raise MailAuthError(f"OAuth2 Token 刷新失败: {val_err}") from val_err
-                auth_str = f"user={account}\x01auth=Bearer {access_token}\x01\x01"
-                auth_b64 = base64.b64encode(auth_str.encode('utf-8')).decode('utf-8')
-                mail._putline(b'AUTH XOAUTH2')
-                resp = mail._getresp()
-                if resp.startswith(b'+'):
-                    mail._putline(auth_b64.encode('utf-8'))
+                    auth_str = f"user={account}\x01auth=Bearer {access_token}\x01\x01"
+                    auth_b64 = base64.b64encode(auth_str.encode('utf-8')).decode('utf-8')
+                    mail._putline(b'AUTH XOAUTH2')
                     resp = mail._getresp()
-                if not resp.startswith(b'+OK'):
-                    raise poplib.error_proto(resp)
+                    if resp.startswith(b'+'):
+                        mail._putline(auth_b64.encode('utf-8'))
+                        resp = mail._getresp()
+                    if not resp.startswith(b'+OK'):
+                        raise poplib.error_proto(resp)
+                    return mail
+                except ImportError:
+                    raise
+                except Exception as oauth_err:
+                    if auth_code:
+                        print(f"⚠️ 账号 {account} OAuth2 鉴权/刷新失败 ({oauth_err})，自动回退到 App Password (Basic 认证)...")
+                        try:
+                            mail.quit()
+                        except Exception:
+                            pass
+                        mail = poplib.POP3_SSL(host, port, timeout=30)
+                        mail.user(account)
+                        mail.pass_(auth_code)
+                        return mail
+                    else:
+                        raise MailAuthError(f"OAuth2 Token 刷新失败: {oauth_err}") from oauth_err
             else:
                 mail.user(account)
-                mail.pass_(email_config['authCode'])
-            return mail
+                mail.pass_(auth_code)
+                return mail
         except poplib.error_proto as pe:
             err_msg = str(pe).lower()
             if any(word in err_msg for word in ("auth", "login", "user", "pass", "cred", "fail", "invalid")):
@@ -137,11 +152,12 @@ def connect_pop3(email_config):
 
 
 def connect_smtp(email_config):
-    """SMTP 统一连接工厂。支持 Basic 登录及 XOAUTH2。"""
+    """SMTP 统一连接工厂。支持 Basic 登录及 XOAUTH2 自动回退机制。"""
     host = email_config['smtp']['host']
     port = email_config['smtp']['port']
     account = email_config['account']
     auth_type = email_config.get('auth_type', 'basic')
+    auth_code = email_config.get('authCode')
     secure = email_config['smtp'].get('secure', True)
 
     def _connect():
@@ -158,13 +174,32 @@ def connect_smtp(email_config):
                 from oauth_helper import get_valid_oauth_token
                 try:
                     access_token = get_valid_oauth_token(email_config)
-                except ValueError as val_err:
-                    raise MailAuthError(f"OAuth2 Token 刷新失败: {val_err}") from val_err
-                auth_str = f"user={account}\x01auth=Bearer {access_token}\x01\x01"
-                server.auth('XOAUTH2', lambda response=None: auth_str)
+                    auth_str = f"user={account}\x01auth=Bearer {access_token}\x01\x01"
+                    server.auth('XOAUTH2', lambda response=None: auth_str)
+                    return server
+                except ImportError:
+                    raise
+                except Exception as oauth_err:
+                    if auth_code:
+                        print(f"⚠️ 账号 {account} OAuth2 鉴权/刷新失败 ({oauth_err})，自动回退到 App Password (Basic 认证)...")
+                        try:
+                            server.quit()
+                        except Exception:
+                            pass
+                        if secure:
+                            server = smtplib.SMTP_SSL(host, port, timeout=30)
+                        else:
+                            server = smtplib.SMTP(host, port, timeout=30)
+                            server.ehlo()
+                            server.starttls()
+                            server.ehlo()
+                        server.login(account, auth_code)
+                        return server
+                    else:
+                        raise MailAuthError(f"OAuth2 Token 刷新失败: {oauth_err}") from oauth_err
             else:
-                server.login(account, email_config['authCode'])
-            return server
+                server.login(account, auth_code)
+                return server
         except smtplib.SMTPAuthenticationError as sae:
             raise MailAuthError(
                 f"SMTP 鉴权失败 (代码 {sae.smtp_code}): {sae.smtp_error.decode('utf-8', errors='ignore') if isinstance(sae.smtp_error, bytes) else sae.smtp_error}"
@@ -186,11 +221,12 @@ def connect_smtp(email_config):
 
 
 def connect_imap(email_config):
-    """IMAP 统一连接工厂。支持 Basic 登录及 XOAUTH2。"""
+    """IMAP 统一连接工厂。支持 Basic 登录及 XOAUTH2 自动回退机制。"""
     host = email_config['imap']['host']
     port = email_config['imap']['port']
     account = email_config['account']
     auth_type = email_config.get('auth_type', 'basic')
+    auth_code = email_config.get('authCode')
 
     def _connect():
         mail = imaplib.IMAP4_SSL(host, port, timeout=30)
@@ -199,12 +235,25 @@ def connect_imap(email_config):
                 from oauth_helper import get_valid_oauth_token
                 try:
                     access_token = get_valid_oauth_token(email_config)
-                except ValueError as val_err:
-                    raise MailAuthError(f"OAuth2 Token 刷新失败: {val_err}") from val_err
-                mail.authenticate('XOAUTH2', lambda x: f"user={account}\x01auth=Bearer {access_token}\x01\x01")
+                    mail.authenticate('XOAUTH2', lambda x: f"user={account}\x01auth=Bearer {access_token}\x01\x01")
+                    return mail
+                except ImportError:
+                    raise
+                except Exception as oauth_err:
+                    if auth_code:
+                        print(f"⚠️ 账号 {account} OAuth2 鉴权/刷新失败 ({oauth_err})，自动回退到 App Password (Basic 认证)...")
+                        try:
+                            mail.logout()
+                        except Exception:
+                            pass
+                        mail = imaplib.IMAP4_SSL(host, port, timeout=30)
+                        mail.login(account, auth_code)
+                        return mail
+                    else:
+                        raise MailAuthError(f"OAuth2 Token 刷新失败: {oauth_err}") from oauth_err
             else:
-                mail.login(account, email_config['authCode'])
-            return mail
+                mail.login(account, auth_code)
+                return mail
         except imaplib.IMAP4.error as ie:
             err_msg = str(ie).lower()
             if any(word in err_msg for word in ("auth", "login", "cred", "fail", "invalid", "password")):
