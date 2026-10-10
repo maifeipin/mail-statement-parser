@@ -92,5 +92,28 @@
         "skip_if_missing": true
       }
     ]
+  },
+  "template_version": "CITIC_TEMPLATE_V1.20261011",
+  "quality": {
+    "required_fields_by_purpose": {
+      "financial_summary": [
+        "statement_month",
+        "total_due"
+      ],
+      "repayment_reminder": [
+        "statement_month",
+        "due_date",
+        "total_due"
+      ],
+      "fx_analysis": [
+        "statement_month"
+      ]
+    },
+    "table_header_aliases": {},
+    "accepted_structure_fingerprints": [],
+    "currency_declaration": {
+      "settlement_currency": "CNY",
+      "evidence": "交易金额以 CNY 前缀标注"
+    }
   }
 }

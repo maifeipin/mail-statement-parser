@@ -16,12 +16,20 @@ from decimal import Decimal, InvalidOperation
 from statement_models import (
     StatementRecord, StatementTransactionRecord,
     ValidationResult, ValidationIssue,
+    Diagnostic, QualityEventRecord, StatementBalanceRecord, FIELD_SOURCES,
 )
 from statement_db import (
     init_db, upsert_statement, save_validation_run, replace_transactions,
     save_statement_with_transactions, find_message_id_conflicts, MessageIdentityConflict,
+    upsert_quality_event,
 )
 from mail_parse import decode_mime, _to_text, extract_email_content, _parse_email_datetime
+from mail_quality import (
+    split_markdown_table_blocks, dedupe_table_blocks, structure_fingerprint,
+    detect_suspicious_statement, diagnose_currency, diagnose_coverage, diagnose_format,
+    diagnose_missing_field, missing_fields_by_purpose, events_from_diagnostics,
+    make_case_key,
+)
 
 # 路径常量（与 mail_client 同级目录，os.path.expanduser("rules") 解析结果相同）
 RULES_DIR = os.path.expanduser("rules")
@@ -65,13 +73,15 @@ def _normalize_statement_month(v):
     if not v:
         return None
     s = str(v).strip()
-    m = re.search(r'(20\d{2})年(0?[1-9]|1[0-2])月', s)
+    # 注意 alternation 顺序：两位月份（10-12）必须先于 0?[1-9] 尝试，
+    # 否则 '2026/10/10' 会被截成 '2026-01'（生产 CMB 曾真实发生）。
+    m = re.search(r'(20\d{2})年(1[0-2]|0?[1-9])月', s)
     if m:
         return f'{m.group(1)}-{int(m.group(2)):02d}'
-    m = re.search(r'(20\d{2})[-/](0?[1-9]|1[0-2])', s)
+    m = re.search(r'(20\d{2})[-/](1[0-2]|0?[1-9])', s)
     if m:
         return f'{m.group(1)}-{int(m.group(2)):02d}'
-    m = re.search(r'(20\d{2})[-/](0?[1-9]|1[0-2])[-/](\d{1,2})', s)
+    m = re.search(r'(20\d{2})[-/](1[0-2]|0?[1-9])[-/](\d{1,2})', s)
     if m:
         return f'{m.group(1)}-{int(m.group(2)):02d}'
     return s
@@ -235,12 +245,39 @@ def _infer_date_from_any(v, statement_month):
     return _infer_date_from_mmdd(s, statement_month)
 
 
+def _dedup_markdown_tables(markdown_text):
+    """重复渲染的 HTML 表格只在块级去重一次；块内行不去重（保留真实交易重数）。"""
+    if not markdown_text:
+        return ''
+    blocks = dedupe_table_blocks(split_markdown_table_blocks(markdown_text))
+    return '\n\n'.join('\n'.join(b) for b in blocks)
+
+
+def _count_candidate_rows(markdown_text):
+    """候选数据行：| 开头且非表头/分隔行（供覆盖缺口诊断）。"""
+    n = 0
+    for line in (markdown_text or '').splitlines():
+        s = line.strip()
+        if not s.startswith('|'):
+            continue
+        first = s.strip('|').split('|')[0].strip()
+        if not first or first == '---' or any(x in s for x in ('交易日', '记账日', '入账日期',
+                                                               '主卡明细', '卡号后四位', '交易日期')):
+            continue
+        n += 1
+    return n
+
+
 def parse_hx_transactions_from_markdown(uid, statement_month, markdown_text):
-    """从华夏账单 Markdown 表中提取交易明细。"""
+    """从华夏账单 Markdown 表中提取交易明细。
+
+    去重策略（重构契约 §2.2）：重复表块只解析一次；同内容两笔真实交易保留重数，
+    不用内容唯一键消除（回归矩阵：相同日期商户金额的两笔真实交易）。
+    """
     if not markdown_text:
         return []
+    markdown_text = _dedup_markdown_tables(markdown_text)
     rows = []
-    seen = set()
     for line in markdown_text.splitlines():
         s = line.strip()
         if not s.startswith('|'):
@@ -256,10 +293,6 @@ def parse_hx_transactions_from_markdown(uid, statement_month, markdown_text):
         d = _safe_decimal(amount_raw, [',', ' ', '￥', '¥'])
         if d is None:
             continue
-        key = (cols[0], cols[1], cols[2], str(d))
-        if key in seen:
-            continue
-        seen.add(key)
         rows.append(
             StatementTransactionRecord(
                 uid=str(uid),
@@ -277,11 +310,11 @@ def parse_hx_transactions_from_markdown(uid, statement_month, markdown_text):
 
 
 def parse_cmb_transactions_from_markdown(uid, statement_month, markdown_text):
-    """从招商账单 Markdown 表中提取交易明细。"""
+    """从招商账单 Markdown 表中提取交易明细（表块级去重，保留行级重数）。"""
     if not markdown_text:
         return []
+    markdown_text = _dedup_markdown_tables(markdown_text)
     rows = []
-    seen = set()
     for line in markdown_text.splitlines():
         s = line.strip()
         if not s.startswith('|'):
@@ -321,11 +354,6 @@ def parse_cmb_transactions_from_markdown(uid, statement_month, markdown_text):
             if od is not None:
                 original_amount = str(od)
 
-        key = (cols[txn_col], cols[post_col], desc, str(d), txn_location_code or '', original_amount or '')
-        if key in seen:
-            continue
-        seen.add(key)
-
         rows.append(
             StatementTransactionRecord(
                 uid=str(uid),
@@ -345,11 +373,11 @@ def parse_cmb_transactions_from_markdown(uid, statement_month, markdown_text):
 
 
 def parse_spdb_transactions_from_markdown(uid, statement_month, markdown_text):
-    """从浦发账单 Markdown 表中提取交易明细（若邮件包含明细表）。"""
+    """从浦发账单 Markdown 表中提取交易明细（表块级去重，保留行级重数）。"""
     if not markdown_text:
         return []
+    markdown_text = _dedup_markdown_tables(markdown_text)
     rows = []
-    seen = set()
     for line in markdown_text.splitlines():
         s = line.strip()
         if not s.startswith('|'):
@@ -382,11 +410,6 @@ def parse_spdb_transactions_from_markdown(uid, statement_month, markdown_text):
         if not desc_val:
             continue
 
-        key = (date_val or '', desc_val, str(amount_val))
-        if key in seen:
-            continue
-        seen.add(key)
-
         rows.append(
             StatementTransactionRecord(
                 uid=str(uid),
@@ -404,11 +427,11 @@ def parse_spdb_transactions_from_markdown(uid, statement_month, markdown_text):
 
 
 def parse_icbc_transactions_from_markdown(uid, statement_month, markdown_text):
-    """从工行账单 Markdown 表中提取交易明细。"""
+    """从工行账单 Markdown 表中提取交易明细（表块级去重，保留行级重数）。"""
     if not markdown_text:
         return []
+    markdown_text = _dedup_markdown_tables(markdown_text)
     rows = []
-    seen = set()
     for line in markdown_text.splitlines():
         s = line.strip()
         if not s.startswith('|'):
@@ -442,11 +465,6 @@ def parse_icbc_transactions_from_markdown(uid, statement_month, markdown_text):
         elif '支出' in book_col:
             direction = 'debit'
 
-        key = (cols[0], cols[1], cols[2], desc, str(d))
-        if key in seen:
-            continue
-        seen.add(key)
-
         rows.append(
             StatementTransactionRecord(
                 uid=str(uid),
@@ -468,11 +486,12 @@ def parse_citic_transactions_from_body(uid, statement_month, body_text):
     中信账单交易行格式（HTML 转纯文本后，无固定分隔符）：
       YYYYMMDDYYYYMMDD4234描述CNY金额CNY金额
     例：20260117202601174234财付通－居家物业CNY1258.00CNY1258.00
+
+    不做内容行去重：同内容多笔真实交易保留重数（重复渲染由 Message-ID 幂等与清洗兜底）。
     """
     if not body_text:
         return []
     rows = []
-    seen = set()
     # 匹配: txn_date(8位) post_date(8位) card_last4(4位) desc CNY amount CNY amount
     pattern = re.compile(
         r'(\d{8})(\d{8})(\d{4})'          # txn_date, post_date, card_last4
@@ -495,10 +514,6 @@ def parse_citic_transactions_from_body(uid, statement_month, body_text):
         post_date = _parse_date(
             f'{post_raw[:4]}-{post_raw[4:6]}-{post_raw[6:]}', ['%Y-%m-%d']
         )
-        key = (txn_raw, post_raw, desc, str(d))
-        if key in seen:
-            continue
-        seen.add(key)
         rows.append(
             StatementTransactionRecord(
                 uid=str(uid),
@@ -569,7 +584,9 @@ def identify_rule(subject, sender, body_text, rules):
             best_score = score
     return best, best_score
 
-def extract_statement_by_rule(rule, subject, body_text):
+def extract_statement_by_rule(rule, subject, body_text, return_meta=False):
+    """提取账单字段。return_meta=True 时返回 (fields, meta)：meta 为
+    {字段: {value, source, rule_version?}}，source ∈ FIELD_SOURCES（重构契约 §2.1）。"""
     fields = {}
     rules = rule.get('extract_rules', {}).get('statement_fields', {})
     for name, cfg in rules.items():
@@ -604,6 +621,7 @@ def extract_statement_by_rule(rule, subject, body_text):
     if fields.get('due_date'):
         fields['due_date'] = _parse_date(fields['due_date'], date_formats)
 
+    pre_fallback = {k: fields.get(k) for k in fields}  # fallback 前快照（inferred 判据）
     _apply_due_date_fallbacks(rule, body_text, fields)
     _apply_amount_fallbacks(rule, body_text, fields)
 
@@ -612,7 +630,25 @@ def extract_statement_by_rule(rule, subject, body_text):
             d = _safe_decimal(fields[amt_key], amount_tokens)
             fields[amt_key] = str(d) if d is not None else None
 
-    return fields
+    if not return_meta:
+        return fields
+    # 字段来源状态（重构契约 §2.1）：fallback 改变的值标 inferred（规则推算），
+    # 金额比较用 Decimal 语义（'1,234.56' 与 '1234.56' 相等，不算 fallback 改变）。
+    rule_ver = rule.get('template_version') or rule.get('rule_id')
+    meta = {}
+    for k, v in fields.items():
+        if v is None:
+            meta[k] = {'value': None, 'source': 'unknown'}
+        elif k in ('total_due', 'minimum_due'):
+            if _safe_decimal(pre_fallback.get(k)) == _safe_decimal(v) and v is not None:
+                meta[k] = {'value': v, 'source': 'extracted'}
+            else:
+                meta[k] = {'value': v, 'source': 'inferred', 'rule_version': rule_ver}
+        elif pre_fallback.get(k) != v:
+            meta[k] = {'value': v, 'source': 'inferred', 'rule_version': rule_ver}
+        else:
+            meta[k] = {'value': v, 'source': 'extracted'}
+    return fields, meta
 
 def validate_statement_by_rule(rule, fields):
     result = ValidationResult(passed=True)
@@ -741,11 +777,44 @@ def validate_and_save_email_message(msg, uid, rules=None, account_name=None):
                           markdown_tables=content.get('markdown'))
         rule, score = identify_rule(subj, frm, body_text, rules)
         if not rule:
+            # 未命中模板 ≠ 非账单：疑似账单进入质量检查（已知非账单已在主题门禁排除），
+            # 事件留痕供人工确认新模板；不入账单库、不放松入库门禁。
+            suspicious = detect_suspicious_statement(frm, subj, body_text, rules)
+            if suspicious is not None:
+                template_version = 'unknown'
+                ev = QualityEventRecord(
+                    case_key=make_case_key(account_name, '', template_version, suspicious.code, ''),
+                    event_type='quality_detected', account_name=account_name,
+                    template_version=template_version, diagnostics=[suspicious],
+                    evidence_refs=[{'kind': 'email', 'account': account_name, 'uid': str(uid),
+                                    'subject': subj[:80]}],
+                )
+                try:
+                    init_db(DB_PATH)
+                    event_id = upsert_quality_event(DB_PATH, ev)
+                    print(f'⚠️ 疑似账单未命中模板，已记录质量事件：{event_id[:12]}')
+                except Exception as qe:
+                    print(f'疑似账单事件写入失败（不影响跳过入库）：{qe}')
+                    event_id = None
+                return {'status': 'not_statement', 'suspected': True,
+                        'quality_event_id': event_id, 'diagnostic': suspicious.to_dict()}
             print('未命中账单模板（非账单），跳过入库')
             return {'status': 'not_statement'}
 
-        fields = extract_statement_by_rule(rule, subj, body_text)
+        fields, fields_meta = extract_statement_by_rule(rule, subj, body_text, return_meta=True)
+        pre_outer = {k: fields.get(k) for k in fields}
         _apply_statement_date_month_fallbacks(rule, _to_text(msg.get('Date', '')), fields)
+        # 外层 fallback（SPDB 账单日从邮件日期推导等）同样标记 inferred
+        rule_ver = rule.get('template_version') or rule.get('rule_id')
+        for k, v in fields.items():
+            if k in fields_meta and fields_meta[k].get('value') == v:
+                continue
+            if v is None:
+                fields_meta[k] = {'value': None, 'source': 'unknown'}
+            elif pre_outer.get(k) != v:
+                fields_meta[k] = {'value': v, 'source': 'inferred', 'rule_version': rule_ver}
+            else:
+                fields_meta[k] = {'value': v, 'source': 'extracted'}
         vr = validate_statement_by_rule(rule, fields)
 
         # 邮件身份：优先标准 Message-ID；缺失时使用确定性的账户内备用身份，禁止空串入库
@@ -807,7 +876,7 @@ def validate_and_save_email_message(msg, uid, rules=None, account_name=None):
             due_date=fields.get('due_date'),
             total_due=fields.get('total_due'),
             minimum_due=fields.get('minimum_due'),
-            raw_fields_json=json.dumps(fields, ensure_ascii=False),
+            raw_fields_json=json.dumps({'fields': fields, 'meta': fields_meta}, ensure_ascii=False),
             parse_status=parse_status,
         )
 
@@ -824,7 +893,93 @@ def validate_and_save_email_message(msg, uid, rules=None, account_name=None):
             txns = parse_citic_transactions_from_body(uid, statement.statement_month, content.get('plain', ''))
         for _t in txns:
             _t.account_name = account_name
-        statement_id, txn_count = save_statement_with_transactions(DB_PATH, statement, txns)
+
+        # 币种证据（重构契约 §1.1）：模板声明的入账币种是唯一合法证据来源；
+        # 历史行为兼容——未声明时 currency 保持 CNY 但 currency_source 为 NULL（未知）。
+        quality_cfg = rule.get('quality') or {}
+        currency_decl = (quality_cfg.get('currency_declaration') or {})
+        settlement_currency = currency_decl.get('settlement_currency')
+        if settlement_currency:
+            for _t in txns:
+                _t.currency = settlement_currency
+                _t.currency_source = 'rule_declared'
+
+        # 交易行统计（覆盖缺口诊断输入）：候选/有效/拒绝 + 声明笔数（可配置正则）
+        candidate_rows = _count_candidate_rows(content.get('markdown', ''))
+        declared_txn_count = 0
+        declared_pat = quality_cfg.get('declared_txn_pattern')
+        if declared_pat:
+            dm = re.search(declared_pat, body_text or '')
+            if dm:
+                try:
+                    declared_txn_count = int(dm.group(1))
+                except (ValueError, IndexError):
+                    declared_txn_count = 0
+        txn_stats = {
+            'candidate_row_count': candidate_rows,
+            'valid_row_count': len(txns),
+            'rejected_row_count': max(0, candidate_rows - len(txns)),
+            'table_block_count': len(split_markdown_table_blocks(content.get('markdown', ''))),
+            'declared_txn_count': declared_txn_count,
+            'original_amount_count': sum(1 for t in txns if t.original_amount),
+            'original_currency_known': sum(1 for t in txns if getattr(t, 'original_currency', None)),
+        }
+
+        # 多币种应还余额：模板声明币种 → rule_declared；未声明 → UNKNOWN 显式展示（不猜）
+        balances = []
+        if fields.get('total_due') is not None or fields.get('minimum_due') is not None:
+            balances.append(StatementBalanceRecord(
+                currency=settlement_currency or 'UNKNOWN',
+                total_due=fields.get('total_due'),
+                minimum_due=fields.get('minimum_due'),
+                currency_source='rule_declared' if settlement_currency else None,
+                evidence=(currency_decl.get('evidence') and {'declaration': currency_decl['evidence']}) or {},
+            ))
+
+        # ---------- 诊断组装（用途隔离，重构契约 §2.1）----------
+        template_version = _to_text(rule.get('template_version') or rule.get('rule_id', ''))
+        evidence_ref = {'kind': 'statement', 'account': account_name, 'uid': str(uid),
+                        'message_id': message_id, 'report_path': out}
+        diagnostics = []
+        # 校验错误（必填缺失）→ EXTRACTION_FAILED（账单级合法性判据已由 parse_status 承担，这里只加诊断）
+        for issue in vr.errors:
+            if issue.code == 'PARSE_REQUIRED_FIELD_MISSING' and issue.field:
+                diagnostics.append(Diagnostic(
+                    code='EXTRACTION_FAILED', field=issue.field, severity='warning',
+                    reason='命中账单模板但必填字段未能提取（可能格式变化）',
+                    affected_purposes=[], evidence_ref=evidence_ref,
+                ))
+        # 用途级缺失（required_fields_by_purpose）：阻用途不降级 parse_status
+        for purpose, missing in (missing_fields_by_purpose(rule, fields_meta) or {}).items():
+            for f in missing:
+                meta_src = (fields_meta.get(f) or {}).get('source', 'unknown')
+                diag = diagnose_missing_field(f, meta_src if meta_src in ('source_missing', 'extraction_failed') else 'source_missing',
+                                              f'{purpose} 需要字段 {f} 但来源状态为 {meta_src}',
+                                              evidence_ref=evidence_ref)
+                if diag:
+                    diag.affected_purposes = list(set(list(diag.affected_purposes) + [purpose]))
+                    if not any(d.code == diag.code and d.field == diag.field for d in diagnostics):
+                        diagnostics.append(diag)
+        diagnostics.extend(diagnose_currency(txn_stats, evidence_ref))
+        diagnostics.extend(diagnose_coverage(txn_stats, evidence_ref))
+        # 结构指纹（仅当模板已配置确认基线才比较；金额/排版变化不进指纹）
+        fingerprint = structure_fingerprint(dedupe_table_blocks(split_markdown_table_blocks(content.get('markdown', ''))))
+        diagnostics.extend(diagnose_format(fingerprint, rule, evidence_ref))
+        quality_event_recs = [
+            QualityEventRecord(
+                case_key=e['case_key'], event_type=e['event_type'],
+                account_name=account_name, bank_code=bank_code,
+                template_version=template_version,
+                diagnostics=e['diagnostics'], evidence_refs=e['evidence_refs'],
+            )
+            for e in events_from_diagnostics(diagnostics, account_name, bank_code, template_version,
+                                             [evidence_ref])
+        ]
+
+        statement_id, txn_count = save_statement_with_transactions(
+            DB_PATH, statement, txns,
+            balances=balances, quality_events=quality_event_recs,
+        )
 
         run_id = save_validation_run(
             DB_PATH,
@@ -853,6 +1008,11 @@ def validate_and_save_email_message(msg, uid, rules=None, account_name=None):
             'warnings': len(vr.warnings),
             'report_path': out,
             'bank_code': bank_code,
+            'template_version': template_version,
+            'message_id': message_id,
+            'parse_status': parse_status,
+            'diagnostics': [d.to_dict() for d in diagnostics],
+            'txn_stats': txn_stats,
         }
     except MessageIdentityConflict as exc:
         # Keep the new transport's original body/report and validation audit;

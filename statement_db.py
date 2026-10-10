@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """SQLite persistence for statement parsing and validation."""
 
+import hashlib
+import json
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Iterable, Optional
 
-from statement_models import StatementRecord, ValidationIssue, StatementTransactionRecord, EmailSummaryRecord
+from statement_models import (StatementRecord, ValidationIssue, StatementTransactionRecord,
+                              EmailSummaryRecord, QualityEventRecord, StatementBalanceRecord)
 
 
 class MessageIdentityConflict(ValueError):
@@ -258,6 +261,81 @@ def init_db(db_path: str) -> None:
             cur.execute("ALTER TABLE statements ADD COLUMN parse_status TEXT NOT NULL DEFAULT 'ok'")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_statements_msgid ON statements(account_name, bank_code, message_id)")
 
+        # ---------- 币种证据列（重构契约 §1.1）：历史 CNY 标记为 legacy_assumed，不作已核实证据
+        cur.execute("PRAGMA table_info(statement_transactions)")
+        txn_cols3 = {row[1] for row in cur.fetchall()}
+        if 'original_currency' not in txn_cols3:
+            cur.execute("ALTER TABLE statement_transactions ADD COLUMN original_currency TEXT")
+        if 'currency_source' not in txn_cols3:
+            cur.execute("ALTER TABLE statement_transactions ADD COLUMN currency_source TEXT")
+            cur.execute("UPDATE statement_transactions SET currency_source = 'legacy_assumed' WHERE currency = 'CNY'")
+        if 'original_currency_source' not in txn_cols3:
+            cur.execute("ALTER TABLE statement_transactions ADD COLUMN original_currency_source TEXT")
+
+        # validation_runs 解析器版本（解析尝试证据链）
+        cur.execute("PRAGMA table_info(validation_runs)")
+        vr_cols2 = {row[1] for row in cur.fetchall()}
+        if 'parser_version' not in vr_cols2:
+            cur.execute("ALTER TABLE validation_runs ADD COLUMN parser_version TEXT")
+
+        # ---------- 多币种应还余额（重构契约 §1.2）；statements.total_due 保留为兼容字段
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS statement_balances (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                statement_id INTEGER NOT NULL,
+                currency TEXT NOT NULL,
+                total_due TEXT,
+                minimum_due TEXT,
+                currency_source TEXT,
+                evidence_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(statement_id, currency)
+            )
+        """)
+        # 历史账单回填一行 legacy CNY（幂等：INSERT OR IGNORE 不覆盖已存在行）
+        # 注：evidence_json 用字符串常量，不依赖 SQLite json1 编译选项
+        cur.execute("""
+            INSERT OR IGNORE INTO statement_balances
+                (statement_id, currency, total_due, minimum_due, currency_source, evidence_json, created_at, updated_at)
+            SELECT id, 'CNY', total_due, minimum_due, 'legacy_assumed',
+                   '{"note": "legacy backfill, not verified evidence"}',
+                   created_at, updated_at
+            FROM statements
+            WHERE parse_status = 'ok' AND total_due IS NOT NULL AND total_due <> ''
+        """)
+
+        # ---------- 质量事件持久化（重构契约 §1.3）：at-least-once + 消费方幂等
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS quality_events (
+                event_id TEXT PRIMARY KEY,
+                case_key TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                account_name TEXT,
+                bank_code TEXT,
+                template_version TEXT,
+                diagnostics_json TEXT NOT NULL,
+                evidence_refs_json TEXT NOT NULL DEFAULT '[]',
+                occurrence_count INTEGER NOT NULL DEFAULT 1,
+                first_seen_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL,
+                acked_at TEXT,
+                acked_todo_id TEXT
+            )
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_quality_events_case ON quality_events(case_key)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_quality_events_unacked ON quality_events(acked_at) WHERE acked_at IS NULL")
+
+        # ---------- 跨进程互斥租约（重构契约 §1.4）：覆盖并发 cron / 手动命令 / 重试
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS sync_leases (
+                lease_key TEXT PRIMARY KEY,
+                owner TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                acquired_at TEXT NOT NULL
+            )
+        """)
+
         # 历史账单还款状态不再由 init_db 推断：到期日已过不构成还款证据，
         # is_paid 仅通过显式标记（mark_paid / 清洗继承）变更。
 
@@ -316,15 +394,170 @@ def upsert_statement(db_path: str, s: StatementRecord) -> None:
         conn.close()
 
 
+def derive_event_id(case_key: str) -> str:
+    """event_id 由 case_key 确定性派生：同一 case 重复扫描不产生新行（重构契约 §1.3）。"""
+    return hashlib.sha256(('quality://' + case_key).encode('utf-8')).hexdigest()[:32]
+
+
+def _upsert_quality_event_locked(cur, event: 'QualityEventRecord') -> str:
+    """在已持有写锁的事务内 upsert 质量事件。返回 event_id。
+
+    - 新 case → quality_detected，occurrence=1；
+    - 已存在且未 ack → quality_updated，occurrence+1，诊断就地更新；
+    - 已存在且已 ack（复发）→ 清除 ack（新发生周期），occurrence+1；
+    - event_type='quality_resolved' → 标记该 case 解决（由解析层在无诊断时显式发出）；
+    - event_type='statement_recorded' → 新账单落库事件（含关键字段变化时的重新可见）。
+    """
+    now = _utc_now_iso()
+    event_id = derive_event_id(event.case_key)
+    cur.execute("SELECT event_id, acked_at, occurrence_count FROM quality_events WHERE event_id = ?", (event_id,))
+    row = cur.fetchone()
+    if row is None:
+        cur.execute(
+            """INSERT INTO quality_events (
+                event_id, case_key, event_type, account_name, bank_code, template_version,
+                diagnostics_json, evidence_refs_json, occurrence_count, first_seen_at, last_seen_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)""",
+            (event_id, event.case_key, event.event_type, event.account_name, event.bank_code,
+             event.template_version,
+             json.dumps([d.to_dict() for d in event.diagnostics], ensure_ascii=False),
+             json.dumps(event.evidence_refs or [], ensure_ascii=False),
+             now, now),
+        )
+    else:
+        cur.execute(
+            """UPDATE quality_events SET
+                event_type = ?, account_name = COALESCE(?, account_name),
+                bank_code = COALESCE(?, bank_code), template_version = COALESCE(?, template_version),
+                diagnostics_json = ?, evidence_refs_json = ?,
+                occurrence_count = occurrence_count + 1, last_seen_at = ?,
+                acked_at = NULL, acked_todo_id = NULL
+               WHERE event_id = ?""",
+            (event.event_type, event.account_name, event.bank_code, event.template_version,
+             json.dumps([d.to_dict() for d in event.diagnostics], ensure_ascii=False),
+             json.dumps(event.evidence_refs or [], ensure_ascii=False),
+             now, event_id),
+        )
+    return event_id
+
+
+def upsert_quality_event(db_path: str, event: 'QualityEventRecord') -> str:
+    """独立连接版本（供工具/测试使用）；主路径在 save_statement_with_transactions 事务内调用。"""
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute('BEGIN IMMEDIATE')
+        event_id = _upsert_quality_event_locked(conn.cursor(), event)
+        conn.commit()
+        return event_id
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def get_unacked_quality_events(db_path: str, limit: int = 100) -> list:
+    """未确认质量事件（只读），按最近发生排序。"""
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            """SELECT * FROM quality_events WHERE acked_at IS NULL
+               ORDER BY last_seen_at DESC LIMIT ?""", (limit,)).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def ack_quality_event(db_path: str, event_id: str, todo_id: str) -> dict:
+    """幂等确认事件：未确认则确认；已确认且 todo_id 一致 no-op；事件不存在返回 not_found。"""
+    now = _utc_now_iso()
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute('BEGIN IMMEDIATE')
+        cur = conn.cursor()
+        cur.execute("SELECT event_id, acked_todo_id FROM quality_events WHERE event_id = ?", (event_id,))
+        row = cur.fetchone()
+        if row is None:
+            conn.rollback()
+            return {'acked': False, 'event_id': event_id, 'todo_id': todo_id, 'reason': 'not_found'}
+        if row[1] == todo_id:
+            conn.rollback()  # 已被同一 todo 确认，幂等 no-op
+            return {'acked': True, 'event_id': event_id, 'todo_id': todo_id, 'reason': 'already_acked'}
+        cur.execute("UPDATE quality_events SET acked_at = ?, acked_todo_id = ? WHERE event_id = ? AND acked_at IS NULL",
+                    (now, todo_id, event_id))
+        conn.commit()
+        return {'acked': bool(cur.rowcount), 'event_id': event_id, 'todo_id': todo_id,
+                'reason': 'acked' if cur.rowcount else 'already_acked'}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def acquire_lease(db_path: str, lease_key: str, owner: str, ttl_seconds: int = 600) -> bool:
+    """跨进程互斥租约：获取成功 True；被占用/过期前占用者持有中 False。
+
+    过期租约由下一次获取自动清理（恢复语义：持有者崩溃后 TTL 到期自然让位）。"""
+    now_dt = datetime.now(timezone.utc)
+    expires = (now_dt + timedelta(seconds=ttl_seconds)).isoformat()
+    conn = sqlite3.connect(db_path, isolation_level=None)
+    try:
+        conn.execute('PRAGMA busy_timeout = 3000')
+        conn.execute('BEGIN IMMEDIATE')
+        conn.execute("DELETE FROM sync_leases WHERE lease_key = ? AND expires_at < ?",
+                     (lease_key, now_dt.isoformat()))
+        try:
+            conn.execute("INSERT INTO sync_leases (lease_key, owner, expires_at, acquired_at) VALUES (?, ?, ?, ?)",
+                         (lease_key, owner, expires, now_dt.isoformat()))
+            conn.execute('COMMIT')
+            return True
+        except sqlite3.IntegrityError:
+            conn.execute('ROLLBACK')
+            return False
+    finally:
+        conn.close()
+
+
+def release_lease(db_path: str, lease_key: str, owner: str) -> bool:
+    """释放租约（仅持有者本人可释放）。"""
+    conn = sqlite3.connect(db_path)
+    try:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM sync_leases WHERE lease_key = ? AND owner = ?", (lease_key, owner))
+        conn.commit()
+        return bool(cur.rowcount)
+    finally:
+        conn.close()
+
+
+def get_statement_balances(db_path: str, statement_id: int) -> list:
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute("SELECT * FROM statement_balances WHERE statement_id = ? ORDER BY currency",
+                            (statement_id,)).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
 def save_statement_with_transactions(db_path: str, s: StatementRecord,
-                                     txns: Iterable[StatementTransactionRecord]) -> tuple[int, int]:
-    """账单 + 交易明细单事务原子保存。
+                                     txns: Iterable[StatementTransactionRecord],
+                                     balances: Optional[list] = None,
+                                     quality_events: Optional[list] = None,
+                                     parser_version: Optional[str] = None) -> tuple:
+    """账单 + 交易 + 多币种余额 + 质量事件单事务原子保存。
 
     步骤（同一 BEGIN IMMEDIATE 事务内）：
-    1. Upsert statements 取稳定 statement_id；
+    1. Upsert statements 取稳定 statement_id（is_paid/paid_at 永不回退）；
     2. 清空该账单旧明细（含迁移期未挂 statement_id 的同源明细），即使新明细为空也执行，
-       避免重解析残留旧交易；
-    3. 批量插入新明细并回挂 statement_id。
+       避免重解析残留旧交易；旧余额行同样整份替换；
+    3. 批量插入新明细并回挂 statement_id（含币种证据列）；
+    4. 首次落库或关键字段（due_date/total_due）实质变化的合法账单 → 自动产出
+       statement_recorded 事件（还款提醒闭环的事件源，重构契约 §5.3）；
+    5. 传入的质量事件 upsert（与账单数据同事务，不伪跨库单事务）。
     返回 (statement_id, txn_count)。任何一步失败整体回滚。
     """
     items = list(txns)
@@ -333,6 +566,12 @@ def save_statement_with_transactions(db_path: str, s: StatementRecord,
     try:
         conn.execute('BEGIN IMMEDIATE')
         cur = conn.cursor()
+        # 保存前旧值（判断首次落库与关键字段变化，is_paid 保护不依赖此查询）
+        cur.execute(
+            "SELECT id, due_date, total_due, is_paid FROM statements WHERE account_name=? AND uid=? AND bank_code=?",
+            (s.account_name, str(s.uid), s.bank_code),
+        )
+        existing = cur.fetchone()
         # Check under the write lock, so concurrent transports cannot both
         # insert the same message. Existing finances and paid evidence stay intact.
         if s.message_id:
@@ -390,17 +629,53 @@ def save_statement_with_transactions(db_path: str, s: StatementRecord,
                 """
                 INSERT INTO statement_transactions (
                     account_name, uid, bank_code, statement_id, txn_date, post_date, description,
-                    amount, currency, txn_location_code, original_amount, direction,
+                    amount, currency, currency_source, txn_location_code, original_amount,
+                    original_currency, original_currency_source, direction,
                     raw_row_json, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     t.account_name or s.account_name, t.uid, t.bank_code, statement_id,
                     t.txn_date, t.post_date, t.description, t.amount, t.currency,
-                    t.txn_location_code, t.original_amount, t.direction,
+                    getattr(t, 'currency_source', None),
+                    t.txn_location_code, t.original_amount,
+                    getattr(t, 'original_currency', None),
+                    getattr(t, 'original_currency_source', None),
+                    t.direction,
                     t.raw_row_json, _utc_now_iso(),
                 ),
             )
+
+        # 余额整份替换（含历史 legacy 回填行），无证据币种用 'UNKNOWN' 显式展示
+        cur.execute("DELETE FROM statement_balances WHERE statement_id = ?", (statement_id,))
+        for b in (balances or []):
+            cur.execute(
+                """INSERT INTO statement_balances (
+                    statement_id, currency, total_due, minimum_due, currency_source,
+                    evidence_json, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (statement_id, b.currency, b.total_due, b.minimum_due, b.currency_source,
+                 json.dumps(b.evidence or {}, ensure_ascii=False), now, now),
+            )
+
+        # statement_recorded：首次落库或还款关键字段实质变化（多卡/多币种按 Message-ID 区分）
+        key_changed = (existing is None) or (
+            existing[1] != s.due_date or existing[2] != s.total_due
+        )
+        if key_changed and (s.parse_status or 'ok') == 'ok' and s.message_id:
+            _upsert_quality_event_locked(cur, QualityEventRecord(
+                case_key=f'billing_due|{s.account_name}|{s.bank_code}|{s.message_id}',
+                event_type='statement_recorded',
+                account_name=s.account_name, bank_code=s.bank_code,
+                template_version=s.rule_id,
+                diagnostics=[],
+                evidence_refs=[{'kind': 'statement', 'statement_id': statement_id,
+                                'account': s.account_name, 'uid': str(s.uid),
+                                'message_id': s.message_id}],
+            ))
+
+        for ev in (quality_events or []):
+            _upsert_quality_event_locked(cur, ev)
 
         conn.commit()
         return statement_id, len(items)
@@ -813,6 +1088,24 @@ def mark_statement_paid(db_path: str, bank_code: str, statement_month: str = Non
                 """,
                 (now_str, now_str, bank_code)
             )
+        rowcount = cur.rowcount
+        conn.commit()
+        return rowcount
+    finally:
+        conn.close()
+
+
+def mark_statement_paid_by_id(db_path: str, statement_id: int) -> int:
+    """精确到逻辑账单的已还款标记（重构契约 §5.3）：按 statement_id 单行更新，
+    防止银行+月份批量误标其他卡；已还款不重复更新（幂等返回 0）。"""
+    conn = sqlite3.connect(db_path)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE statements SET is_paid=1, paid_at=COALESCE(paid_at, ?), updated_at=? "
+            "WHERE id=? AND is_paid=0 AND COALESCE(parse_status, 'ok') != 'failed'",
+            (_utc_now_iso(), _utc_now_iso(), int(statement_id)),
+        )
         rowcount = cur.rowcount
         conn.commit()
         return rowcount

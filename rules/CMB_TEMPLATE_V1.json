@@ -98,5 +98,33 @@
         "skip_if_missing": true
       }
     ]
+  },
+  "template_version": "CMB_TEMPLATE_V1.20261011",
+  "quality": {
+    "required_fields_by_purpose": {
+      "financial_summary": [
+        "statement_month",
+        "total_due"
+      ],
+      "repayment_reminder": [
+        "statement_month",
+        "due_date",
+        "total_due"
+      ],
+      "fx_analysis": [
+        "statement_month"
+      ]
+    },
+    "table_header_aliases": {
+      "交易日": [
+        "交易日期"
+      ],
+      "记账日": [
+        "入账日期",
+        "POST DATE"
+      ]
+    },
+    "accepted_structure_fingerprints": [],
+    "currency_declaration": {}
   }
 }

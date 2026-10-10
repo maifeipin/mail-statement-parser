@@ -12,7 +12,7 @@ if sys.platform.startswith('win'):
     except Exception:
         pass
 from statement_models import EmailSummaryRecord
-from statement_db import init_db, get_recent_statements, get_summary_by_bank_month, get_reconciliation_rows, uid_exists, get_transactions_above_amount, upsert_email_summary, get_email_summary_status, get_email_summary_by_id, get_recent_email_headers, get_potential_missed_emails
+from statement_db import init_db, get_recent_statements, get_summary_by_bank_month, get_reconciliation_rows, uid_exists, get_transactions_above_amount, upsert_email_summary, get_email_summary_status, get_email_summary_by_id, get_recent_email_headers, get_potential_missed_emails, get_unacked_quality_events, ack_quality_event, mark_statement_paid_by_id
 
 
 from mail_connect import (MailAuthError, AccountBudgetExceeded, account_deadline, retry_with_backoff, is_graph_api, connect_pop3, connect_smtp, connect_imap, _graph_api_request, fetch_summaries_graph, send_email_graph, _month_subtract, pop3_uidl_map, pop3_retr_by_uid)
@@ -981,8 +981,21 @@ def sync_recent_bank_emails(months=3, account_budget_s=60, total_budget_s=270):
         print(f"🏁 账户 {account_name} 状态 {acct['status']}：入库 {acct['saved']}，"
               f"解析失败 {acct['parse_failed']}，异常 {acct['errors']}")
 
-    summary = {'command': 'sync3m', 'months': int(months), 'accounts': account_results,
+    # 协议版本 + 质量事件计数（重构契约 §3：保留旧标记兼容，追加 protocol_version）
+    try:
+        from statement_db import get_unacked_quality_events
+        unacked_events = get_unacked_quality_events(DB_PATH, limit=1000)
+    except Exception:
+        unacked_events = []
+    summary = {'command': 'sync3m', 'protocol_version': 2, 'months': int(months), 'accounts': account_results,
                'errors': [] if accounts else ['未配置邮箱账户'],
+               'quality_events': {
+                   'unacked_count': len(unacked_events),
+                   'detected': sum(1 for e in unacked_events if e.get('event_type') == 'quality_detected'),
+                   'updated': sum(1 for e in unacked_events if e.get('event_type') == 'quality_updated'),
+                   'resolved': sum(1 for e in unacked_events if e.get('event_type') == 'quality_resolved'),
+                   'statement_recorded': sum(1 for e in unacked_events if e.get('event_type') == 'statement_recorded'),
+               },
                'totals': {key: sum(a[key] for a in account_results) for key in
                           ('candidates', 'downloaded', 'saved', 'parse_failed', 'gated',
                            'skipped_dup', 'errors', 'scan_errors')}}
@@ -1268,11 +1281,112 @@ def show_missed(limit=15):
     print(json.dumps(result, ensure_ascii=False))
 
 
+# ---------------- 契约 CLI（重构契约 §3：统一 envelope，schema_version=1） ----------------
+
+def _emit_envelope(command, data=None, errors=None):
+    """版本化 JSON 回执：lite_agent integrations/mail/client.py 的消费契约。"""
+    envelope = {
+        'schema_version': 1,
+        'command': command,
+        'status': 'ok' if not errors else 'error',
+        'data': data if data is not None else {},
+        'errors': errors or [],
+    }
+    print(json.dumps(envelope, ensure_ascii=False))
+    return envelope
+
+
+def cli_quality_events(limit=100):
+    errors = []
+    data = {'events': []}
+    try:
+        init_db(DB_PATH)
+        events = get_unacked_quality_events(DB_PATH, limit=max(1, int(limit)))
+        for e in events:
+            try:
+                e['diagnostics'] = json.loads(e.get('diagnostics_json') or '[]')
+            except ValueError:
+                e['diagnostics'] = []
+            try:
+                e['evidence_refs'] = json.loads(e.get('evidence_refs_json') or '[]')
+            except ValueError:
+                e['evidence_refs'] = []
+            e.pop('diagnostics_json', None)
+            e.pop('evidence_refs_json', None)
+        data['events'] = events
+        data['count'] = len(events)
+    except Exception as exc:
+        errors.append(f'quality_events: {exc}')
+    return _emit_envelope('quality_events', data, errors)
+
+
+def cli_quality_ack(event_id, todo_id):
+    errors = []
+    data = {}
+    try:
+        init_db(DB_PATH)
+        data = ack_quality_event(DB_PATH, event_id, todo_id)
+        if not data.get('acked') and data.get('reason') == 'not_found':
+            errors.append(f'事件不存在：{event_id}')
+    except Exception as exc:
+        errors.append(f'quality_ack: {exc}')
+        data = {'acked': False, 'event_id': event_id, 'todo_id': todo_id, 'reason': 'error'}
+    return _emit_envelope('quality_ack', data, errors)
+
+
+def cli_billing_snapshot(months=1, detail_limit=20):
+    from billing_readmodel import snapshot
+    errors = []
+    data = {}
+    try:
+        init_db(DB_PATH)
+        data = snapshot(DB_PATH, months=max(1, int(months)), detail_limit=max(1, int(detail_limit)))
+    except Exception as exc:
+        errors.append(f'billing_snapshot: {exc}')
+    return _emit_envelope('billing_snapshot', data, errors)
+
+
+def cli_billing_trends(months=3, merchant=None, account=None):
+    from billing_readmodel import trends
+    errors = []
+    data = {}
+    try:
+        init_db(DB_PATH)
+        data = trends(DB_PATH, months=max(1, int(months)), merchant=merchant, account=account)
+    except Exception as exc:
+        errors.append(f'billing_trends: {exc}')
+    return _emit_envelope('billing_trends', data, errors)
+
+
+def mark_paid_statement_by_id_cmd(statement_id):
+    """精确到逻辑账单的还款标记：`mark_paid --statement-id N`（兼容旧的银行+月份入口）。"""
+    init_db(DB_PATH)
+    n = mark_statement_paid_by_id(DB_PATH, statement_id)
+    if n:
+        print(f'✅ 已标记账单 #{statement_id} 为已还款（paid_at 记录当前时间）')
+    else:
+        print(f'ℹ️ 账单 #{statement_id} 无需更新（不存在/已还款/解析失败）')
+
+
+def _parse_flag(argv, flag):
+    """解析 --flag value；返回 (值, 去除该 flag 后的位置参数列表)。"""
+    positional = []
+    value = None
+    i = 0
+    while i < len(argv):
+        if argv[i] == flag and i + 1 < len(argv):
+            value = argv[i + 1]
+            i += 2
+            continue
+        positional.append(argv[i])
+        i += 1
+    return value, positional
+
+
 def main():
     if len(sys.argv) < 2:
         interactive_menu()
         sys.exit(0)
-    
     cmd = sys.argv[1]
     if cmd in ('menu', 'interactive'):
         interactive_menu()
@@ -1328,12 +1442,43 @@ def main():
     elif cmd == 'unpaid':
         show_unpaid_statements()
     elif cmd == 'mark_paid':
-        if len(sys.argv) < 3:
-            print('用法：mark_paid <bank_code> [statement_month]')
+        stmt_id_flag, positional = _parse_flag(sys.argv[2:], '--statement-id')
+        if stmt_id_flag is not None:
+            mark_paid_statement_by_id_cmd(stmt_id_flag)
+        elif len(sys.argv) < 3:
+            print('用法：mark_paid <bank_code> [statement_month] | mark_paid --statement-id <id>')
             sys.exit(1)
-        bank_code = sys.argv[2]
-        month = sys.argv[3] if len(sys.argv) > 3 else None
-        mark_statement_paid_cmd(bank_code, month)
+        else:
+            bank_code = positional[0] if positional else sys.argv[2]
+            month = positional[1] if len(positional) > 1 else None
+            mark_statement_paid_cmd(bank_code, month)
+
+    elif cmd == 'quality_events':
+        limit_flag, _ = _parse_flag(sys.argv[2:], '--limit')
+        limit = int(limit_flag) if limit_flag else (int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2].isdigit() else 100)
+        cli_quality_events(limit)
+    elif cmd == 'quality_ack':
+        event_id, _ = _parse_flag(sys.argv[2:], '--event-id')
+        todo_id, _ = _parse_flag(sys.argv[2:], '--todo-id')
+        positional = [a for a in sys.argv[2:] if not a.startswith('--')]
+        if event_id is None and len(positional) > 0:
+            event_id = positional[0]
+        if todo_id is None and len(positional) > 1:
+            todo_id = positional[1]
+        if not event_id or not todo_id:
+            print('用法：quality_ack --event-id <ID> --todo-id <ID>')
+            sys.exit(1)
+        cli_quality_ack(event_id, todo_id)
+    elif cmd == 'billing_snapshot':
+        months = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2].isdigit() else 1
+        detail_flag, _ = _parse_flag(sys.argv[2:], '--detail-limit')
+        detail = int(detail_flag) if detail_flag else 20
+        cli_billing_snapshot(months, detail)
+    elif cmd == 'billing_trends':
+        months = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2].isdigit() else 3
+        merchant_flag, _ = _parse_flag(sys.argv[2:], '--merchant')
+        account_flag, _ = _parse_flag(sys.argv[2:], '--account')
+        cli_billing_trends(months, merchant_flag, account_flag)
 
     elif cmd == 'due_soon_bills':
         months = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2].isdigit() else 3
