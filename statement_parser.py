@@ -19,6 +19,7 @@ from statement_models import (
 )
 from statement_db import (
     init_db, upsert_statement, save_validation_run, replace_transactions,
+    save_statement_with_transactions, find_message_id_conflicts,
 )
 from mail_parse import decode_mime, _to_text, extract_email_content, _parse_email_datetime
 
@@ -543,7 +544,11 @@ def _match_score(text, patterns):
     return score
 
 def identify_rule(subject, sender, body_text, rules):
-    """按规则匹配模板，返回最佳匹配规则与分数。"""
+    """按规则匹配模板，返回最佳匹配规则与分数。
+
+    入库门禁：声明了 subject_patterns 的规则必须至少命中一个主题特征，
+    防止发件人单独命中导致非账单邮件（如“每日信用管家”日报）混入账单流。
+    """
     best = None
     best_score = -1
     for r in rules:
@@ -551,6 +556,8 @@ def identify_rule(subject, sender, body_text, rules):
         sender_score = _match_score(sender, m.get('sender_patterns', [])) * 5
         subject_score = _match_score(subject, m.get('subject_patterns', [])) * 3
         body_score = _match_score(body_text, m.get('body_signatures', []))
+        if m.get('subject_patterns') and subject_score == 0:
+            continue
         if sender_score == 0 and subject_score == 0:
             continue
         base = sender_score + subject_score + body_score
@@ -706,12 +713,20 @@ def _validation_result_to_dict(vr):
     }
 
 def validate_and_save_email_message(msg, uid, rules=None, account_name=None):
-    """提取的重用逻辑：从已下载的 msg 解析、校验并落库账单"""
+    """从已下载的 msg 解析、校验并落库账单（三态分流）。
+
+    返回 dict，status 取值：
+      - 'saved'        合法账单已原子入库（金额 0=已还清、负值=溢缴款/退款结转均为合法取值）
+      - 'parse_failed' 命中账单模板但校验未过：保留原文与校验记录，statements 标 parse_status='failed'，
+                       排除出有效账单统计，供修复后离线重解析
+      - 'not_statement' 未命中账单模板（非账单），不入 statements 表
+      - 'error'        处理异常
+    """
     if rules is None:
         rules = load_rule_files()
     if not rules:
         print('未找到规则文件，请先在 rules 目录下放置 *.json')
-        return
+        return {'status': 'error', 'error': 'no_rules'}
 
     account_name = account_name or 'default'
     try:
@@ -726,21 +741,40 @@ def validate_and_save_email_message(msg, uid, rules=None, account_name=None):
                           markdown_tables=content.get('markdown'))
         rule, score = identify_rule(subj, frm, body_text, rules)
         if not rule:
-            print('未匹配到规则，无法验证')
-            return
+            print('未命中账单模板（非账单），跳过入库')
+            return {'status': 'not_statement'}
 
         fields = extract_statement_by_rule(rule, subj, body_text)
         _apply_statement_date_month_fallbacks(rule, _to_text(msg.get('Date', '')), fields)
         vr = validate_statement_by_rule(rule, fields)
 
+        # 邮件身份：优先标准 Message-ID；缺失时使用确定性的账户内备用身份，禁止空串入库
+        message_id = _to_text(msg.get('Message-ID', '')).strip()
+        if not message_id:
+            message_id = f'<{account_name}.{uid}@local.generated>'
+
+        bank_code = _to_text(rule.get('bank_code', ''))
+
+        # Message-ID 冲突检测：同账户+银行+Message-ID 但 uid 不同 → 记录冲突告警，不静默覆盖
+        conflicts = find_message_id_conflicts(DB_PATH, account_name, message_id, bank_code, str(uid))
+        if conflicts:
+            conflict_uids = ','.join(str(c['uid']) for c in conflicts)
+            vr.warnings.append(ValidationIssue(
+                code='MESSAGE_ID_CONFLICT', field='message_id', severity='warning',
+                left=str(uid), right=conflict_uids, op='ne'))
+            print(f'⚠️ Message-ID 冲突：UID={str(uid)[:24]} 与已存记录 {conflict_uids[:40]} 相同，已记冲突告警')
+
         validation_dict = _validation_result_to_dict(vr)
+        parse_status = 'ok' if vr.passed else 'failed'
         report = {
             'report_meta': {
                 'generated_at': datetime.now(timezone.utc).isoformat(),
                 'uid': str(uid),
+                'message_id': message_id,
                 'rule_id': rule.get('rule_id'),
                 'bank_code': rule.get('bank_code'),
-                'match_score': score
+                'match_score': score,
+                'parse_status': parse_status
             },
             'email_header': {
                 'subject': subj,
@@ -757,13 +791,13 @@ def validate_and_save_email_message(msg, uid, rules=None, account_name=None):
         with open(out, 'w', encoding='utf-8') as f:
             json.dump(report, f, ensure_ascii=False, indent=2)
 
-        # 落库：结构化账单 + 本次校验运行记录
+        # 落库：账单 + 交易明细单事务原子保存（即使新明细为空也清空旧明细，防重解析残留）
         init_db(DB_PATH)
         statement = StatementRecord(
             account_name=account_name,
             uid=str(uid),
-            message_id=_to_text(msg.get('Message-ID', '')).strip(),
-            bank_code=_to_text(rule.get('bank_code', '')),
+            message_id=message_id,
+            bank_code=bank_code,
             rule_id=_to_text(rule.get('rule_id', '')),
             subject=subj,
             sender=frm,
@@ -774,10 +808,9 @@ def validate_and_save_email_message(msg, uid, rules=None, account_name=None):
             total_due=fields.get('total_due'),
             minimum_due=fields.get('minimum_due'),
             raw_fields_json=json.dumps(fields, ensure_ascii=False),
+            parse_status=parse_status,
         )
-        upsert_statement(DB_PATH, statement)
 
-        txn_count = 0
         txns = []
         if statement.bank_code == 'HX':
             txns = parse_hx_transactions_from_markdown(uid, statement.statement_month, content.get('markdown', ''))
@@ -789,16 +822,15 @@ def validate_and_save_email_message(msg, uid, rules=None, account_name=None):
             txns = parse_icbc_transactions_from_markdown(uid, statement.statement_month, content.get('markdown', ''))
         elif statement.bank_code == 'CITIC':
             txns = parse_citic_transactions_from_body(uid, statement.statement_month, content.get('plain', ''))
-        if txns:
-            for _t in txns:
-                _t.account_name = account_name
-            txn_count = replace_transactions(DB_PATH, account_name, str(uid), statement.bank_code, txns)
+        for _t in txns:
+            _t.account_name = account_name
+        statement_id, txn_count = save_statement_with_transactions(DB_PATH, statement, txns)
 
         run_id = save_validation_run(
             DB_PATH,
             account_name,
             uid=str(uid),
-            bank_code=_to_text(rule.get('bank_code', '')),
+            bank_code=bank_code,
             rule_id=_to_text(rule.get('rule_id', '')),
             passed=vr.passed,
             report_path=out,
@@ -812,6 +844,56 @@ def validate_and_save_email_message(msg, uid, rules=None, account_name=None):
         print(f'错误数：{len(vr.errors)}，告警数：{len(vr.warnings)}')
         print(f'交易入库数：{txn_count}')
         print(f'数据库记录 run_id：{run_id}')
+        return {
+            'status': 'saved' if vr.passed else 'parse_failed',
+            'statement_id': statement_id,
+            'txn_count': txn_count,
+            'run_id': run_id,
+            'errors': len(vr.errors),
+            'warnings': len(vr.warnings),
+            'report_path': out,
+            'bank_code': bank_code,
+        }
     except Exception as e:
         print(f'验证失败：{e}')
+        return {'status': 'error', 'error': str(e)}
+
+
+def reparse_cached_statement(account_name, uid):
+    """离线重解析：优先使用 email_bodies 已缓存正文重建邮件，避免网络重拉。
+
+    元数据（主题/发件人/日期/Message-ID）取 statements 或 email_summaries 已存记录。
+    返回与 validate_and_save_email_message 相同的 dict。
+    """
+    import sqlite3
+    from email.message import EmailMessage
+    init_db(DB_PATH)
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        body = conn.execute(
+            "SELECT raw_html, plain_text, markdown_tables FROM email_bodies WHERE account_name = ? AND uid = ?",
+            (account_name, str(uid))).fetchone()
+        if not body or not (body['raw_html'] or body['plain_text'] or body['markdown_tables']):
+            return {'status': 'error', 'error': 'no_cached_body'}
+        meta = conn.execute(
+            "SELECT subject, sender, email_date, message_id FROM statements WHERE account_name = ? AND uid = ? LIMIT 1",
+            (account_name, str(uid))).fetchone()
+        if not meta:
+            meta = conn.execute(
+                "SELECT subject, sender, email_date, NULL AS message_id FROM email_summaries WHERE account_name = ? AND uid = ? LIMIT 1",
+                (account_name, str(uid))).fetchone()
+    finally:
+        conn.close()
+
+    msg = EmailMessage()
+    msg['Subject'] = (meta['subject'] if meta else '') or ''
+    msg['From'] = (meta['sender'] if meta else '') or ''
+    msg['Date'] = (meta['email_date'] if meta else '') or ''
+    if meta and meta['message_id']:
+        msg['Message-ID'] = meta['message_id']
+    msg.set_content(body['plain_text'] or '(无纯文本正文)')
+    if body['raw_html']:
+        msg.add_alternative(body['raw_html'], subtype='html')
+    return validate_and_save_email_message(msg, uid, account_name=account_name)
 

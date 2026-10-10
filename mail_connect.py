@@ -18,6 +18,9 @@ import urllib.parse
 import json
 import time
 import random
+import signal
+import threading
+from contextlib import contextmanager
 from datetime import datetime, timezone
 
 from mail_parse import html_to_text
@@ -26,6 +29,32 @@ from mail_parse import html_to_text
 class MailAuthError(Exception):
     """自定义邮件鉴权异常，遇到此类异常应当立即停止连接重试，防锁号"""
     pass
+
+
+class AccountBudgetExceeded(BaseException):
+    """Escape ordinary retry/error handlers when a whole-account deadline expires."""
+
+
+@contextmanager
+def account_deadline(seconds):
+    """Unix CLI wall-clock deadline, including sockets, retries and scanning."""
+    if threading.current_thread() is not threading.main_thread() or not hasattr(signal, 'setitimer'):
+        raise RuntimeError('account deadline requires a Unix main-thread CLI')
+    if seconds <= 0:
+        raise AccountBudgetExceeded('account deadline exhausted')
+    previous_handler = signal.getsignal(signal.SIGALRM)
+    previous_timer = signal.getitimer(signal.ITIMER_REAL)
+    if previous_timer[0] or previous_timer[1]:
+        raise RuntimeError('another alarm is already active')
+    def expire(signum, frame):
+        raise AccountBudgetExceeded('account deadline exceeded')
+    signal.signal(signal.SIGALRM, expire)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
 
 
 def retry_with_backoff(func, *args, max_retries=3, initial_delay=2, backoff_factor=2, **kwargs):
@@ -336,6 +365,42 @@ def _month_subtract(dt, months):
     return dt.replace(year=year, month=month, day=day)
 
 
+def pop3_uidl_map(mail):
+    """取 POP3 服务器的 UIDL 列表，返回 {msg_num(int): uidl(str)}。
+
+    RFC 1939：邮件序号（msg_num）只在单次会话内有效，新邮件到达/删除会偏移；
+    UIDL 是账户内跨会话持久唯一的身份标识。服务器不支持 UIDL 时返回 {}。
+    """
+    try:
+        _resp, listing, _octets = mail.uidl()
+    except Exception:
+        return {}
+    out = {}
+    for item in listing or []:
+        parts = item.decode('utf-8', errors='ignore').split(None, 1)
+        if len(parts) != 2:
+            continue
+        try:
+            out[int(parts[0])] = parts[1].strip()
+        except ValueError:
+            continue
+    return out
+
+
+def pop3_retr_by_uid(mail, uid):
+    """按稳定 UID（POP3 UIDL）拉取邮件，返回 (msg_num, lines, size)。
+
+    先在当前会话的 UIDL 映射中反查 msg_num 再 retr，杜绝序号漂移导致取错邮件。
+    历史序号不能作为身份兜底；找不到 UIDL 时拒绝取信，使用离线原文重解析。
+    """
+    uid_s = str(uid)
+    for num, uidl in pop3_uidl_map(mail).items():
+        if uidl == uid_s:
+            resp, lines, size = mail.retr(num)
+            return num, lines, size
+    raise ValueError(f'UIDL 在当前邮箱中不存在: {uid_s[:40]}')
+
+
 def fetch_summaries_graph(email_config, months=1):
     from oauth_helper import get_valid_oauth_token
 
@@ -345,7 +410,7 @@ def fetch_summaries_graph(email_config, months=1):
     base_url = "https://graph.microsoft.com/v1.0/me/messages"
     params = {
         "$filter": f"receivedDateTime ge {cutoff_date}",
-        "$select": "id,subject,from,receivedDateTime,body",
+        "$select": "id,subject,from,receivedDateTime,body,internetMessageId",
         "$top": 100,
         "$orderby": "receivedDateTime desc"
     }
@@ -384,7 +449,8 @@ def fetch_summaries_graph(email_config, months=1):
                     "email_date": email_date,
                     "raw_date": email_date,
                     "body": body_text,
-                    "html": body_content if msg.get('body', {}).get('contentType') == 'html' else ""
+                    "html": body_content if msg.get('body', {}).get('contentType') == 'html' else "",
+                    "internet_message_id": msg.get('internetMessageId') or ""
                 })
             except Exception as e:
                 print(f"⚠️ 跳过解析错误的 Graph 邮件: {e}")

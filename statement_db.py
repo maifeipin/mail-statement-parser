@@ -102,6 +102,7 @@ def init_db(db_path: str) -> None:
                 raw_fields_json TEXT,
                 is_paid INTEGER NOT NULL DEFAULT 0,
                 paid_at TEXT,
+                parse_status TEXT NOT NULL DEFAULT 'ok',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 UNIQUE(account_name, uid, bank_code)
@@ -148,6 +149,7 @@ def init_db(db_path: str) -> None:
                 account_name TEXT NOT NULL DEFAULT '__orphan__',
                 uid TEXT NOT NULL,
                 bank_code TEXT NOT NULL,
+                statement_id INTEGER,
                 txn_date TEXT,
                 post_date TEXT,
                 description TEXT,
@@ -224,21 +226,36 @@ def init_db(db_path: str) -> None:
         if 'pushed' not in summar_cols:
             cur.execute("ALTER TABLE email_summaries ADD COLUMN pushed INTEGER NOT NULL DEFAULT 0")
 
-        # 修复 1: 历史账单状态回填 (幂等)
-        cur.execute(
-            """
-            UPDATE statements
-            SET is_paid = 1,
-                paid_at = COALESCE(paid_at, datetime('now')),
-                updated_at = datetime('now')
-            WHERE due_date IS NOT NULL
-              AND date(due_date) < date('now')
-              AND is_paid = 0
-            """
-        )
-
         # account_name 迁移：账单存储层加账号维度，防跨账号 UID 碰撞覆盖（幂等）
         _migrate_account_name(cur)
+
+        # statement_id / parse_status 迁移（必须在 _migrate_account_name 之后：
+        # 旧库重建 statements 表才会带 account_name，回填 JOIN 才不报错；幂等）
+        cur.execute("PRAGMA table_info(statement_transactions)")
+        txn_cols2 = {row[1] for row in cur.fetchall()}
+        if 'statement_id' not in txn_cols2:
+            # 交易显式关联稳定 statement_id（原子级联替换的锚点）
+            cur.execute("ALTER TABLE statement_transactions ADD COLUMN statement_id INTEGER")
+            cur.execute("""
+                UPDATE statement_transactions SET statement_id = (
+                    SELECT s.id FROM statements s
+                    WHERE s.account_name = statement_transactions.account_name
+                      AND s.uid = statement_transactions.uid
+                      AND s.bank_code = statement_transactions.bank_code
+                    LIMIT 1)
+                WHERE statement_id IS NULL
+            """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_stmt_txn_sid ON statement_transactions(statement_id)")
+
+        cur.execute("PRAGMA table_info(statements)")
+        stmt_cols2 = {row[1] for row in cur.fetchall()}
+        # 三态分流：'ok' 合法账单 / 'failed' 命中模板但校验未过（保留证据，排除出财务汇总）
+        if 'parse_status' not in stmt_cols2:
+            cur.execute("ALTER TABLE statements ADD COLUMN parse_status TEXT NOT NULL DEFAULT 'ok'")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_statements_msgid ON statements(account_name, bank_code, message_id)")
+
+        # 历史账单还款状态不再由 init_db 推断：到期日已过不构成还款证据，
+        # is_paid 仅通过显式标记（mark_paid / 清洗继承）变更。
 
         conn.commit()
     finally:
@@ -291,6 +308,119 @@ def upsert_statement(db_path: str, s: StatementRecord) -> None:
             ),
         )
         conn.commit()
+    finally:
+        conn.close()
+
+
+def save_statement_with_transactions(db_path: str, s: StatementRecord,
+                                     txns: Iterable[StatementTransactionRecord]) -> tuple[int, int]:
+    """账单 + 交易明细单事务原子保存。
+
+    步骤（同一 BEGIN IMMEDIATE 事务内）：
+    1. Upsert statements 取稳定 statement_id；
+    2. 清空该账单旧明细（含迁移期未挂 statement_id 的同源明细），即使新明细为空也执行，
+       避免重解析残留旧交易；
+    3. 批量插入新明细并回挂 statement_id。
+    返回 (statement_id, txn_count)。任何一步失败整体回滚。
+    """
+    items = list(txns)
+    now = _utc_now_iso()
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute('BEGIN IMMEDIATE')
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO statements (
+                account_name, uid, message_id, bank_code, rule_id, subject, sender, email_date,
+                statement_month, statement_date, due_date, total_due, minimum_due,
+                raw_fields_json, parse_status, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(account_name, uid, bank_code) DO UPDATE SET
+                message_id = excluded.message_id,
+                rule_id = excluded.rule_id,
+                subject = excluded.subject,
+                sender = excluded.sender,
+                email_date = excluded.email_date,
+                statement_month = excluded.statement_month,
+                statement_date = excluded.statement_date,
+                due_date = excluded.due_date,
+                total_due = excluded.total_due,
+                minimum_due = excluded.minimum_due,
+                raw_fields_json = excluded.raw_fields_json,
+                parse_status = excluded.parse_status,
+                updated_at = excluded.updated_at
+            """,
+            (
+                s.account_name, s.uid, s.message_id, s.bank_code, s.rule_id,
+                s.subject, s.sender, s.email_date, s.statement_month, s.statement_date,
+                s.due_date, s.total_due, s.minimum_due, s.raw_fields_json,
+                s.parse_status or 'ok', now, now,
+            ),
+        )
+        cur.execute(
+            "SELECT id FROM statements WHERE account_name = ? AND uid = ? AND bank_code = ? LIMIT 1",
+            (s.account_name, s.uid, s.bank_code),
+        )
+        statement_id = int(cur.fetchone()[0])
+
+        cur.execute(
+            """
+            DELETE FROM statement_transactions
+            WHERE statement_id = ?
+               OR (statement_id IS NULL AND account_name = ? AND uid = ? AND bank_code = ?)
+            """,
+            (statement_id, s.account_name, s.uid, s.bank_code),
+        )
+
+        for t in items:
+            cur.execute(
+                """
+                INSERT INTO statement_transactions (
+                    account_name, uid, bank_code, statement_id, txn_date, post_date, description,
+                    amount, currency, txn_location_code, original_amount, direction,
+                    raw_row_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    t.account_name or s.account_name, t.uid, t.bank_code, statement_id,
+                    t.txn_date, t.post_date, t.description, t.amount, t.currency,
+                    t.txn_location_code, t.original_amount, t.direction,
+                    t.raw_row_json, _utc_now_iso(),
+                ),
+            )
+
+        conn.commit()
+        return statement_id, len(items)
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def find_message_id_conflicts(db_path: str, account_name: str, message_id: str,
+                              bank_code: str, uid: str) -> list[sqlite3.Row]:
+    """同账户+银行+Message-ID 但 uid 不同的已存账单（疑似重复投递/重复入库）。
+
+    仅检测并交由调用方记录冲突告警，绝不静默覆盖。message_id 为空时直接返回空。
+    """
+    if not message_id:
+        return []
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT id, uid, subject, statement_month, total_due, parse_status, is_paid
+            FROM statements
+            WHERE account_name = ? AND bank_code = ? AND message_id = ? AND uid <> ?
+            ORDER BY id ASC
+            """,
+            (account_name, bank_code, message_id, str(uid)),
+        )
+        return list(cur.fetchall())
     finally:
         conn.close()
 
@@ -500,6 +630,7 @@ def get_summary_by_bank_month(db_path: str, months: int = 3) -> list[sqlite3.Row
                     CAST(COALESCE(s.minimum_due, '0') AS REAL) AS minimum_due
                 FROM statements s
                 WHERE date(substr(s.updated_at, 1, 10)) >= date('now', ?)
+                  AND COALESCE(s.parse_status, 'ok') != 'failed'
             ),
             tx AS (
                 SELECT uid, bank_code, SUM(CAST(COALESCE(amount, '0') AS REAL)) AS txn_sum
@@ -575,6 +706,7 @@ def get_reconciliation_rows(db_path: str, months: int = 3) -> list[sqlite3.Row]:
                 GROUP BY uid, bank_code
             ) tx ON tx.uid = s.uid AND tx.bank_code = s.bank_code
             WHERE date(substr(s.updated_at, 1, 10)) >= date('now', ?)
+              AND COALESCE(s.parse_status, 'ok') != 'failed'
             ORDER BY s.bank_code ASC, s.uid ASC
             """,
             (f'-{months} months',),
@@ -610,6 +742,7 @@ def get_transactions_above_amount(db_path: str, min_amount: float, months: int =
                 FROM statement_transactions t
                 JOIN statements s ON s.uid = t.uid AND s.bank_code = t.bank_code
                 WHERE date(substr(s.updated_at, 1, 10)) >= date('now', ?)
+                  AND COALESCE(s.parse_status, 'ok') != 'failed'
                   AND ABS(CAST(COALESCE(t.amount, '0') AS REAL)) >= ?
                 ORDER BY ABS(CAST(COALESCE(t.amount, '0') AS REAL)) DESC,
                          date(COALESCE(t.post_date, t.txn_date)) DESC,
@@ -634,6 +767,7 @@ def get_transactions_above_amount(db_path: str, min_amount: float, months: int =
                 FROM statement_transactions t
                 JOIN statements s ON s.uid = t.uid AND s.bank_code = t.bank_code
                 WHERE ABS(CAST(COALESCE(t.amount, '0') AS REAL)) >= ?
+                  AND COALESCE(s.parse_status, 'ok') != 'failed'
                 ORDER BY ABS(CAST(COALESCE(t.amount, '0') AS REAL)) DESC,
                          date(COALESCE(t.post_date, t.txn_date)) DESC,
                          t.uid DESC
@@ -651,7 +785,7 @@ def mark_statement_paid(db_path: str, bank_code: str, statement_month: str = Non
         now_str = _utc_now_iso()
         if statement_month:
             cur.execute(
-                "UPDATE statements SET is_paid=1, paid_at=?, updated_at=? WHERE bank_code=? AND statement_month=? AND is_paid=0",
+                "UPDATE statements SET is_paid=1, paid_at=?, updated_at=? WHERE bank_code=? AND statement_month=? AND is_paid=0 AND COALESCE(parse_status, 'ok') != 'failed'",
                 (now_str, now_str, bank_code, statement_month)
             )
         else:
@@ -660,6 +794,7 @@ def mark_statement_paid(db_path: str, bank_code: str, statement_month: str = Non
                 UPDATE statements SET is_paid=1, paid_at=?, updated_at=? WHERE id = (
                     SELECT id FROM statements
                     WHERE bank_code=? AND is_paid=0 AND CAST(COALESCE(total_due, '0') AS REAL) > 0
+                      AND COALESCE(parse_status, 'ok') != 'failed'
                     ORDER BY date(due_date) DESC, date(statement_date) DESC, id DESC
                     LIMIT 1
                 )
@@ -688,6 +823,7 @@ def get_unpaid_statements(db_path: str, months: int = None) -> list[sqlite3.Row]
               FROM statements
               WHERE is_paid = 0
                 AND CAST(COALESCE(total_due, '0') AS REAL) > 0
+                AND COALESCE(parse_status, 'ok') != 'failed'
             )
             SELECT uid, bank_code, subject, statement_month, statement_date, due_date, total_due, minimum_due
             FROM latest

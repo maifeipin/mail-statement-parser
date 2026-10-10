@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """163 邮箱邮件技能 - 支持发送、读取、搜索、下载（含 HTML 表格解析）"""
 
-import json, os, sys, email, re, glob
+import json, os, sys, email, re, glob, time
 from datetime import datetime, timezone, timedelta
 
 # Windows 终端中文编码与 emoji 兼容性适配
@@ -15,7 +15,7 @@ from statement_models import EmailSummaryRecord
 from statement_db import init_db, get_recent_statements, get_summary_by_bank_month, get_reconciliation_rows, uid_exists, get_transactions_above_amount, upsert_email_summary, get_email_summary_status, get_email_summary_by_id, get_recent_email_headers, get_potential_missed_emails
 
 
-from mail_connect import (MailAuthError, retry_with_backoff, is_graph_api, connect_pop3, connect_smtp, connect_imap, _graph_api_request, fetch_summaries_graph, send_email_graph, _month_subtract)
+from mail_connect import (MailAuthError, AccountBudgetExceeded, account_deadline, retry_with_backoff, is_graph_api, connect_pop3, connect_smtp, connect_imap, _graph_api_request, fetch_summaries_graph, send_email_graph, _month_subtract, pop3_uidl_map, pop3_retr_by_uid)
 from mail_parse import (HTMLTableParser, decode_mime, _to_text, html_to_text, parse_html_tables, tables_to_markdown, extract_email_content, _parse_email_datetime)
 from mail_llm import (
     call_llm,
@@ -36,7 +36,7 @@ from statement_parser import (
     parse_icbc_transactions_from_markdown, parse_citic_transactions_from_body,
     load_rule_files, _match_score, identify_rule, extract_statement_by_rule,
     validate_statement_by_rule, _validation_result_to_dict,
-    validate_and_save_email_message,
+    validate_and_save_email_message, reparse_cached_statement,
 )
 from mail_sync import (
     fetch_recent_emails_and_summarize,
@@ -348,7 +348,9 @@ def pop3_fetch_message_by_uid(uid, account_name=None):
         
     mail = connect_pop3(target_config)
     try:
-        _, headers, _ = mail.retr(int(uid))
+        # 稳定身份：uid 为账户内持久 UIDL，映射到当前会话序号后再 retr；
+        # 历史纯数字序号 uid 由 pop3_retr_by_uid 兜底（可能漂移，调用方需校验主题）
+        _, headers, _ = pop3_retr_by_uid(mail, uid)
         msg = email.message_from_bytes(b'\r\n'.join(headers))
         return msg
     finally:
@@ -549,6 +551,24 @@ def search_emails_pop3(keyword, limit=20, account_name=None):
         print(f'❌ 搜索失败: {e}')
 
 
+def _safe_uid_for_fname(uid):
+    """UID（POP3 UIDL / Graph id）清洗为文件名片段，防特殊字符注入路径。"""
+    return re.sub(r'[^A-Za-z0-9_.-]', '_', str(uid))
+
+
+def _downloaded_file_exists(account_name, uid, output_dir=None):
+    """幂等检查：该账户该 UID 是否已有下载文件（uid 经文件名清洗，与保存侧一致）。"""
+    output_dir = output_dir or DOWNLOAD_DIR
+    safe = _safe_uid_for_fname(uid)
+    try:
+        return any(
+            f.startswith(f'email_acc_{account_name}_uid{safe}_') or f.startswith(f'email_uid{safe}_')
+            for f in os.listdir(output_dir)
+        )
+    except FileNotFoundError:
+        return False
+
+
 def _save_email_message(uid, msg, output_dir=None, format='md', account_name=None):
     """保存已拉取的 message 到本地（支持 Markdown/HTML）。"""
     if output_dir is None:
@@ -562,10 +582,10 @@ def _save_email_message(uid, msg, output_dir=None, format='md', account_name=Non
     # 提取邮件内容（包括 HTML 表格）
     content = extract_email_content(msg)
 
-    # 生成文件名，带 UID 避免批量下载时冲突，附加账户前缀隔离
+    # 生成文件名，带 UID 避免批量下载时冲突，附加账户前缀隔离（UID 经清洗防路径注入）
     safe_subj = re.sub(r'[^\w\s-]', '', subj[:50]).strip().replace(' ', '_') or 'email'
     acc_prefix = f"acc_{account_name}_" if account_name else ""
-    fname = f'email_{acc_prefix}uid{uid}_{safe_subj}'
+    fname = f'email_{acc_prefix}uid{_safe_uid_for_fname(uid)}_{safe_subj}'
 
     saved_paths = {}
     write_html = format in ('html', 'both')
@@ -630,7 +650,7 @@ tr:nth-child(even) {{ background-color: #f2f2f2; }}
     return saved_paths
 
 
-def _collect_recent_bill_uids(months, rules, target_banks, email_config=None):
+def _collect_recent_bill_uids(months, rules, target_banks, email_config=None, on_candidate=None):
     """扫描最近N个月账单邮件，返回候选UID与统计信息。"""
     if not email_config:
         accounts = load_accounts()
@@ -681,6 +701,8 @@ def _collect_recent_bill_uids(months, rules, target_banks, email_config=None):
                     for kw in kw_list:
                         if kw in subj_lower:
                             candidates.append((uid, b, subj, frm, str(dt) if dt else ''))
+                            if on_candidate:
+                                on_candidate(uid, None)
                             matched = True
                             break
                     if matched: break
@@ -698,6 +720,10 @@ def _collect_recent_bill_uids(months, rules, target_banks, email_config=None):
         if num == 0:
             return candidates, stats
 
+        # 稳定身份：候选 UID 使用账户内持久 UIDL，重连后经映射回序号取信
+        uidl_by_num = pop3_uidl_map(mail)
+        if not uidl_by_num:
+            raise ValueError('服务器未提供 UIDL，拒绝使用会话序号持久化邮件')
         for i in range(num, 0, -1):
             stats['scanned'] += 1
             try:
@@ -716,7 +742,12 @@ def _collect_recent_bill_uids(months, rules, target_banks, email_config=None):
                 for b, kw_list in keyword_map_lower.items():
                     for kw in kw_list:
                         if kw in subj_lower:
-                            candidates.append((i, b, subj, frm, str(dt) if dt else ''))
+                            stable_uid = uidl_by_num.get(i)
+                            if not stable_uid:
+                                raise ValueError('候选邮件缺少 UIDL')
+                            candidates.append((stable_uid, b, subj, frm, str(dt) if dt else ''))
+                            if on_candidate:
+                                on_candidate(stable_uid, msg)
                             matched = True
                             break
                     if matched: break
@@ -728,7 +759,7 @@ def _collect_recent_bill_uids(months, rules, target_banks, email_config=None):
                 stats['skipped_error'] += 1
     finally:
         try:
-            mail.quit()
+            mail.close()
         except Exception:
             pass
 
@@ -780,17 +811,16 @@ def download_recent_bank_emails(months=3, output_dir=None):
             for uid, bank_code, subj, frm, date_str in candidates:
                 try:
                     # 幂等：检查是否已有该 uid 的文件（附加账户前缀）
-                    existing = [f for f in os.listdir(output_dir) if f.startswith(f'email_acc_{account_name}_uid{uid}_') or f.startswith(f'email_uid{uid}_')]
-                    if existing:
-                        print(f'⏭️  账户 {account_name} UID={uid} 已下载，跳过')
+                    if _downloaded_file_exists(account_name, uid, output_dir):
+                        print(f'⏭️  账户 {account_name} UID={str(uid)[:24]} 已下载，跳过')
                         skipped_old += 1
                         continue
-                    _, headers, _ = mail.retr(int(uid))
+                    _, headers, _ = pop3_retr_by_uid(mail, uid)
                     msg = email.message_from_bytes(b'\r\n'.join(headers))
                     _save_email_message(uid, msg, output_dir=output_dir, format='md', account_name=account_name)
                     downloaded += 1
                 except Exception as e:
-                    print(f"⚠️ UID={uid} 下载异常: {e}")
+                    print(f"⚠️ UID={str(uid)[:24]} 下载异常: {e}")
                     skipped_error += 1
                     continue
 
@@ -807,7 +837,7 @@ def download_recent_bank_emails(months=3, output_dir=None):
 
 
 def validate_recent_bank_emails(months=3):
-    """专用指令：按规则关键字匹配，批量解析校验并写入 SQLite。"""
+    """专用指令：按规则关键字匹配，批量解析校验并写入 SQLite（每账户单会话复用）。"""
     init_db(DB_PATH)
     rules = load_rule_files()
     if not rules:
@@ -820,11 +850,11 @@ def validate_recent_bank_emails(months=3):
         return
 
     target_banks = {'HX', 'CMB', 'SPDB', 'CMBC', 'ICBC', 'CITIC'}
-    
+
     for account_config in accounts:
         account_name = account_config.get('account', 'default')
         print(f'\n🚀 开始同步账户 {account_name} 批量写库最近 {months} 个月账单')
-        
+
         candidates, stats = _collect_recent_bill_uids(months, rules, target_banks, account_config)
         cutoff = stats['cutoff']
 
@@ -842,25 +872,124 @@ def validate_recent_bank_emails(months=3):
         print(f'🧩 待写库账单 {len(candidates)} 封，开始校验并写库...')
         ok = 0
         fail = 0
+        gated = 0
         skipped_db = 0
-        for uid, bank_code, subj, frm, date_str in candidates:
-            # 幂等：检查是否已在 DB 中
-            _uid_str = str(uid)
-            if uid_exists(DB_PATH, _uid_str, account_name):
-                print(f'⏭️  UID={_uid_str} 已在数据库，跳过')
-                skipped_db += 1
-                continue
+        is_graph = is_graph_api(account_config)
+        mail = None
+        if not is_graph:
+            # 单会话复用：一次连接完成全部候选取信+校验，替代逐封重连
             try:
-                validate_email_by_uid(uid, account_name=account_name)
-                ok += 1
+                mail = connect_pop3(account_config)
             except Exception as e:
-                print(f'❌ UID={uid} 写库失败：{e}')
-                fail += 1
+                print(f'❌ 账户 {account_name} 连接失败：{e}')
+                continue
+        try:
+            for uid, bank_code, subj, frm, date_str in candidates:
+                # 幂等：检查是否已在 DB 中
+                _uid_str = str(uid)
+                if uid_exists(DB_PATH, _uid_str, account_name):
+                    print(f'⏭️  UID={_uid_str[:24]} 已在数据库，跳过')
+                    skipped_db += 1
+                    continue
+                try:
+                    if is_graph:
+                        msg = pop3_fetch_message_by_uid(uid, account_name=account_name)
+                    else:
+                        _, headers, _ = pop3_retr_by_uid(mail, uid)
+                        msg = email.message_from_bytes(b'\r\n'.join(headers))
+                    result = validate_and_save_email_message(msg, uid, rules=rules, account_name=account_name)
+                    st = (result or {}).get('status')
+                    if st in ('saved', 'parse_failed'):
+                        ok += 1
+                    elif st == 'not_statement':
+                        gated += 1  # 门禁拦截：非账单不计失败
+                    else:
+                        fail += 1
+                except Exception as e:
+                    print(f'❌ UID={_uid_str[:24]} 写库失败：{e}')
+                    fail += 1
+        finally:
+            if mail:
+                try:
+                    mail.quit()
+                except Exception:
+                    pass
 
         print(
-            f'✅ 账户 {account_name} 写库完成：成功 {ok} 封，已在库跳过 {skipped_db} 封，失败 {fail} 封，'
+            f'✅ 账户 {account_name} 写库完成：成功 {ok} 封，已在库跳过 {skipped_db} 封，门禁拦截 {gated} 封，失败 {fail} 封，'
             f'过期邮件 {skipped_old} 封，未匹配 {skipped_unmatched} 封，异常 {skipped_error} 封'
         )
+
+
+def sync_recent_bank_emails(months=3, account_budget_s=60, total_budget_s=270):
+    """Scan, archive and parse in one POP3 session, with bounded account deadlines.
+
+    No LLM is used. The global deadline leaves room for the caller's 300s limit
+    and always emits a receipt for every configured account.
+    """
+    init_db(DB_PATH)
+    rules = load_rule_files()
+    accounts = load_accounts()
+    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+    target_banks = {'HX', 'CMB', 'SPDB', 'CMBC', 'ICBC', 'CITIC'}
+    account_results = []
+    overall_deadline = time.monotonic() + total_budget_s
+    for account_config in accounts:
+        account_name = account_config.get('account', 'default')
+        acct = {'account': account_name, 'status': 'ok', 'candidates': 0,
+                'downloaded': 0, 'saved': 0, 'parse_failed': 0, 'gated': 0,
+                'skipped_dup': 0, 'errors': 0, 'scan_errors': 0}
+        account_results.append(acct)
+        allowed = min(account_budget_s, overall_deadline - time.monotonic())
+        print(f'\n🚀 账户 {account_name} 单次遍历同步（最近 {months} 个月，预算 {max(0, allowed):.1f}s）')
+        if not rules:
+            acct.update(status='error', error='未找到账单规则')
+            continue
+
+        def process_candidate(uid, msg):
+            acct['candidates'] += 1
+            uid = str(uid)
+            need_download = not _downloaded_file_exists(account_name, uid)
+            need_db = not uid_exists(DB_PATH, uid, account_name)
+            if not need_download and not need_db:
+                acct['skipped_dup'] += 1
+                return
+            if msg is None:  # Graph MIME preserves Message-ID and HTML evidence.
+                msg = pop3_fetch_message_by_uid(uid, account_name=account_name)
+            if need_download:
+                _save_email_message(uid, msg, output_dir=DOWNLOAD_DIR, format='md', account_name=account_name)
+                acct['downloaded'] += 1
+            if need_db:
+                result = validate_and_save_email_message(msg, uid, rules=rules, account_name=account_name)
+                key = {'saved': 'saved', 'parse_failed': 'parse_failed',
+                       'not_statement': 'gated'}.get((result or {}).get('status'), 'errors')
+                acct[key] += 1
+
+        try:
+            with account_deadline(allowed):
+                _, stats = _collect_recent_bill_uids(months, rules, target_banks,
+                                                     account_config, on_candidate=process_candidate)
+                acct['scan_errors'] = stats['skipped_error']
+                acct['errors'] += stats['skipped_error']
+                if acct['errors'] or acct['parse_failed']:
+                    acct['status'] = 'partial'
+        except AccountBudgetExceeded:
+            acct.update(status='timeout', error=f'account/overall time budget exhausted ({max(0, allowed):.1f}s)')
+        except Exception as exc:
+            acct.update(status='error', error=str(exc))
+            acct['errors'] += 1
+        print(f"🏁 账户 {account_name} 状态 {acct['status']}：入库 {acct['saved']}，"
+              f"解析失败 {acct['parse_failed']}，异常 {acct['errors']}")
+
+    summary = {'command': 'sync3m', 'months': int(months), 'accounts': account_results,
+               'errors': [] if accounts else ['未配置邮箱账户'],
+               'totals': {key: sum(a[key] for a in account_results) for key in
+                          ('candidates', 'downloaded', 'saved', 'parse_failed', 'gated',
+                           'skipped_dup', 'errors', 'scan_errors')}}
+    print('--- JSON_SUMMARY_START ---')
+    print(json.dumps(summary, ensure_ascii=False))
+    print('--- JSON_SUMMARY_END ---')
+    return summary
 
 
 def due_soon_bank_bills(months=3, days=7, output_dir=None):
@@ -1184,6 +1313,17 @@ def main():
     elif cmd in ('download_bank_bills', 'exec3m'):
         months = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2].isdigit() else 3
         download_recent_bank_emails(months)
+
+    elif cmd in ('sync_bank_bills', 'sync3m'):
+        months = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2].isdigit() else 3
+        sync_recent_bank_emails(months)
+
+    elif cmd == 'reparse_cached':
+        if len(sys.argv) < 4:
+            print('用法：reparse_cached <account_name> <uid>')
+            sys.exit(1)
+        result = reparse_cached_statement(sys.argv[2], sys.argv[3])
+        print(json.dumps(result, ensure_ascii=False))
 
     elif cmd == 'unpaid':
         show_unpaid_statements()

@@ -39,6 +39,8 @@ class StatementRecord:
     total_due: Optional[str] = None
     minimum_due: Optional[str] = None
     raw_fields_json: str = "{}"
+    # 'ok' 合法账单；'failed' 命中账单模板但校验未过（保留证据，排除出财务汇总，供修复后重解析）
+    parse_status: str = "ok"
 
 
 @dataclass
@@ -46,6 +48,7 @@ class StatementTransactionRecord:
     uid: str
     bank_code: str
     account_name: str = 'default'
+    statement_id: Optional[int] = None
     txn_date: Optional[str] = None
     post_date: Optional[str] = None
     description: str = ""

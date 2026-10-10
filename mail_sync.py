@@ -31,6 +31,8 @@ from mail_connect import (
     connect_pop3,
     fetch_summaries_graph,
     _month_subtract,
+    pop3_uidl_map,
+    pop3_retr_by_uid,
 )
 from mail_parse import (
     decode_mime,
@@ -49,11 +51,16 @@ from statement_parser import (
 )
 
 
-def fetch_recent_emails_and_summarize(months=1, llm_enabled=True):
+def fetch_recent_emails_and_summarize(months=1, llm_enabled=True, account_budget_s=180):
     """双通道收网网关命令：批量抓取解析正则账单，并对其他邮件进行 LLM 结构化摘要提炼。
 
     llm_enabled=False（fetch_only）：通道 A/B 保持（无 LLM），通道 C 仅 upsert_email_body
     + 插入 status='pending' 的摘要记录，不调 LLM；已入库(任意 status)的邮件一律跳过，只入全新邮件。
+
+    account_budget_s：单账户处理总时限预算（秒）。超预算时该账户 fail-fast 记 status='timeout'，
+    不拖垮整批账户；300s 仅作外层兜底。
+
+    返回结构化 dict 并在末尾输出 JSON_SUMMARY 区块，供 lite_agent 摆脱日志关键词猜测。
     """
     from mail_client import DB_PATH, load_accounts  # 延迟导入避免循环依赖
 
@@ -68,23 +75,31 @@ def fetch_recent_emails_and_summarize(months=1, llm_enabled=True):
     accounts = load_accounts()
     if not accounts:
         print("📭 未配置任何邮箱账户。")
-        return
+        return {'accounts': [], 'totals': {}}
 
     scanned_total = 0
     new_bills_total = 0
     new_summaries_total = 0
     skipped_dup_total = 0
     errors_total = 0
+    account_results = []
 
     high_importance_summaries = []
 
     for account_config in accounts:
         account_name = account_config.get('account', 'default')
+        account_started = time.monotonic()
         print(f'\n🔌 正在连接邮箱 {account_name} ...')
+
+        acct_result = {
+            'account': account_name, 'status': 'ok', 'scanned': 0,
+            'new_bills': 0, 'new_summaries': 0, 'skipped_dup': 0, 'errors': 0,
+        }
 
         is_graph = is_graph_api(account_config)
         graph_emails = []
         mail = None
+        uidl_by_num = {}
 
         if is_graph:
             print(f'🔗 [Graph API] 获取 {account_name} 近 {months} 个月的邮件摘要...')
@@ -95,6 +110,8 @@ def fetch_recent_emails_and_summarize(months=1, llm_enabled=True):
             except Exception as e:
                 print(f'❌ 无法连接 Graph API {account_name}: {e}')
                 errors_total += 1
+                acct_result.update(status='error', error=f'connect: {e}')
+                account_results.append(acct_result)
                 continue
         else:
             try:
@@ -102,11 +119,19 @@ def fetch_recent_emails_and_summarize(months=1, llm_enabled=True):
                 num = len(mail.list()[1])
                 if num == 0:
                     print(f'📭 邮箱 {account_name} 中没有任何邮件。')
+                    account_results.append(acct_result)
                     continue
+                # 稳定身份：UIDL 跨会话持久唯一，本地持久化与去重全部基于 UIDL；
+                # retr 时经映射回到当前序号，杜绝新邮件到达引起序号漂移导致重复/串单
+                uidl_by_num = pop3_uidl_map(mail)
+                if not uidl_by_num:
+                    raise ValueError('服务器未提供 UIDL，拒绝使用会话序号持久化邮件')
                 print(f'🧩 邮箱 {account_name} 邮件总数: {num} 封，开始最新邮件反向匹配...')
             except Exception as e:
                 print(f'❌ 无法连接邮箱 {account_name}: {e}')
                 errors_total += 1
+                acct_result.update(status='error', error=f'connect: {e}')
+                account_results.append(acct_result)
                 continue
 
         scanned = 0
@@ -121,12 +146,21 @@ def fetch_recent_emails_and_summarize(months=1, llm_enabled=True):
 
             for index in range(num):
                 scanned += 1
+                if time.monotonic() - account_started > account_budget_s:
+                    acct_result['status'] = 'timeout'
+                    acct_result['error'] = f'account budget {account_budget_s}s exceeded'
+                    print(f'⏱️ 账户 {account_name} 超出处理时限预算 {account_budget_s}s，fail-fast 转入下一账户')
+                    break
                 if is_graph:
                     msg_obj = graph_emails[index]
                     uid = msg_obj['uid']
                 else:
                     i = num - index
-                    uid = str(i)
+                    uid = uidl_by_num.get(i)
+                    if not uid:
+                        errors += 1
+                        print(f'⚠️ 邮件序号 {i} 缺少 UIDL，跳过持久化')
+                        continue
 
                 is_dup_bill = uid_exists(DB_PATH, uid, account_name)
                 status, retry_cnt = get_email_summary_status(DB_PATH, account_name, uid)
@@ -134,15 +168,15 @@ def fetch_recent_emails_and_summarize(months=1, llm_enabled=True):
                 if not llm_enabled:
                     # fetch-only: pending 与 failed(retry<3) 也跳过（正文已存或交由 enrich/reprocess），只入全新邮件
                     is_dup_summary = is_dup_summary or status in ('pending', 'failed')
-                # 防 POP3 UID 回收: 取邮件标题头校验 subject 是否匹配
-                if is_dup_summary and status == 'processed':
+                # 防历史纯数字 UID 回收: 取邮件标题头校验 subject 是否匹配（仅 legacy 序号需要；UIDL 天然稳定）
+                if is_dup_summary and status == 'processed' and uid.isdigit():
                     # 用 TOP 只取标题头(不拉正文), 确认 uid 是否对应同一封
                     _check_subj = None
                     if is_graph:
                         _check_subj = msg_obj.get('subject', '')
                     elif mail:
                         try:
-                            _resp, _lines, _size = mail.top(int(uid), 0)
+                            _resp, _lines, _size = mail.top(i, 0)
                             _hdr = email.message_from_bytes(b"\r\n".join(_lines))
                             _check_subj = decode_mime(_hdr.get('Subject', ''))
                         except Exception:
@@ -178,16 +212,15 @@ def fetch_recent_emails_and_summarize(months=1, llm_enabled=True):
                             consecutive_old = 0
                         body_text = msg_obj['body']
 
-                        # Graph 邮件需自己组装简单的 EmailMessage 供 validate_and_save_email_message 解析使用，如果命中规则
-                        # 但实际上为了规则通道，它可能会使用 mail_client.extract_email_content，
-                        # 这里为了兼容，若命中规则直接构建 dummy msg 或触发下载。
-                        # 对于提取摘要通道，只用 body_text 即可。
-                        # 所以我们构造一个简单的 message
+                        # Graph 邮件需组装 EmailMessage 供 validate_and_save_email_message 解析使用。
+                        # 必须补齐标准 Message-ID（internetMessageId），否则解析器落库为空串；
+                        # 上游缺失时使用确定性备用身份，保证同账户内唯一且可重放。
                         from email.message import EmailMessage
                         msg = EmailMessage()
                         msg['Subject'] = subj
                         msg['From'] = frm
                         msg['Date'] = date_str
+                        msg['Message-ID'] = msg_obj.get('internet_message_id') or f'<graph-{account_name}-{uid}>'
                         msg.set_content(body_text)
                         # 保留 HTML 原文，使账单交易明细解析器能从 HTML 表格提取 markdown
                         if msg_obj.get('html'):
@@ -339,6 +372,9 @@ def fetch_recent_emails_and_summarize(months=1, llm_enabled=True):
                 except Exception:
                     pass
             print(f'🏁 账户 {account_name} 扫描完成：新入库账单 {new_bills} 封，通用提炼 {new_summaries} 封，跳过重复 {skipped_dup} 封，处理失败 {errors} 封')
+            acct_result.update(scanned=scanned, new_bills=new_bills, new_summaries=new_summaries,
+                               skipped_dup=skipped_dup, errors=errors)
+            account_results.append(acct_result)
             scanned_total += scanned
             new_bills_total += new_bills
             new_summaries_total += new_summaries
@@ -347,7 +383,24 @@ def fetch_recent_emails_and_summarize(months=1, llm_enabled=True):
 
     print(f'\n🏁 全局同步完成：总扫描 {scanned_total} 封，新入库账单 {new_bills_total} 封，通用提炼 {new_summaries_total} 封，跳过重复 {skipped_dup_total} 封，全局失败 {errors_total} 封')
 
+    summary = {
+        'command': 'fetch_summaries' if llm_enabled else 'fetch_only',
+        'months': int(months),
+        'accounts': account_results,
+        'totals': {
+            'scanned': scanned_total,
+            'new_bills': new_bills_total,
+            'new_summaries': new_summaries_total,
+            'skipped_dup': skipped_dup_total,
+            'errors': errors_total,
+        },
+    }
+    print('--- JSON_SUMMARY_START ---')
+    print(json.dumps(summary, ensure_ascii=False))
+    print('--- JSON_SUMMARY_END ---')
+
     _emit_high_imp_push(high_importance_summaries)
+    return summary
 
 
 def _retry_llm_summary(subj, frm, body_text, date_str, max_attempts=4):
@@ -421,10 +474,42 @@ def _enrich_one(db_path, r, body_text):
     return 'fail', rec
 
 
-def _emit_high_imp_push(high_importance_summaries):
+def _emit_high_imp_push(high_importance_summaries, max_days=3):
     """打印高优邮件卡片 + JSON_PUSH 区域，供 lite_agent 捕获推送。无则不输出。"""
     if not high_importance_summaries:
         return
+    # 仅推送近 max_days 天的高优邮件，历史积压旧邮件不再重复打扰（lite_agent 侧已消费过）
+    from datetime import datetime, timezone, timedelta
+    from email.utils import parsedate_to_datetime
+    cutoff = datetime.now(timezone.utc) - timedelta(days=max_days)
+    filtered = []
+    for r in high_importance_summaries:
+        date_str = getattr(r, "email_date", "") or ""
+        dt = None
+        if date_str:
+            try:
+                dt = parsedate_to_datetime(date_str)
+                if dt:
+                    dt = dt.astimezone(timezone.utc)
+            except Exception:
+                pass
+            if not dt:
+                try:
+                    clean_str = date_str.split("(")[0].strip()
+                    dt = datetime.fromisoformat(clean_str.replace("Z", "+00:00"))
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    else:
+                        dt = dt.astimezone(timezone.utc)
+                except Exception:
+                    pass
+        if dt and dt < cutoff:
+            print(f"  [跳过推送超过 {max_days} 天旧高优邮件]: {r.subject} ({date_str})")
+            continue
+        filtered.append(r)
+    if not filtered:
+        return
+    high_importance_summaries = filtered
     print("\n=== 🔥 发现高优待推送邮件 ===")
     high_summaries_list = []
     for r in high_importance_summaries:
@@ -600,7 +685,7 @@ def reprocess_by_status(db_path=None, status='failed', limit=None):
                         raw_lines = None
                         for _att in range(3):
                             try:
-                                _, raw_lines, _ = mail.retr(int(uid))
+                                _, raw_lines, _ = pop3_retr_by_uid(mail, uid)
                                 break
                             except Exception as _re:
                                 if _att < 2:
