@@ -8,6 +8,10 @@ from typing import Iterable, Optional
 from statement_models import StatementRecord, ValidationIssue, StatementTransactionRecord, EmailSummaryRecord
 
 
+class MessageIdentityConflict(ValueError):
+    """Same account/bank/Message-ID under a different transport identity."""
+
+
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -329,6 +333,14 @@ def save_statement_with_transactions(db_path: str, s: StatementRecord,
     try:
         conn.execute('BEGIN IMMEDIATE')
         cur = conn.cursor()
+        # Check under the write lock, so concurrent transports cannot both
+        # insert the same message. Existing finances and paid evidence stay intact.
+        if s.message_id:
+            cur.execute("SELECT id FROM statements WHERE account_name=? AND bank_code=? AND message_id=? AND uid<>?",
+                        (s.account_name, s.bank_code, s.message_id, str(s.uid)))
+            conflicts = [row[0] for row in cur.fetchall()]
+            if conflicts:
+                raise MessageIdentityConflict('Message-ID already belongs to statement IDs ' + str(conflicts))
         cur.execute(
             """
             INSERT INTO statements (

@@ -320,7 +320,7 @@ def main():
         if args.apply:
             # ---------- 执行路径：迁移前一致性备份 → schema 迁移 → 单事务 ----------
             if not args.no_backup:
-                backup = f"{args.db}.bak-{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                backup = f"{args.db}.bak-{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
                 src = sqlite3.connect(args.db)
                 dst = sqlite3.connect(backup)
                 with dst:
@@ -352,6 +352,7 @@ def main():
             conn = sqlite3.connect(f'file:{args.db}?mode=ro', uri=True)
             cur = conn.cursor()
 
+        map_rows_before = cur.execute('SELECT COUNT(*) FROM cleanup_id_map').fetchone()[0] if args.apply else 0
         before = _snapshot(cur)
         ghosts = plan_ghosts(cur, subject_patterns)
         ghost_ids = {g['id'] for g in ghosts}
@@ -463,8 +464,8 @@ def main():
              f"预期 {expected_txns}（合并删 {merged_removed_txns} + 幽灵删 {ghost_removed_txns}），实际 {after['transactions']}"),
             ('合并组还款证据保留', group_paid_ok, '；'.join(group_paid_detail) or f"{len(groups)} 组全部通过"),
             ('合并组交易重数保留', group_txn_ok, '；'.join(group_txn_detail) or f"{len(groups)} 组全部通过"),
-            ('cleanup_id_map 映射完整', map_rows == len(deleted_ids),
-             f"删除 {len(deleted_ids)} 条 ↔ 映射 {map_rows} 行"),
+            ('cleanup_id_map 映射完整', map_rows - map_rows_before == len(deleted_ids),
+             f"删除 {len(deleted_ids)} 条 ↔ 本次新增映射 {map_rows - map_rows_before} 行（历史累计 {map_rows} 行）"),
         ]
         all_ok = all(ok for _, ok, _ in checks)
         print('\n---------- 核对报告 ----------')

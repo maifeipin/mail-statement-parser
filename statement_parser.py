@@ -19,7 +19,7 @@ from statement_models import (
 )
 from statement_db import (
     init_db, upsert_statement, save_validation_run, replace_transactions,
-    save_statement_with_transactions, find_message_id_conflicts,
+    save_statement_with_transactions, find_message_id_conflicts, MessageIdentityConflict,
 )
 from mail_parse import decode_mime, _to_text, extract_email_content, _parse_email_datetime
 
@@ -854,6 +854,15 @@ def validate_and_save_email_message(msg, uid, rules=None, account_name=None):
             'report_path': out,
             'bank_code': bank_code,
         }
+    except MessageIdentityConflict as exc:
+        # Keep the new transport's original body/report and validation audit;
+        # reject duplicate financial rows rather than overwriting old evidence.
+        issue = ValidationIssue(code='MESSAGE_ID_CONFLICT', field='message_id', severity='error')
+        run_id = save_validation_run(DB_PATH, account_name, uid=str(uid), bank_code=bank_code,
+                    rule_id=_to_text(rule.get('rule_id', '')), passed=False, report_path=out,
+                    errors=[issue], warnings=vr.warnings)
+        print(f'身份冲突：{exc}；原账单及交易保持不变，已归档新邮件证据')
+        return {'status': 'identity_conflict', 'run_id': run_id, 'report_path': out, 'error': str(exc)}
     except Exception as e:
         print(f'验证失败：{e}')
         return {'status': 'error', 'error': str(e)}

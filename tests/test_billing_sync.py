@@ -118,6 +118,42 @@ class BillingSyncTests(unittest.TestCase):
             with contextlib.closing(sqlite3.connect(path)) as c:
                 self.assertEqual(c.execute('SELECT COUNT(*) FROM statement_transactions').fetchone()[0], 0)
 
+    def test_message_identity_conflict_does_not_insert_or_overwrite(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = str(Path(temp) / 'statements.db')
+            db.init_db(path)
+            original = StatementRecord(uid='legacy', message_id='<same>', bank_code='HX',
+                rule_id='hx', subject='bill', sender='bank', email_date='', account_name='a', total_due='10')
+            sid, _ = db.save_statement_with_transactions(path, original, [])
+            replay = StatementRecord(uid='stable-uidl', message_id='<same>', bank_code='HX',
+                rule_id='hx', subject='bill', sender='bank', email_date='', account_name='a', total_due='999')
+            with self.assertRaises(db.MessageIdentityConflict):
+                db.save_statement_with_transactions(path, replay, [])
+            with contextlib.closing(sqlite3.connect(path)) as c:
+                self.assertEqual(c.execute('SELECT id,total_due FROM statements').fetchall(), [(sid, '10')])
+
+    def test_cleanup_can_run_again_with_existing_mapping_history(self):
+        spec = importlib.util.spec_from_file_location('cleanup_repeat', ROOT / 'scripts/clean_duplicate_statements.py')
+        cleanup = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cleanup)
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / 'statements.db'
+            db.init_db(str(path))
+            def seed(uid):
+                with contextlib.closing(sqlite3.connect(path)) as c:
+                    c.execute("INSERT INTO statements(account_name,uid,message_id,bank_code,rule_id,subject,created_at,updated_at) VALUES('a',?,'<same>','HX','hx','bill','now','now')", (uid,))
+                    c.commit()
+            seed('one'); seed('two')
+            for step in range(3):
+                if step == 2:
+                    seed('three')
+                with patch.object(sys, 'argv', ['cleanup', '--db', str(path), '--apply']), \
+                     contextlib.redirect_stdout(io.StringIO()):
+                    cleanup.main()
+            with contextlib.closing(sqlite3.connect(path)) as c:
+                self.assertEqual(c.execute('SELECT COUNT(*) FROM statements').fetchone()[0], 1)
+                self.assertEqual(c.execute('SELECT COUNT(*) FROM cleanup_id_map').fetchone()[0], 2)
+
     def test_cleanup_dry_run_is_byte_identical(self):
         spec = importlib.util.spec_from_file_location('cleanup', ROOT / 'scripts/clean_duplicate_statements.py')
         cleanup = importlib.util.module_from_spec(spec)
