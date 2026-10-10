@@ -298,11 +298,12 @@ def init_db(db_path: str) -> None:
         cur.execute("""
             INSERT OR IGNORE INTO statement_balances
                 (statement_id, currency, total_due, minimum_due, currency_source, evidence_json, created_at, updated_at)
-            SELECT id, 'CNY', total_due, minimum_due, 'legacy_assumed',
+            SELECT s.id, 'CNY', s.total_due, s.minimum_due, 'legacy_assumed',
                    '{"note": "legacy backfill, not verified evidence"}',
-                   created_at, updated_at
-            FROM statements
-            WHERE parse_status = 'ok' AND total_due IS NOT NULL AND total_due <> ''
+                   s.created_at, s.updated_at
+            FROM statements s
+            WHERE s.parse_status = 'ok' AND s.total_due IS NOT NULL AND s.total_due <> ''
+              AND NOT EXISTS (SELECT 1 FROM statement_balances b WHERE b.statement_id = s.id)
         """)
 
         # ---------- 质量事件持久化（重构契约 §1.3）：at-least-once + 消费方幂等
@@ -458,13 +459,18 @@ def upsert_quality_event(db_path: str, event: 'QualityEventRecord') -> str:
 
 def get_unacked_quality_events(db_path: str, limit: int = 100) -> list:
     """未确认质量事件（只读），按最近发生排序。"""
-    conn = sqlite3.connect(db_path)
+    try:
+        conn = sqlite3.connect(f'file:{db_path}?mode=ro', uri=True)
+    except sqlite3.OperationalError:
+        return []
     conn.row_factory = sqlite3.Row
     try:
         rows = conn.execute(
             """SELECT * FROM quality_events WHERE acked_at IS NULL
                ORDER BY last_seen_at DESC LIMIT ?""", (limit,)).fetchall()
         return [dict(r) for r in rows]
+    except sqlite3.OperationalError:
+        return []
     finally:
         conn.close()
 
@@ -568,7 +574,7 @@ def save_statement_with_transactions(db_path: str, s: StatementRecord,
         cur = conn.cursor()
         # 保存前旧值（判断首次落库与关键字段变化，is_paid 保护不依赖此查询）
         cur.execute(
-            "SELECT id, due_date, total_due, is_paid FROM statements WHERE account_name=? AND uid=? AND bank_code=?",
+            "SELECT id, due_date, total_due, is_paid, parse_status FROM statements WHERE account_name=? AND uid=? AND bank_code=?",
             (s.account_name, str(s.uid), s.bank_code),
         )
         existing = cur.fetchone()
@@ -580,6 +586,19 @@ def save_statement_with_transactions(db_path: str, s: StatementRecord,
             conflicts = [row[0] for row in cur.fetchall()]
             if conflicts:
                 raise MessageIdentityConflict('Message-ID already belongs to statement IDs ' + str(conflicts))
+
+        incoming_status = s.parse_status or 'ok'
+        # R1 核心保护：若已有账单为合法账单 (parse_status='ok')，重解析失败 (parse_status!='ok')
+        # 绝不覆盖原账单、原金额、交易明细与多币种余额及还款状态；仅保存新尝试的诊断事件。
+        if existing is not None and len(existing) >= 5 and existing[4] == 'ok' and incoming_status != 'ok':
+            existing_id = int(existing[0])
+            for ev in (quality_events or []):
+                _upsert_quality_event_locked(cur, ev)
+            conn.commit()
+            cur.execute("SELECT COUNT(*) FROM statement_transactions WHERE statement_id = ?", (existing_id,))
+            cnt = int(cur.fetchone()[0])
+            return existing_id, cnt
+
         cur.execute(
             """
             INSERT INTO statements (

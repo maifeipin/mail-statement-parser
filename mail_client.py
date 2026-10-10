@@ -1300,7 +1300,7 @@ def cli_quality_events(limit=100):
     errors = []
     data = {'events': []}
     try:
-        init_db(DB_PATH)
+        # 只读命令严禁调用 init_db 触发迁移
         events = get_unacked_quality_events(DB_PATH, limit=max(1, int(limit)))
         for e in events:
             try:
@@ -1324,7 +1324,6 @@ def cli_quality_ack(event_id, todo_id):
     errors = []
     data = {}
     try:
-        init_db(DB_PATH)
         data = ack_quality_event(DB_PATH, event_id, todo_id)
         if not data.get('acked') and data.get('reason') == 'not_found':
             errors.append(f'事件不存在：{event_id}')
@@ -1339,7 +1338,7 @@ def cli_billing_snapshot(months=1, detail_limit=20):
     errors = []
     data = {}
     try:
-        init_db(DB_PATH)
+        # 只读命令严禁调用 init_db 触发迁移
         data = snapshot(DB_PATH, months=max(1, int(months)), detail_limit=max(1, int(detail_limit)))
     except Exception as exc:
         errors.append(f'billing_snapshot: {exc}')
@@ -1351,21 +1350,25 @@ def cli_billing_trends(months=3, merchant=None, account=None):
     errors = []
     data = {}
     try:
-        init_db(DB_PATH)
+        # 只读命令严禁调用 init_db 触发迁移
         data = trends(DB_PATH, months=max(1, int(months)), merchant=merchant, account=account)
     except Exception as exc:
         errors.append(f'billing_trends: {exc}')
     return _emit_envelope('billing_trends', data, errors)
 
 
-def mark_paid_statement_by_id_cmd(statement_id):
-    """精确到逻辑账单的还款标记：`mark_paid --statement-id N`（兼容旧的银行+月份入口）。"""
-    init_db(DB_PATH)
-    n = mark_statement_paid_by_id(DB_PATH, statement_id)
-    if n:
-        print(f'✅ 已标记账单 #{statement_id} 为已还款（paid_at 记录当前时间）')
-    else:
-        print(f'ℹ️ 账单 #{statement_id} 无需更新（不存在/已还款/解析失败）')
+def cli_mark_paid_by_id(statement_id):
+    """精确到逻辑账单的还款标记，输出统一 envelope（契约 §3）。"""
+    errors = []
+    data = {}
+    try:
+        sid = int(statement_id)
+        n = mark_statement_paid_by_id(DB_PATH, sid)
+        data = {'statement_id': sid, 'updated': bool(n)}
+    except Exception as exc:
+        errors.append(f'mark_paid: {exc}')
+        data = {'statement_id': statement_id, 'updated': False}
+    return _emit_envelope('mark_paid', data, errors)
 
 
 def _parse_flag(argv, flag):
@@ -1444,7 +1447,7 @@ def main():
     elif cmd == 'mark_paid':
         stmt_id_flag, positional = _parse_flag(sys.argv[2:], '--statement-id')
         if stmt_id_flag is not None:
-            mark_paid_statement_by_id_cmd(stmt_id_flag)
+            cli_mark_paid_by_id(stmt_id_flag)
         elif len(sys.argv) < 3:
             print('用法：mark_paid <bank_code> [statement_month] | mark_paid --statement-id <id>')
             sys.exit(1)
@@ -1470,12 +1473,24 @@ def main():
             sys.exit(1)
         cli_quality_ack(event_id, todo_id)
     elif cmd == 'billing_snapshot':
-        months = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2].isdigit() else 1
+        months_flag, _ = _parse_flag(sys.argv[2:], '--months')
+        if months_flag is not None:
+            months = int(months_flag)
+        elif len(sys.argv) > 2 and sys.argv[2].isdigit():
+            months = int(sys.argv[2])
+        else:
+            months = 1
         detail_flag, _ = _parse_flag(sys.argv[2:], '--detail-limit')
         detail = int(detail_flag) if detail_flag else 20
         cli_billing_snapshot(months, detail)
     elif cmd == 'billing_trends':
-        months = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2].isdigit() else 3
+        months_flag, _ = _parse_flag(sys.argv[2:], '--months')
+        if months_flag is not None:
+            months = int(months_flag)
+        elif len(sys.argv) > 2 and sys.argv[2].isdigit():
+            months = int(sys.argv[2])
+        else:
+            months = 3
         merchant_flag, _ = _parse_flag(sys.argv[2:], '--merchant')
         account_flag, _ = _parse_flag(sys.argv[2:], '--account')
         cli_billing_trends(months, merchant_flag, account_flag)

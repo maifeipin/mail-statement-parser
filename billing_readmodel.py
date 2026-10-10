@@ -203,7 +203,8 @@ def merchant_of(desc):
 def trends(db_path, months=3, merchant=None, account=None):
     """商户/币种月度统计（billing_trends CLI 的 data 部分，契约 §6.2）。
 
-    支出与退款分开列示；折算比例仅当原币币种已知且金额有效时计算。"""
+    按 (merchant, month, currency) 聚合，debit 与 credit 分列且净额真正相消。
+    原币统计与实际折算比例按 (original_currency/currency) 币种对及月份分组。"""
     today = datetime.now(timezone.utc)
     start = month_start(today, months)
     conn = _connect_ro(db_path)
@@ -225,8 +226,9 @@ def trends(db_path, months=3, merchant=None, account=None):
         conn.close()
 
     m_filter = merchant_of(merchant) if merchant else None
-    stats = {}   # (merchant, month) -> {currency, direction -> {count, amount}}
-    fx_samples = {}  # merchant -> [rates]
+    stats = {}  # (m, month) -> {cur -> {'debit_count': int, 'debit_amount': Decimal, 'credit_count': int, 'credit_amount': Decimal, 'net': Decimal, 'fx_pairs': dict}}
+    merchant_fx_samples = {}  # m -> {fx_pair -> [rates]}
+
     for r in rows:
         d = decimal_amount(r['amount'])
         if d is None:
@@ -235,44 +237,90 @@ def trends(db_path, months=3, merchant=None, account=None):
         if m_filter and m != m_filter:
             continue
         month = r['statement_month'] or (r['txn_date'] or '')[:7] or 'unknown'
-        bucket = stats.setdefault((m, month), {})
-        key = (r['currency'] or 'UNKNOWN', r['direction'] or 'unknown')
-        agg = bucket.setdefault(key, {'count': 0, 'amount': Decimal('0')})
-        agg['count'] += 1
-        agg['amount'] += d
+        cur = r['currency'] or 'UNKNOWN'
+        dirn = (r['direction'] or 'unknown').lower()
+
+        month_bucket = stats.setdefault((m, month), {})
+        cur_agg = month_bucket.setdefault(cur, {
+            'debit_count': 0,
+            'debit_amount': Decimal('0'),
+            'credit_count': 0,
+            'credit_amount': Decimal('0'),
+            'net': Decimal('0'),
+            'fx_pairs': {},
+        })
+
+        if dirn == 'credit':
+            cur_agg['credit_count'] += 1
+            # credit_amount 统一以负数累计表达退款，net 直接相加求和
+            signed_credit = -abs(d) if d > 0 else d
+            cur_agg['credit_amount'] += signed_credit
+            cur_agg['net'] += signed_credit
+        else:
+            cur_agg['debit_count'] += 1
+            signed_debit = abs(d) if d > 0 else d
+            cur_agg['debit_amount'] += signed_debit
+            cur_agg['net'] += signed_debit
+
         # 实际折算比例（原币币种已知 + 两边金额有效 + 原币非零）
-        if r['original_currency'] and r['original_amount']:
-            od = decimal_amount(r['original_amount'])
+        orig_cur = r['original_currency']
+        orig_amt = r['original_amount']
+        if orig_cur and orig_amt:
+            od = decimal_amount(orig_amt)
             if od is not None and od != 0:
-                fx_samples.setdefault(m, []).append(str((d / od).quantize(Decimal('0.000001'))))
+                rate = (abs(d) / abs(od)).quantize(Decimal('0.000001'))
+                rate_str = str(rate)
+                fx_key = f"{orig_cur}/{cur}"
+                fx_entry = cur_agg['fx_pairs'].setdefault(fx_key, {'rates': [], 'total_orig_amount': Decimal('0')})
+                fx_entry['rates'].append(rate_str)
+                fx_entry['total_orig_amount'] += od
+                merchant_fx_samples.setdefault(m, {}).setdefault(fx_key, []).append(rate_str)
 
     merchants = []
     all_months = sorted({m for (_, m) in stats}, reverse=True)
     for m in sorted({mm for (mm, _) in stats}):
         entries = []
         for month in all_months:
-            bucket = stats.get((m, month))
-            if not bucket:
-                continue  # 无交易月份不列（不补零）
+            month_bucket = stats.get((m, month))
+            if not month_bucket:
+                continue
             row = {'month': month, 'currencies': []}
-            for (cur, dirn), agg in sorted(bucket.items()):
-                debit = agg if dirn == 'debit' else None
-                credit = agg if dirn == 'credit' else None
-                row['currencies'].append({
+            for cur in sorted(month_bucket.keys()):
+                agg = month_bucket[cur]
+                cur_data = {
                     'currency': cur,
-                    'debit_count': (debit or {}).get('count', 0),
-                    'debit_amount': str((debit or {}).get('amount', Decimal('0'))),
-                    'credit_count': (credit or {}).get('count', 0),
-                    'credit_amount': str((credit or {}).get('amount', Decimal('0'))),
-                    'net': str(agg['amount']),  # amount 已带符号，直接求和不双重反号
-                })
+                    'debit_count': agg['debit_count'],
+                    'debit_amount': str(agg['debit_amount']),
+                    'credit_count': agg['credit_count'],
+                    'credit_amount': str(agg['credit_amount']),
+                    'net': str(agg['net']),
+                }
+                if agg['fx_pairs']:
+                    cur_data['fx_pairs'] = {
+                        k: {
+                            'sample_rate': v['rates'][0] if v['rates'] else None,
+                            'rates': v['rates'],
+                            'total_orig_amount': str(v['total_orig_amount'])
+                        }
+                        for k, v in agg['fx_pairs'].items()
+                    }
+                row['currencies'].append(cur_data)
             entries.append(row)
+
+        m_fx = merchant_fx_samples.get(m, {})
+        first_fx_sample = None
+        for pair, rates in m_fx.items():
+            if rates:
+                first_fx_sample = rates[0]
+                break
+
         merchants.append({
             'merchant': m,
             'merchant_norm_version': MERCHANT_NORM_VERSION,
             'months': entries,
-            'avg_fx_rate_sample': (fx_samples.get(m) or [None])[0] if m in fx_samples else None,
-            'fx_rate_note': ('实际折算比例（入账金额/原币金额），非央行汇率' if m in fx_samples else None),
+            'avg_fx_rate_sample': first_fx_sample,
+            'fx_pairs_summary': {pair: {'sample_rate': rates[0], 'count': len(rates)} for pair, rates in m_fx.items()} if m_fx else {},
+            'fx_rate_note': ('实际折算比例（入账金额/原币金额），非央行汇率' if first_fx_sample else None),
         })
 
     return {
