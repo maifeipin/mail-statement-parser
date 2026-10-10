@@ -1371,8 +1371,52 @@ def cli_mark_paid_by_id(statement_id):
     return _emit_envelope('mark_paid', data, errors)
 
 
+def _parse_cmd_args(argv, allowed_options):
+    """严格解析命令行选项（契约 §3）。
+    allowed_options: {'flag_name': {'type': 'int'|'str', 'default': val, 'min': 1}}
+    返回: (parsed_dict, positional_list, errors_list)
+    """
+    parsed = {k: v.get('default') for k, v in allowed_options.items()}
+    positional = []
+    errors = []
+    i = 0
+
+    while i < len(argv):
+        arg = argv[i]
+        if arg.startswith('--'):
+            opt_name = arg[2:]
+            if opt_name not in allowed_options:
+                errors.append(f"未知选项：'{arg}'")
+                i += 1
+                continue
+            spec = allowed_options[opt_name]
+            if i + 1 >= len(argv) or argv[i + 1].startswith('--'):
+                errors.append(f"选项 '{arg}' 缺少参数值")
+                i += 1
+                continue
+            raw_val = argv[i + 1]
+            i += 2
+            if spec.get('type') == 'int':
+                try:
+                    val = int(raw_val)
+                    min_v = spec.get('min')
+                    if min_v is not None and val < min_v:
+                        errors.append(f"选项 '{arg}' 参数值非法：'{raw_val}'，必须 >= {min_v}")
+                    else:
+                        parsed[opt_name] = val
+                except ValueError:
+                    errors.append(f"选项 '{arg}' 参数值非法：'{raw_val}'，必须为整数")
+            else:
+                parsed[opt_name] = raw_val
+        else:
+            positional.append(arg)
+            i += 1
+
+    return parsed, positional, errors
+
+
 def _parse_flag(argv, flag):
-    """解析 --flag value；返回 (值, 去除该 flag 后的位置参数列表)。"""
+    """兼容旧调用：解析 --flag value；返回 (值, 去除该 flag 后的位置参数列表)。"""
     positional = []
     value = None
     i = 0
@@ -1457,43 +1501,100 @@ def main():
             mark_statement_paid_cmd(bank_code, month)
 
     elif cmd == 'quality_events':
-        limit_flag, _ = _parse_flag(sys.argv[2:], '--limit')
-        limit = int(limit_flag) if limit_flag else (int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2].isdigit() else 100)
-        cli_quality_events(limit)
-    elif cmd == 'quality_ack':
-        event_id, _ = _parse_flag(sys.argv[2:], '--event-id')
-        todo_id, _ = _parse_flag(sys.argv[2:], '--todo-id')
-        positional = [a for a in sys.argv[2:] if not a.startswith('--')]
-        if event_id is None and len(positional) > 0:
-            event_id = positional[0]
-        if todo_id is None and len(positional) > 1:
-            todo_id = positional[1]
-        if not event_id or not todo_id:
-            print('用法：quality_ack --event-id <ID> --todo-id <ID>')
+        opts, pos, errs = _parse_cmd_args(sys.argv[2:], {
+            'limit': {'type': 'int', 'default': 100, 'min': 1}
+        })
+        limit = opts['limit']
+        if not errs and pos:
+            try:
+                p_lim = int(pos[0])
+                if p_lim < 1:
+                    errs.append(f"limit 参数非法：'{pos[0]}'，必须 >= 1")
+                else:
+                    limit = p_lim
+            except ValueError:
+                errs.append(f"limit 参数非法：'{pos[0]}'，必须为整数")
+        if errs:
+            _emit_envelope('quality_events', {'events': [], 'count': 0}, errs)
             sys.exit(1)
-        cli_quality_ack(event_id, todo_id)
+        res = cli_quality_events(limit)
+        if res.get('status') != 'ok':
+            sys.exit(1)
+
+    elif cmd == 'quality_ack':
+        opts, pos, errs = _parse_cmd_args(sys.argv[2:], {
+            'event-id': {'type': 'str'},
+            'todo-id': {'type': 'str'}
+        })
+        event_id = opts['event-id'] or (pos[0] if len(pos) > 0 else None)
+        todo_id = opts['todo-id'] or (pos[1] if len(pos) > 1 else None)
+        if not event_id or not todo_id:
+            errs.append('用法：quality_ack --event-id <ID> --todo-id <ID>')
+        if errs:
+            _emit_envelope('quality_ack', {'acked': False}, errs)
+            sys.exit(1)
+        res = cli_quality_ack(event_id, todo_id)
+        if res.get('status') != 'ok':
+            sys.exit(1)
+
     elif cmd == 'billing_snapshot':
-        months_flag, _ = _parse_flag(sys.argv[2:], '--months')
-        if months_flag is not None:
-            months = int(months_flag)
-        elif len(sys.argv) > 2 and sys.argv[2].isdigit():
-            months = int(sys.argv[2])
-        else:
-            months = 1
-        detail_flag, _ = _parse_flag(sys.argv[2:], '--detail-limit')
-        detail = int(detail_flag) if detail_flag else 20
-        cli_billing_snapshot(months, detail)
+        opts, pos, errs = _parse_cmd_args(sys.argv[2:], {
+            'months': {'type': 'int', 'default': 1, 'min': 1},
+            'detail-limit': {'type': 'int', 'default': 20, 'min': 1}
+        })
+        months = opts['months']
+        detail = opts['detail-limit']
+        # 兼容旧位置参数
+        if not errs and pos:
+            try:
+                p_m = int(pos[0])
+                if p_m < 1:
+                    errs.append(f"months 参数非法：'{pos[0]}'，必须 >= 1")
+                else:
+                    months = p_m
+            except ValueError:
+                errs.append(f"months 参数非法：'{pos[0]}'，必须为整数")
+            if len(pos) > 1 and not errs:
+                try:
+                    p_d = int(pos[1])
+                    if p_d < 1:
+                        errs.append(f"detail-limit 参数非法：'{pos[1]}'，必须 >= 1")
+                    else:
+                        detail = p_d
+                except ValueError:
+                    errs.append(f"detail-limit 参数非法：'{pos[1]}'，必须为整数")
+        if errs:
+            _emit_envelope('billing_snapshot', {}, errs)
+            sys.exit(1)
+        res = cli_billing_snapshot(months, detail)
+        if res.get('status') != 'ok':
+            sys.exit(1)
+
     elif cmd == 'billing_trends':
-        months_flag, _ = _parse_flag(sys.argv[2:], '--months')
-        if months_flag is not None:
-            months = int(months_flag)
-        elif len(sys.argv) > 2 and sys.argv[2].isdigit():
-            months = int(sys.argv[2])
-        else:
-            months = 3
-        merchant_flag, _ = _parse_flag(sys.argv[2:], '--merchant')
-        account_flag, _ = _parse_flag(sys.argv[2:], '--account')
-        cli_billing_trends(months, merchant_flag, account_flag)
+        opts, pos, errs = _parse_cmd_args(sys.argv[2:], {
+            'months': {'type': 'int', 'default': 3, 'min': 1},
+            'merchant': {'type': 'str'},
+            'account': {'type': 'str'}
+        })
+        months = opts['months']
+        merchant_flag = opts['merchant']
+        account_flag = opts['account']
+        # 兼容旧位置参数
+        if not errs and pos:
+            try:
+                p_m = int(pos[0])
+                if p_m < 1:
+                    errs.append(f"months 参数非法：'{pos[0]}'，必须 >= 1")
+                else:
+                    months = p_m
+            except ValueError:
+                errs.append(f"months 参数非法：'{pos[0]}'，必须为整数")
+        if errs:
+            _emit_envelope('billing_trends', {}, errs)
+            sys.exit(1)
+        res = cli_billing_trends(months, merchant_flag, account_flag)
+        if res.get('status') != 'ok':
+            sys.exit(1)
 
     elif cmd == 'due_soon_bills':
         months = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2].isdigit() else 3

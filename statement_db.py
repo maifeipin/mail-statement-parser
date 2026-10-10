@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """SQLite persistence for statement parsing and validation."""
 
+import os
 import hashlib
 import json
 import sqlite3
@@ -458,19 +459,18 @@ def upsert_quality_event(db_path: str, event: 'QualityEventRecord') -> str:
 
 
 def get_unacked_quality_events(db_path: str, limit: int = 100) -> list:
-    """未确认质量事件（只读），按最近发生排序。"""
-    try:
-        conn = sqlite3.connect(f'file:{db_path}?mode=ro', uri=True)
-    except sqlite3.OperationalError:
-        return []
+    """未确认质量事件（只读），按最近发生排序。
+    若数据库文件不存在或缺少 quality_events 表，显式向上抛出异常，
+    由外层转为结构化错误回执，严禁静默吞掉异常伪装为空队列。"""
+    if not os.path.exists(db_path):
+        raise FileNotFoundError(f"数据库文件不存在：{db_path}")
+    conn = sqlite3.connect(f'file:{db_path}?mode=ro', uri=True)
     conn.row_factory = sqlite3.Row
     try:
         rows = conn.execute(
             """SELECT * FROM quality_events WHERE acked_at IS NULL
                ORDER BY last_seen_at DESC LIMIT ?""", (limit,)).fetchall()
         return [dict(r) for r in rows]
-    except sqlite3.OperationalError:
-        return []
     finally:
         conn.close()
 

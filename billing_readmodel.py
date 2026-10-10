@@ -204,7 +204,8 @@ def trends(db_path, months=3, merchant=None, account=None):
     """商户/币种月度统计（billing_trends CLI 的 data 部分，契约 §6.2）。
 
     按 (merchant, month, currency) 聚合，debit 与 credit 分列且净额真正相消。
-    原币统计与实际折算比例按 (original_currency/currency) 币种对及月份分组。"""
+    未知收支方向与方向/符号冲突单独列示，不误计入支出或退款。
+    原币统计与折算比例按 (original_currency/currency) 币种对及月份分组。"""
     today = datetime.now(timezone.utc)
     start = month_start(today, months)
     conn = _connect_ro(db_path)
@@ -226,8 +227,8 @@ def trends(db_path, months=3, merchant=None, account=None):
         conn.close()
 
     m_filter = merchant_of(merchant) if merchant else None
-    stats = {}  # (m, month) -> {cur -> {'debit_count': int, 'debit_amount': Decimal, 'credit_count': int, 'credit_amount': Decimal, 'net': Decimal, 'fx_pairs': dict}}
-    merchant_fx_samples = {}  # m -> {fx_pair -> [rates]}
+    stats = {}  # (m, month) -> {cur -> cur_agg}
+    merchant_fx_pairs = {}  # m -> {fx_key -> [{'month': m, 'rate': Decimal, 'settlement': Decimal, 'original': Decimal}]}
 
     for r in rows:
         d = decimal_amount(r['amount'])
@@ -238,7 +239,8 @@ def trends(db_path, months=3, merchant=None, account=None):
             continue
         month = r['statement_month'] or (r['txn_date'] or '')[:7] or 'unknown'
         cur = r['currency'] or 'UNKNOWN'
-        dirn = (r['direction'] or 'unknown').lower()
+        raw_dirn = r['direction']
+        dirn = (raw_dirn or '').strip().lower()
 
         month_bucket = stats.setdefault((m, month), {})
         cur_agg = month_bucket.setdefault(cur, {
@@ -247,22 +249,35 @@ def trends(db_path, months=3, merchant=None, account=None):
             'credit_count': 0,
             'credit_amount': Decimal('0'),
             'net': Decimal('0'),
+            'unknown_direction_count': 0,
+            'unknown_direction_amount': Decimal('0'),
+            'direction_conflict_count': 0,
+            'direction_conflict_amount': Decimal('0'),
             'fx_pairs': {},
         })
 
-        if dirn == 'credit':
+        # A3 核心：方向与符号严格分类，未知方向单独列示，冲突不强行掩盖
+        if dirn == 'debit':
+            if d >= 0:
+                cur_agg['debit_count'] += 1
+                cur_agg['debit_amount'] += d
+                cur_agg['net'] += d
+            else:
+                # 标为 debit 支出但金额为负数：方向与符号冲突！
+                cur_agg['direction_conflict_count'] += 1
+                cur_agg['direction_conflict_amount'] += d
+        elif dirn == 'credit':
+            # credit 退款：规范化为负数计入 credit_amount 与 net
             cur_agg['credit_count'] += 1
-            # credit_amount 统一以负数累计表达退款，net 直接相加求和
-            signed_credit = -abs(d) if d > 0 else d
+            signed_credit = -abs(d)
             cur_agg['credit_amount'] += signed_credit
             cur_agg['net'] += signed_credit
         else:
-            cur_agg['debit_count'] += 1
-            signed_debit = abs(d) if d > 0 else d
-            cur_agg['debit_amount'] += signed_debit
-            cur_agg['net'] += signed_debit
+            # 未知收支方向（None, 'unknown', 非法字符串）：单独列示，不进支出、不进确定性 net
+            cur_agg['unknown_direction_count'] += 1
+            cur_agg['unknown_direction_amount'] += d
 
-        # 实际折算比例（原币币种已知 + 两边金额有效 + 原币非零）
+        # A4 核心：实际折算比例（仅当原币币种已知 + 两边金额有效 + 原币非零）
         orig_cur = r['original_currency']
         orig_amt = r['original_amount']
         if orig_cur and orig_amt:
@@ -271,10 +286,21 @@ def trends(db_path, months=3, merchant=None, account=None):
                 rate = (abs(d) / abs(od)).quantize(Decimal('0.000001'))
                 rate_str = str(rate)
                 fx_key = f"{orig_cur}/{cur}"
-                fx_entry = cur_agg['fx_pairs'].setdefault(fx_key, {'rates': [], 'total_orig_amount': Decimal('0')})
+                fx_entry = cur_agg['fx_pairs'].setdefault(fx_key, {
+                    'rates': [],
+                    'total_settlement_amount': Decimal('0'),
+                    'total_original_amount': Decimal('0')
+                })
                 fx_entry['rates'].append(rate_str)
-                fx_entry['total_orig_amount'] += od
-                merchant_fx_samples.setdefault(m, {}).setdefault(fx_key, []).append(rate_str)
+                fx_entry['total_settlement_amount'] += abs(d)
+                fx_entry['total_original_amount'] += abs(od)
+
+                merchant_fx_pairs.setdefault(m, {}).setdefault(fx_key, []).append({
+                    'month': month,
+                    'settlement_amount': abs(d),
+                    'original_amount': abs(od),
+                    'rate': rate,
+                })
 
     merchants = []
     all_months = sorted({m for (_, m) in stats}, reverse=True)
@@ -295,32 +321,76 @@ def trends(db_path, months=3, merchant=None, account=None):
                     'credit_amount': str(agg['credit_amount']),
                     'net': str(agg['net']),
                 }
+                if agg['unknown_direction_count'] > 0:
+                    cur_data['unknown_direction_count'] = agg['unknown_direction_count']
+                    cur_data['unknown_direction_amount'] = str(agg['unknown_direction_amount'])
+                if agg['direction_conflict_count'] > 0:
+                    cur_data['direction_conflict_count'] = agg['direction_conflict_count']
+                    cur_data['direction_conflict_amount'] = str(agg['direction_conflict_amount'])
+
                 if agg['fx_pairs']:
-                    cur_data['fx_pairs'] = {
-                        k: {
-                            'sample_rate': v['rates'][0] if v['rates'] else None,
-                            'rates': v['rates'],
-                            'total_orig_amount': str(v['total_orig_amount'])
+                    cur_data['fx_pairs'] = {}
+                    for k, v in sorted(agg['fx_pairs'].items()):
+                        rates = v['rates']
+                        count = len(rates)
+                        simple_avg = (sum(Decimal(x) for x in rates) / count).quantize(Decimal('0.000001'))
+                        tot_orig = v['total_original_amount']
+                        tot_settle = v['total_settlement_amount']
+                        weighted_avg = (tot_settle / tot_orig).quantize(Decimal('0.000001')) if tot_orig != 0 else simple_avg
+                        cur_data['fx_pairs'][k] = {
+                            'sample_rates': rates,
+                            'sample_rate': rates[0],
+                            'sample_count': count,
+                            'simple_avg_rate': str(simple_avg),
+                            'weighted_avg_rate': str(weighted_avg),
+                            'total_settlement_amount': str(tot_settle),
+                            'total_original_amount': str(tot_orig),
                         }
-                        for k, v in agg['fx_pairs'].items()
-                    }
                 row['currencies'].append(cur_data)
             entries.append(row)
 
-        m_fx = merchant_fx_samples.get(m, {})
-        first_fx_sample = None
-        for pair, rates in m_fx.items():
-            if rates:
-                first_fx_sample = rates[0]
-                break
+        m_pairs = merchant_fx_pairs.get(m, {})
+        fx_pairs_summary = {}
+        for pair, items in sorted(m_pairs.items()):
+            pair_rates = [it['rate'] for it in items]
+            p_count = len(pair_rates)
+            p_simple_avg = (sum(pair_rates) / p_count).quantize(Decimal('0.000001'))
+            p_tot_settle = sum(it['settlement_amount'] for it in items)
+            p_tot_orig = sum(it['original_amount'] for it in items)
+            p_weighted_avg = (p_tot_settle / p_tot_orig).quantize(Decimal('0.000001')) if p_tot_orig != 0 else p_simple_avg
+            fx_pairs_summary[pair] = {
+                'count': p_count,
+                'sample_rates': [str(r) for r in pair_rates],
+                'simple_avg_rate': str(p_simple_avg),
+                'weighted_avg_rate': str(p_weighted_avg),
+                'total_settlement_amount': str(p_tot_settle),
+                'total_original_amount': str(p_tot_orig),
+            }
+
+        # 商户顶层汇率指标：杜绝首条样本冒充平均值，多币种对禁止跨币种混算
+        if len(fx_pairs_summary) == 1:
+            single_pair = list(fx_pairs_summary.keys())[0]
+            real_avg = fx_pairs_summary[single_pair]['simple_avg_rate']
+            avg_fx_rate_sample = real_avg
+            avg_fx_rate_algorithm = 'simple_arithmetic_mean'
+            fx_rate_note = f'实际折算比例（币种对 {single_pair} 共 {fx_pairs_summary[single_pair]["count"]} 笔样本算术平均），非央行汇率'
+        elif len(fx_pairs_summary) > 1:
+            avg_fx_rate_sample = None
+            avg_fx_rate_algorithm = 'disaggregated_by_pair'
+            fx_rate_note = '存在多个币种对，不提供跨币种混合平均值；请参考 fx_pairs_summary 各币种对独立统计'
+        else:
+            avg_fx_rate_sample = None
+            avg_fx_rate_algorithm = None
+            fx_rate_note = None
 
         merchants.append({
             'merchant': m,
             'merchant_norm_version': MERCHANT_NORM_VERSION,
             'months': entries,
-            'avg_fx_rate_sample': first_fx_sample,
-            'fx_pairs_summary': {pair: {'sample_rate': rates[0], 'count': len(rates)} for pair, rates in m_fx.items()} if m_fx else {},
-            'fx_rate_note': ('实际折算比例（入账金额/原币金额），非央行汇率' if first_fx_sample else None),
+            'avg_fx_rate_sample': avg_fx_rate_sample,
+            'avg_fx_rate_algorithm': avg_fx_rate_algorithm,
+            'fx_pairs_summary': fx_pairs_summary,
+            'fx_rate_note': fx_rate_note,
         })
 
     return {

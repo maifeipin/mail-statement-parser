@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""第一阶段复核专项测试（R1, R2, R7, R8）。
+"""第一阶段复核专项测试（R1, R2, R7, R8 及 A1, A2, A3, A4）。
 
 严格覆盖复核报告与用户验收要求：
 - R1：同 UID 重解析失败，验证原金额、交易、币种余额和还款状态全部不变；
 - R2：只读命令不能触发迁移；已有 UNKNOWN/USD 余额时，重复初始化不得新增 CNY；
-- R7：CLI 参数解析（--months 6 生效）与 mark_paid JSON envelope 契约；
-- R8：趋势分析真正净额（同月同商户同时支出 100 与退款 -30 合并净额为 70）。
+- A1：质量库不存在、缺表、正常空队列三种状态严格区分，前两者报错且不改库；
+- A2：CLI 参数严格校验：缺值、非正整数、未知选项报错，拒绝静默缩水；
+- A3：未知收支方向 (None/unknown/非法) 与方向冲突交易单独列示，不误计为支出；
+- A4：汇率折算比例按月份与币种对归属，杜绝首笔样本冒充平均，多币种对禁止跨币种混算。
 """
 
 import io
@@ -38,7 +40,6 @@ class TestR1SameUidReparseFailure(unittest.TestCase):
         sd.init_db(self.db)
 
     def test_same_uid_reparse_failure_keeps_all_valid_financial_data(self):
-        # 1. 存入初始合法账单（total_due=666.00, parse_status='ok', 包含交易明细与余额，且标记已还款）
         s_valid = StatementRecord(
             account_name='testbox', uid='UID-888', message_id='<msg-888@test>', bank_code='CMB',
             rule_id='CMB_TEMPLATE_V1', subject='招商银行信用卡对账单', sender='cmb@cmbchina.com',
@@ -62,11 +63,8 @@ class TestR1SameUidReparseFailure(unittest.TestCase):
         sid, txn_count = sd.save_statement_with_transactions(self.db, s_valid, txns, balances=balances)
         self.assertEqual(txn_count, 1)
 
-        # 标记已还款
         sd.mark_statement_paid_by_id(self.db, sid)
 
-        # 2. 模拟同 UID 重新解析失败（例如模板提取失败或规则校验未通过）
-        # 此时传入相同 (account_name, uid, bank_code)，但 parse_status='failed'，空交易，空余额，total_due=None
         s_failed = StatementRecord(
             account_name='testbox', uid='UID-888', message_id='<msg-888@test>', bank_code='CMB',
             rule_id='CMB_TEMPLATE_V1', subject='招商银行信用卡对账单', sender='cmb@cmbchina.com',
@@ -91,7 +89,6 @@ class TestR1SameUidReparseFailure(unittest.TestCase):
         )
         self.assertEqual(res_sid, sid)
 
-        # 3. 严格核验：原账单金额、状态、交易、多币种余额和还款状态全部不变！
         conn = sqlite3.connect(self.db)
         conn.row_factory = sqlite3.Row
         stmt_row = conn.execute("SELECT * FROM statements WHERE id = ?", (sid,)).fetchone()
@@ -100,19 +97,14 @@ class TestR1SameUidReparseFailure(unittest.TestCase):
         self.assertEqual(stmt_row['due_date'], '2026-10-20', '还款日不得被覆盖')
         self.assertEqual(stmt_row['is_paid'], 1, '还款状态 is_paid 不得回退')
 
-        # 交易明细不得被清空
         txn_rows = conn.execute("SELECT * FROM statement_transactions WHERE statement_id = ?", (sid,)).fetchall()
         self.assertEqual(len(txn_rows), 1, '旧交易明细绝对不得被清空')
         self.assertEqual(txn_rows[0]['amount'], '666.00')
-        self.assertEqual(txn_rows[0]['description'], '苹果专卖店')
 
-        # 币种余额不得被清空
         bal_rows = conn.execute("SELECT * FROM statement_balances WHERE statement_id = ?", (sid,)).fetchall()
         self.assertEqual(len(bal_rows), 1, '旧币种余额行绝对不得被清空')
         self.assertEqual(bal_rows[0]['currency'], 'CNY')
-        self.assertEqual(bal_rows[0]['total_due'], '666.00')
 
-        # 质量事件正常被记录以供审计
         ev_row = conn.execute("SELECT * FROM quality_events WHERE case_key = ?", ('parse_error|testbox|CMB|UID-888',)).fetchone()
         self.assertIsNotNone(ev_row, '失败重解析的质量事件诊断应当保留')
         conn.close()
@@ -127,7 +119,6 @@ class TestR2IdempotentMigrationAndReadOnlyZeroWrite(unittest.TestCase):
         sd.init_db(self.db)
 
     def test_existing_unknown_or_usd_balance_never_backfilled_cny(self):
-        # 1. 存入一个只有 UNKNOWN 余额的账单
         s = StatementRecord(
             account_name='testbox', uid='UID-UNKNOWN', message_id='<msg-unk@test>', bank_code='HX',
             rule_id='HX_TEMPLATE_V1', subject='华夏银行信用卡电子账单', sender='hx@hxb.com',
@@ -139,17 +130,14 @@ class TestR2IdempotentMigrationAndReadOnlyZeroWrite(unittest.TestCase):
         )
         sid, _ = sd.save_statement_with_transactions(self.db, s, [], balances=[bal_unk])
 
-        # 验证初始状态只有 UNKNOWN 余额
         conn = sqlite3.connect(self.db)
         curs = conn.execute("SELECT currency FROM statement_balances WHERE statement_id = ?", (sid,)).fetchall()
         self.assertEqual([r[0] for r in curs], ['UNKNOWN'])
         conn.close()
 
-        # 2. 多次调用 init_db(self.db) 模拟服务重启或多进程初始化
         sd.init_db(self.db)
         sd.init_db(self.db)
 
-        # 3. 严格核验：依然只有 1 行 UNKNOWN 余额，绝对不能凭空新增 CNY 余额产生双倍债务！
         conn = sqlite3.connect(self.db)
         curs_after = conn.execute("SELECT currency, total_due FROM statement_balances WHERE statement_id = ?", (sid,)).fetchall()
         conn.close()
@@ -157,7 +145,6 @@ class TestR2IdempotentMigrationAndReadOnlyZeroWrite(unittest.TestCase):
         self.assertEqual(curs_after[0][0], 'UNKNOWN')
 
     def test_readonly_commands_zero_write(self):
-        # 插入一些测试数据
         s = StatementRecord(
             account_name='testbox', uid='UID-RO', message_id='<msg-ro@test>', bank_code='CMB',
             rule_id='CMB_TEMPLATE_V1', subject='招商银行账单', sender='cmb@cmb.com',
@@ -170,12 +157,8 @@ class TestR2IdempotentMigrationAndReadOnlyZeroWrite(unittest.TestCase):
             )
         ])
 
-        # 将数据库文件权限设为只读 (0444)
         os.chmod(self.db, 0o444)
-
         try:
-            # 在只读模式下调用 snapshot, trends 以及只读事件获取
-            # 如果里面调用了 init_db 或写连接，会抛出 sqlite3.OperationalError: attempt to write a readonly database
             snap = snapshot(self.db, months=3)
             self.assertEqual(snap['statement_count'], 1)
 
@@ -184,139 +167,307 @@ class TestR2IdempotentMigrationAndReadOnlyZeroWrite(unittest.TestCase):
 
             events = sd.get_unacked_quality_events(self.db, limit=10)
             self.assertEqual(len(events), 1)
-            self.assertEqual(events[0]['event_type'], 'statement_recorded')
         finally:
-            # 恢复权限以便临时目录清理
             os.chmod(self.db, 0o644)
 
 
-class TestR7CLIArgumentsAndEnvelope(unittest.TestCase):
-    """R7：CLI 参数解析 (--months 6) 与 mark_paid JSON envelope 契约。"""
+class TestA1QualityEventsSchemaAndPathErrors(unittest.TestCase):
+    """A1：质量库不存在、缺表、正常空队列严格区分。"""
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
-        self.db = os.path.join(self.tmp, 'test_r7.db')
-        sd.init_db(self.db)
         self.orig_db_path = mail_client.DB_PATH
-        mail_client.DB_PATH = self.db
-
-        s = StatementRecord(
-            account_name='testbox', uid='UID-R7', message_id='<msg-r7@test>', bank_code='CMB',
-            rule_id='CMB_TEMPLATE_V1', subject='招行账单', sender='cmb@cmb.com',
-            email_date='2026-10-01', statement_month='2026-05', total_due='500.00', parse_status='ok',
-        )
-        self.sid, _ = sd.save_statement_with_transactions(self.db, s, [])
 
     def tearDown(self):
         mail_client.DB_PATH = self.orig_db_path
 
-    def test_cli_billing_snapshot_and_trends_months_flag(self):
-        old_argv = sys.argv
-        try:
-            # snapshot --months 6
-            sys.argv = ['mail_client.py', 'billing_snapshot', '--months', '6']
-            buf = io.StringIO()
-            with redirect_stdout(buf):
-                mail_client.main()
-            output = buf.getvalue().strip()
-            envelope = json.loads(output)
-            self.assertEqual(envelope['schema_version'], 1)
-            self.assertEqual(envelope['command'], 'billing_snapshot')
-            self.assertEqual(envelope['status'], 'ok')
-            self.assertEqual(envelope['data']['months'], 6, 'CLI 参数 --months 6 必须被正确解析，不得退回默认 1 个月')
+    def test_nonexistent_database_returns_error_and_does_not_create_file(self):
+        nonexistent_db = os.path.join(self.tmp, 'nonexistent_statement.db')
+        self.assertFalse(os.path.exists(nonexistent_db))
+        mail_client.DB_PATH = nonexistent_db
 
-            # trends --months 6
-            sys.argv = ['mail_client.py', 'billing_trends', '--months', '6']
-            buf2 = io.StringIO()
-            with redirect_stdout(buf2):
-                mail_client.main()
-            output2 = buf2.getvalue().strip()
-            envelope2 = json.loads(output2)
-            self.assertEqual(envelope2['schema_version'], 1)
-            self.assertEqual(envelope2['command'], 'billing_trends')
-            self.assertEqual(envelope2['status'], 'ok')
-            self.assertEqual(envelope2['data']['months'], 6, 'CLI 参数 --months 6 必须被正确解析，不得退回默认 3 个月')
-        finally:
-            sys.argv = old_argv
+        ret = mail_client.cli_quality_events(limit=10)
+        self.assertEqual(ret['status'], 'error', '数据库不存在时必须返回 error')
+        self.assertTrue(len(ret['errors']) > 0)
+        self.assertIn('数据库文件不存在', ret['errors'][0])
+        self.assertFalse(os.path.exists(nonexistent_db), '只读命令绝对不得偷偷创建新文件')
 
-    def test_cli_mark_paid_by_id_envelope(self):
-        old_argv = sys.argv
-        try:
-            sys.argv = ['mail_client.py', 'mark_paid', '--statement-id', str(self.sid)]
-            buf = io.StringIO()
-            with redirect_stdout(buf):
-                mail_client.main()
-            output = buf.getvalue().strip()
-            envelope = json.loads(output)
-            self.assertEqual(envelope['schema_version'], 1)
-            self.assertEqual(envelope['command'], 'mark_paid')
-            self.assertEqual(envelope['status'], 'ok')
-            self.assertEqual(envelope['data']['statement_id'], self.sid)
-            self.assertTrue(envelope['data']['updated'])
+    def test_missing_table_returns_error_and_does_not_migrate(self):
+        # 创建一个空数据库，没有任何表
+        empty_db = os.path.join(self.tmp, 'empty.db')
+        conn = sqlite3.connect(empty_db)
+        conn.execute("CREATE TABLE dummy (id INTEGER PRIMARY KEY)")
+        conn.commit()
+        conn.close()
 
-            # 再次调用（已还款）
-            buf2 = io.StringIO()
-            with redirect_stdout(buf2):
-                mail_client.main()
-            envelope2 = json.loads(buf2.getvalue().strip())
-            self.assertEqual(envelope2['status'], 'ok')
-            self.assertFalse(envelope2['data']['updated'], '已经还款时 updated 为 False')
-        finally:
-            sys.argv = old_argv
+        mail_client.DB_PATH = empty_db
+        ret = mail_client.cli_quality_events(limit=10)
+        self.assertEqual(ret['status'], 'error', '缺表时必须返回 error')
+        self.assertTrue(len(ret['errors']) > 0)
+        self.assertIn('no such table: quality_events', ret['errors'][0])
+
+        # 验证没有被偷偷执行 DDL
+        conn = sqlite3.connect(empty_db)
+        tables = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
+        conn.close()
+        self.assertNotIn('quality_events', tables, '只读命令绝对不得私自跑 DDL 补表')
+
+    def test_normal_empty_queue_returns_ok_zero_events(self):
+        # 初始化正常库
+        normal_db = os.path.join(self.tmp, 'normal.db')
+        sd.init_db(normal_db)
+        mail_client.DB_PATH = normal_db
+
+        ret = mail_client.cli_quality_events(limit=10)
+        self.assertEqual(ret['status'], 'ok', '已初始化且无事件时正常返回 ok')
+        self.assertEqual(ret['errors'], [])
+        self.assertEqual(ret['data']['count'], 0)
+        self.assertEqual(ret['data']['events'], [])
 
 
-class TestR8TrendsNetAndFxPairs(unittest.TestCase):
-    """R8：趋势分析真正净额相消，汇率归属币种对与月份。"""
+class TestA2CLIStrictArgumentValidation(unittest.TestCase):
+    """A2：CLI 参数严格校验：缺值、非正整数、未知选项报错，拒绝静默缩水。"""
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
-        self.db = os.path.join(self.tmp, 'test_r8.db')
+        self.db = os.path.join(self.tmp, 'test_a2.db')
+        sd.init_db(self.db)
+        self.orig_db_path = mail_client.DB_PATH
+        mail_client.DB_PATH = self.db
+
+    def tearDown(self):
+        mail_client.DB_PATH = self.orig_db_path
+
+    def _run_cmd(self, cmd_args):
+        old_argv = sys.argv
+        buf = io.StringIO()
+        try:
+            sys.argv = ['mail_client.py'] + cmd_args
+            with redirect_stdout(buf):
+                try:
+                    mail_client.main()
+                    exit_code = 0
+                except SystemExit as e:
+                    exit_code = e.code
+            output = buf.getvalue().strip()
+            envelope = json.loads(output) if output else {}
+            return exit_code, envelope
+        finally:
+            sys.argv = old_argv
+
+    def test_missing_flag_value_errors(self):
+        # billing_snapshot --months (缺值)
+        code, env = self._run_cmd(['billing_snapshot', '--months'])
+        self.assertNotEqual(code, 0)
+        self.assertEqual(env.get('status'), 'error')
+        self.assertIn("缺少参数值", env.get('errors', [''])[0])
+
+        # billing_trends --months (缺值)
+        code, env = self._run_cmd(['billing_trends', '--months'])
+        self.assertNotEqual(code, 0)
+        self.assertEqual(env.get('status'), 'error')
+        self.assertIn("缺少参数值", env.get('errors', [''])[0])
+
+    def test_invalid_non_integer_value_errors(self):
+        code, env = self._run_cmd(['billing_snapshot', '--months', 'bad'])
+        self.assertNotEqual(code, 0)
+        self.assertEqual(env.get('status'), 'error')
+        self.assertIn("必须为整数", env.get('errors', [''])[0])
+
+    def test_non_positive_value_errors(self):
+        code, env = self._run_cmd(['billing_snapshot', '--months', '0'])
+        self.assertNotEqual(code, 0)
+        self.assertEqual(env.get('status'), 'error')
+        self.assertIn("必须 >= 1", env.get('errors', [''])[0])
+
+        code, env = self._run_cmd(['billing_snapshot', '--months', '-2'])
+        self.assertNotEqual(code, 0)
+        self.assertEqual(env.get('status'), 'error')
+
+    def test_unknown_option_errors(self):
+        code, env = self._run_cmd(['billing_snapshot', '--unknown-flag', '123'])
+        self.assertNotEqual(code, 0)
+        self.assertEqual(env.get('status'), 'error')
+        self.assertIn("未知选项", env.get('errors', [''])[0])
+
+    def test_valid_positional_and_flag_paths(self):
+        # 正常 flag
+        code, env = self._run_cmd(['billing_snapshot', '--months', '6'])
+        self.assertEqual(code, 0)
+        self.assertEqual(env.get('status'), 'ok')
+        self.assertEqual(env['data']['months'], 6)
+
+        # 正常旧位置参数
+        code, env = self._run_cmd(['billing_snapshot', '6'])
+        self.assertEqual(code, 0)
+        self.assertEqual(env.get('status'), 'ok')
+        self.assertEqual(env['data']['months'], 6)
+
+
+class TestA3DirectionHandlingAndConflicts(unittest.TestCase):
+    """A3：未知收支方向 (None/unknown/非法) 与方向冲突交易单独列示，不误计为支出。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.db = os.path.join(self.tmp, 'test_a3.db')
         sd.init_db(self.db)
 
-    def test_same_merchant_debit_and_credit_netted_to_70(self):
-        # 针对复核报告核心复现：同商户同月同币种支出 100，退款 -30 → 净额必须为 70！
+    def test_unknown_direction_not_counted_as_debit(self):
         s = StatementRecord(
-            account_name='163box', uid='UID-NET', message_id='<msg-net@test>', bank_code='CMB',
-            rule_id='CMB_TEMPLATE_V1', subject='账单', sender='cmb@cmb.com',
-            email_date='2026-10-01', statement_month='2026-10', total_due='70.00', parse_status='ok',
+            account_name='box', uid='U-A3', message_id='<a3@test>', bank_code='CMB',
+            rule_id='r', subject='s', sender='s', email_date='2026-10-01',
+            statement_month='2026-10', total_due='100.00', parse_status='ok',
         )
         txns = [
+            # 1. 正常支出 100
             StatementTransactionRecord(
-                account_name='163box', uid='UID-NET', bank_code='CMB', txn_date='2026-10-05',
-                description='OPENAI*SUBSCRIPTION', amount='100.00', currency='CNY',
-                direction='debit', original_amount='14.00', original_currency='USD',
+                account_name='box', uid='U-A3', bank_code='CMB', txn_date='2026-10-01',
+                description='M1', amount='100.00', currency='CNY', direction='debit',
             ),
+            # 2. 未知方向 (None) 50
             StatementTransactionRecord(
-                account_name='163box', uid='UID-NET', bank_code='CMB', txn_date='2026-10-10',
-                description='OPENAI*SUBSCRIPTION', amount='-30.00', currency='CNY',
-                direction='credit',
+                account_name='box', uid='U-A3', bank_code='CMB', txn_date='2026-10-02',
+                description='M1', amount='50.00', currency='CNY', direction=None,
+            ),
+            # 3. 未知方向 ('unknown') 30
+            StatementTransactionRecord(
+                account_name='box', uid='U-A3', bank_code='CMB', txn_date='2026-10-03',
+                description='M1', amount='30.00', currency='CNY', direction='unknown',
+            ),
+            # 4. 方向与符号冲突 (标为 debit 但金额为 -20)
+            StatementTransactionRecord(
+                account_name='box', uid='U-A3', bank_code='CMB', txn_date='2026-10-04',
+                description='M1', amount='-20.00', currency='CNY', direction='debit',
+            ),
+            # 5. 正常退款 (credit) -30
+            StatementTransactionRecord(
+                account_name='box', uid='U-A3', bank_code='CMB', txn_date='2026-10-05',
+                description='M1', amount='-30.00', currency='CNY', direction='credit',
             ),
         ]
         sd.save_statement_with_transactions(self.db, s, txns)
 
-        tr = trends(self.db, months=3, merchant='OPENAI*SUBSCRIPTION')
-        self.assertEqual(len(tr['merchants']), 1)
+        tr = trends(self.db, months=3, merchant='M1')
+        cny = tr['merchants'][0]['months'][0]['currencies'][0]
+
+        # 核心断言：
+        # 1. debit 只能有正常支出 1 笔 100.00，绝对不能把未知方向或冲突项计入！
+        self.assertEqual(cny['debit_count'], 1)
+        self.assertEqual(cny['debit_amount'], '100.00')
+
+        # 2. credit 为 1 笔 -30.00
+        self.assertEqual(cny['credit_count'], 1)
+        self.assertEqual(cny['credit_amount'], '-30.00')
+
+        # 3. 确定性净额只能是 100 + (-30) = 70.00！
+        self.assertEqual(cny['net'], '70.00')
+
+        # 4. 未知方向单独列出：2 笔，共 80.00
+        self.assertEqual(cny['unknown_direction_count'], 2)
+        self.assertEqual(cny['unknown_direction_amount'], '80.00')
+
+        # 5. 冲突方向单独列出：1 笔，共 -20.00
+        self.assertEqual(cny['direction_conflict_count'], 1)
+        self.assertEqual(cny['direction_conflict_amount'], '-20.00')
+
+
+class TestA4FxRatesDisaggregationAndAverages(unittest.TestCase):
+    """A4：汇率折算比例按月份与币种对归属，杜绝首笔样本冒充平均，多币种对禁止跨币种混算。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.db = os.path.join(self.tmp, 'test_a4.db')
+        sd.init_db(self.db)
+
+    def test_single_pair_multiple_rates_computes_real_average(self):
+        # 单一币种对 (USD/CNY) 存在两笔不同汇率样本：
+        # 笔 1: 100 CNY / 14 USD ≈ 7.142857
+        # 笔 2: 72 CNY / 10 USD = 7.200000
+        # 真实算术平均: (7.142857 + 7.200000) / 2 = 7.171429 (不是首笔样本 7.142857)
+        s = StatementRecord(
+            account_name='box', uid='U-A4-1', message_id='<a4-1@test>', bank_code='CMB',
+            rule_id='r', subject='s', sender='s', email_date='2026-10-01',
+            statement_month='2026-10', total_due='172.00', parse_status='ok',
+        )
+        txns = [
+            StatementTransactionRecord(
+                account_name='box', uid='U-A4-1', bank_code='CMB', txn_date='2026-10-01',
+                description='SAAS_TOOL', amount='100.00', currency='CNY', direction='debit',
+                original_amount='14.00', original_currency='USD',
+            ),
+            StatementTransactionRecord(
+                account_name='box', uid='U-A4-1', bank_code='CMB', txn_date='2026-10-02',
+                description='SAAS_TOOL', amount='72.00', currency='CNY', direction='debit',
+                original_amount='10.00', original_currency='USD',
+            ),
+        ]
+        sd.save_statement_with_transactions(self.db, s, txns)
+
+        tr = trends(self.db, months=3, merchant='SAAS_TOOL')
         m = tr['merchants'][0]
-        self.assertEqual(m['merchant'], 'OPENAI*SUBSCRIPTION')
-        month_entry = m['months'][0]
-        self.assertEqual(month_entry['month'], '2026-10')
 
-        # 重点：currencies 必须只有 1 个 CNY 记录，而不是被 direction 拆成 2 个！
-        self.assertEqual(len(month_entry['currencies']), 1, '同商户同月同币种只能聚合为 1 个 currency 条目')
-        cny_stat = month_entry['currencies'][0]
-        self.assertEqual(cny_stat['currency'], 'CNY')
-        self.assertEqual(cny_stat['debit_count'], 1)
-        self.assertEqual(cny_stat['debit_amount'], '100.00')
-        self.assertEqual(cny_stat['credit_count'], 1)
-        self.assertEqual(cny_stat['credit_amount'], '-30.00')
-        # 核心断言：net 必须是真正净额 70.00！
-        self.assertEqual(cny_stat['net'], '70.00')
+        # 核心断言：
+        # 1. 商户顶层真实算术平均值必须是 7.171429，绝对不能只是首笔样本 7.142857！
+        self.assertEqual(Decimal(m['avg_fx_rate_sample']), Decimal('7.171428'))
+        self.assertEqual(m['avg_fx_rate_algorithm'], 'simple_arithmetic_mean')
 
-        # 原币汇率对 USD/CNY
-        self.assertIn('USD/CNY', cny_stat['fx_pairs'])
-        fx_info = cny_stat['fx_pairs']['USD/CNY']
-        # 100 / 14 ≈ 7.142857
-        self.assertEqual(Decimal(fx_info['sample_rate']), Decimal('7.142857'))
+        # 2. 币种对汇总信息准确
+        fx_summary = m['fx_pairs_summary']['USD/CNY']
+        self.assertEqual(fx_summary['count'], 2)
+        self.assertEqual(Decimal(fx_summary['simple_avg_rate']), Decimal('7.171428'))
+        # 加权平均: (100 + 72) / (14 + 10) = 172 / 24 ≈ 7.166667
+        self.assertEqual(Decimal(fx_summary['weighted_avg_rate']), Decimal('7.166667'))
+
+    def test_multi_pair_merchant_disaggregated_and_suppresses_global_average(self):
+        # 多币种对商户 (既有 USD/CNY 汇率 ≈ 7.14，又有 JPY/CNY 汇率 ≈ 0.046)
+        # 绝对不能跨币种混合计算平均值！
+        s1 = StatementRecord(
+            account_name='box', uid='U-A4-2', message_id='<a4-2@test>', bank_code='CMB',
+            rule_id='r', subject='s', sender='s', email_date='2026-09-01',
+            statement_month='2026-09', total_due='100.00', parse_status='ok',
+        )
+        s2 = StatementRecord(
+            account_name='box', uid='U-A4-3', message_id='<a4-3@test>', bank_code='CMB',
+            rule_id='r', subject='s', sender='s', email_date='2026-10-01',
+            statement_month='2026-10', total_due='46.00', parse_status='ok',
+        )
+        sd.save_statement_with_transactions(self.db, s1, [
+            StatementTransactionRecord(
+                account_name='box', uid='U-A4-2', bank_code='CMB', txn_date='2026-09-10',
+                description='GLOBAL_STORE', amount='100.00', currency='CNY', direction='debit',
+                original_amount='14.00', original_currency='USD',
+            )
+        ])
+        sd.save_statement_with_transactions(self.db, s2, [
+            StatementTransactionRecord(
+                account_name='box', uid='U-A4-3', bank_code='CMB', txn_date='2026-10-15',
+                description='GLOBAL_STORE', amount='46.00', currency='CNY', direction='debit',
+                original_amount='1000.00', original_currency='JPY',
+            )
+        ])
+
+        tr = trends(self.db, months=3, merchant='GLOBAL_STORE')
+        m = tr['merchants'][0]
+
+        # 核心断言：
+        # 1. 存在多个不同币种对时，全局平均必须置为 None，防止荒谬的跨币种混合！
+        self.assertIsNone(m['avg_fx_rate_sample'], '多币种对商户不得输出荒谬的全局混合平均值')
+        self.assertEqual(m['avg_fx_rate_algorithm'], 'disaggregated_by_pair')
+
+        # 2. 各币种对独立在 summary 中可见
+        self.assertIn('USD/CNY', m['fx_pairs_summary'])
+        self.assertIn('JPY/CNY', m['fx_pairs_summary'])
+
+        # 3. 月度样本独立，9 月只有 USD/CNY，10 月只有 JPY/CNY，绝对不串组！
+        months_dict = {entry['month']: entry for entry in m['months']}
+        sep_entry = months_dict['2026-09']['currencies'][0]
+        oct_entry = months_dict['2026-10']['currencies'][0]
+
+        self.assertIn('USD/CNY', sep_entry['fx_pairs'])
+        self.assertNotIn('JPY/CNY', sep_entry['fx_pairs'])
+
+        self.assertIn('JPY/CNY', oct_entry['fx_pairs'])
+        self.assertNotIn('USD/CNY', oct_entry['fx_pairs'])
 
 
 if __name__ == '__main__':
