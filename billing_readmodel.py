@@ -283,15 +283,14 @@ def trends(db_path, months=3, merchant=None, account=None):
         if orig_cur and orig_amt:
             od = decimal_amount(orig_amt)
             if od is not None and od != 0:
-                rate = (abs(d) / abs(od)).quantize(Decimal('0.000001'))
-                rate_str = str(rate)
+                rate = abs(d) / abs(od)
                 fx_key = f"{orig_cur}/{cur}"
                 fx_entry = cur_agg['fx_pairs'].setdefault(fx_key, {
                     'rates': [],
                     'total_settlement_amount': Decimal('0'),
                     'total_original_amount': Decimal('0')
                 })
-                fx_entry['rates'].append(rate_str)
+                fx_entry['rates'].append(rate)
                 fx_entry['total_settlement_amount'] += abs(d)
                 fx_entry['total_original_amount'] += abs(od)
 
@@ -338,8 +337,8 @@ def trends(db_path, months=3, merchant=None, account=None):
                         tot_settle = v['total_settlement_amount']
                         weighted_avg = (tot_settle / tot_orig).quantize(Decimal('0.000001')) if tot_orig != 0 else simple_avg
                         cur_data['fx_pairs'][k] = {
-                            'sample_rates': rates,
-                            'sample_rate': rates[0],
+                            'sample_rates': [str(x.quantize(Decimal('0.000001'))) for x in rates],
+                            'sample_rate': str(rates[0].quantize(Decimal('0.000001'))),
                             'sample_count': count,
                             'simple_avg_rate': str(simple_avg),
                             'weighted_avg_rate': str(weighted_avg),
@@ -360,7 +359,7 @@ def trends(db_path, months=3, merchant=None, account=None):
             p_weighted_avg = (p_tot_settle / p_tot_orig).quantize(Decimal('0.000001')) if p_tot_orig != 0 else p_simple_avg
             fx_pairs_summary[pair] = {
                 'count': p_count,
-                'sample_rates': [str(r) for r in pair_rates],
+                'sample_rates': [str(r.quantize(Decimal('0.000001'))) for r in pair_rates],
                 'simple_avg_rate': str(p_simple_avg),
                 'weighted_avg_rate': str(p_weighted_avg),
                 'total_settlement_amount': str(p_tot_settle),

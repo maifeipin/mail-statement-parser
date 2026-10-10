@@ -1371,7 +1371,7 @@ def cli_mark_paid_by_id(statement_id):
     return _emit_envelope('mark_paid', data, errors)
 
 
-def _parse_cmd_args(argv, allowed_options):
+def _parse_cmd_args(argv, allowed_options, positional_options=()):
     """严格解析命令行选项（契约 §3）。
     allowed_options: {'flag_name': {'type': 'int'|'str', 'default': val, 'min': 1}}
     返回: (parsed_dict, positional_list, errors_list)
@@ -1380,6 +1380,7 @@ def _parse_cmd_args(argv, allowed_options):
     positional = []
     errors = []
     i = 0
+    seen_options = set()
 
     while i < len(argv):
         arg = argv[i]
@@ -1389,6 +1390,9 @@ def _parse_cmd_args(argv, allowed_options):
                 errors.append(f"未知选项：'{arg}'")
                 i += 1
                 continue
+            if opt_name in seen_options:
+                errors.append(f"重复选项：'{arg}'")
+            seen_options.add(opt_name)
             spec = allowed_options[opt_name]
             if i + 1 >= len(argv) or argv[i + 1].startswith('--'):
                 errors.append(f"选项 '{arg}' 缺少参数值")
@@ -1412,6 +1416,24 @@ def _parse_cmd_args(argv, allowed_options):
             positional.append(arg)
             i += 1
 
+    if len(positional) > len(positional_options):
+        errors.append('多余位置参数：' + ' '.join(positional[len(positional_options):]))
+    for name, raw_val in zip(positional_options, positional):
+        if name in seen_options:
+            errors.append(f"位置参数与选项 '--{name}' 冲突")
+            continue
+        spec = allowed_options[name]
+        if spec.get('type') == 'int':
+            try:
+                val = int(raw_val)
+                if spec.get('min') is not None and val < spec['min']:
+                    errors.append(f"{name} 参数非法：'{raw_val}'，必须 >= {spec['min']}")
+                else:
+                    parsed[name] = val
+            except ValueError:
+                errors.append(f"{name} 参数非法：'{raw_val}'，必须为整数")
+        else:
+            parsed[name] = raw_val
     return parsed, positional, errors
 
 
@@ -1489,110 +1511,70 @@ def main():
     elif cmd == 'unpaid':
         show_unpaid_statements()
     elif cmd == 'mark_paid':
-        stmt_id_flag, positional = _parse_flag(sys.argv[2:], '--statement-id')
-        if stmt_id_flag is not None:
-            cli_mark_paid_by_id(stmt_id_flag)
-        elif len(sys.argv) < 3:
+        args = sys.argv[2:]
+        if any(arg.startswith('--') for arg in args):
+            opts, _, errs = _parse_cmd_args(args, {
+                'statement-id': {'type': 'int', 'min': 1}
+            })
+            if opts['statement-id'] is None:
+                errs.append('必须提供 --statement-id')
+            if errs:
+                _emit_envelope('mark_paid', {'updated': False}, errs)
+                sys.exit(1)
+            res = cli_mark_paid_by_id(opts['statement-id'])
+            if res.get('status') != 'ok':
+                sys.exit(1)
+        elif not 1 <= len(args) <= 2:
             print('用法：mark_paid <bank_code> [statement_month] | mark_paid --statement-id <id>')
             sys.exit(1)
         else:
-            bank_code = positional[0] if positional else sys.argv[2]
-            month = positional[1] if len(positional) > 1 else None
-            mark_statement_paid_cmd(bank_code, month)
+            mark_statement_paid_cmd(args[0], args[1] if len(args) > 1 else None)
 
     elif cmd == 'quality_events':
-        opts, pos, errs = _parse_cmd_args(sys.argv[2:], {
+        opts, _, errs = _parse_cmd_args(sys.argv[2:], {
             'limit': {'type': 'int', 'default': 100, 'min': 1}
-        })
-        limit = opts['limit']
-        if not errs and pos:
-            try:
-                p_lim = int(pos[0])
-                if p_lim < 1:
-                    errs.append(f"limit 参数非法：'{pos[0]}'，必须 >= 1")
-                else:
-                    limit = p_lim
-            except ValueError:
-                errs.append(f"limit 参数非法：'{pos[0]}'，必须为整数")
+        }, ('limit',))
         if errs:
             _emit_envelope('quality_events', {'events': [], 'count': 0}, errs)
             sys.exit(1)
-        res = cli_quality_events(limit)
+        res = cli_quality_events(opts['limit'])
         if res.get('status') != 'ok':
             sys.exit(1)
 
     elif cmd == 'quality_ack':
-        opts, pos, errs = _parse_cmd_args(sys.argv[2:], {
-            'event-id': {'type': 'str'},
-            'todo-id': {'type': 'str'}
-        })
-        event_id = opts['event-id'] or (pos[0] if len(pos) > 0 else None)
-        todo_id = opts['todo-id'] or (pos[1] if len(pos) > 1 else None)
-        if not event_id or not todo_id:
+        opts, _, errs = _parse_cmd_args(sys.argv[2:], {
+            'event-id': {'type': 'str'}, 'todo-id': {'type': 'str'}
+        }, ('event-id', 'todo-id'))
+        if not opts['event-id'] or not opts['todo-id']:
             errs.append('用法：quality_ack --event-id <ID> --todo-id <ID>')
         if errs:
             _emit_envelope('quality_ack', {'acked': False}, errs)
             sys.exit(1)
-        res = cli_quality_ack(event_id, todo_id)
+        res = cli_quality_ack(opts['event-id'], opts['todo-id'])
         if res.get('status') != 'ok':
             sys.exit(1)
 
     elif cmd == 'billing_snapshot':
-        opts, pos, errs = _parse_cmd_args(sys.argv[2:], {
+        opts, _, errs = _parse_cmd_args(sys.argv[2:], {
             'months': {'type': 'int', 'default': 1, 'min': 1},
             'detail-limit': {'type': 'int', 'default': 20, 'min': 1}
-        })
-        months = opts['months']
-        detail = opts['detail-limit']
-        # 兼容旧位置参数
-        if not errs and pos:
-            try:
-                p_m = int(pos[0])
-                if p_m < 1:
-                    errs.append(f"months 参数非法：'{pos[0]}'，必须 >= 1")
-                else:
-                    months = p_m
-            except ValueError:
-                errs.append(f"months 参数非法：'{pos[0]}'，必须为整数")
-            if len(pos) > 1 and not errs:
-                try:
-                    p_d = int(pos[1])
-                    if p_d < 1:
-                        errs.append(f"detail-limit 参数非法：'{pos[1]}'，必须 >= 1")
-                    else:
-                        detail = p_d
-                except ValueError:
-                    errs.append(f"detail-limit 参数非法：'{pos[1]}'，必须为整数")
+        }, ('months', 'detail-limit'))
         if errs:
             _emit_envelope('billing_snapshot', {}, errs)
             sys.exit(1)
-        res = cli_billing_snapshot(months, detail)
+        res = cli_billing_snapshot(opts['months'], opts['detail-limit'])
         if res.get('status') != 'ok':
             sys.exit(1)
 
     elif cmd == 'billing_trends':
-        opts, pos, errs = _parse_cmd_args(sys.argv[2:], {
+        opts, _, errs = _parse_cmd_args(sys.argv[2:], {
             'months': {'type': 'int', 'default': 3, 'min': 1},
-            'merchant': {'type': 'str'},
-            'account': {'type': 'str'}
-        })
-        months = opts['months']
-        merchant_flag = opts['merchant']
-        account_flag = opts['account']
-        # 兼容旧位置参数
-        if not errs and pos:
-            try:
-                p_m = int(pos[0])
-                if p_m < 1:
-                    errs.append(f"months 参数非法：'{pos[0]}'，必须 >= 1")
-                else:
-                    months = p_m
-            except ValueError:
-                errs.append(f"months 参数非法：'{pos[0]}'，必须为整数")
+            'merchant': {'type': 'str'}, 'account': {'type': 'str'}
+        }, ('months',))
         if errs:
             _emit_envelope('billing_trends', {}, errs)
             sys.exit(1)
-        res = cli_billing_trends(months, merchant_flag, account_flag)
+        res = cli_billing_trends(opts['months'], opts['merchant'], opts['account'])
         if res.get('status') != 'ok':
             sys.exit(1)
 

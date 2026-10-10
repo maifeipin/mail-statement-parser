@@ -290,6 +290,39 @@ class TestA2CLIStrictArgumentValidation(unittest.TestCase):
         self.assertEqual(env.get('status'), 'error')
         self.assertIn("未知选项", env.get('errors', [''])[0])
 
+    def test_conflicting_duplicate_and_excess_arguments_rejected(self):
+        cases = [
+            ['billing_snapshot', '--months', '6', '3'],
+            ['billing_snapshot', '6', '20', 'unexpected'],
+            ['billing_snapshot', '--months', '6', '--months', '3'],
+            ['billing_trends', '6', 'unexpected'],
+            ['quality_events', '100', 'unexpected'],
+            ['quality_ack', 'event', 'todo', 'unexpected'],
+            ['mark_paid', '--statement-id'],
+            ['mark_paid', '--statement-id', '0'],
+            ['mark_paid', '--statement-id', 'bad'],
+            ['mark_paid', '--statement-id', '1', 'unexpected'],
+        ]
+        for args in cases:
+            with self.subTest(args=args):
+                code, env = self._run_cmd(args)
+                self.assertEqual(code, 1)
+                self.assertEqual(env['status'], 'error')
+                self.assertEqual(env['command'], args[0])
+
+    def test_mark_paid_id_envelope_and_idempotency(self):
+        s = StatementRecord(uid='paid-fixture', message_id='<paid@test>', bank_code='CMB',
+                            rule_id='r', subject='fixture', sender='fixture', email_date='2026-10-01',
+                            account_name='fixture', statement_month='2026-10', total_due='100')
+        sid, _ = sd.save_statement_with_transactions(self.db, s, [])
+        code, env = self._run_cmd(['mark_paid', '--statement-id', str(sid)])
+        self.assertEqual(code, 0)
+        self.assertEqual(env['schema_version'], 1)
+        self.assertEqual(env['data'], {'statement_id': sid, 'updated': True})
+        code, env = self._run_cmd(['mark_paid', '--statement-id', str(sid)])
+        self.assertEqual(code, 0)
+        self.assertFalse(env['data']['updated'])
+
     def test_valid_positional_and_flag_paths(self):
         # 正常 flag
         code, env = self._run_cmd(['billing_snapshot', '--months', '6'])
@@ -383,7 +416,7 @@ class TestA4FxRatesDisaggregationAndAverages(unittest.TestCase):
         # 单一币种对 (USD/CNY) 存在两笔不同汇率样本：
         # 笔 1: 100 CNY / 14 USD ≈ 7.142857
         # 笔 2: 72 CNY / 10 USD = 7.200000
-        # 真实算术平均: (7.142857 + 7.200000) / 2 = 7.171429 (不是首笔样本 7.142857)
+        # 真实算术平均: (100/14 + 72/10) / 2，最终舍入为 7.171429 (不是首笔样本 7.142857)
         s = StatementRecord(
             account_name='box', uid='U-A4-1', message_id='<a4-1@test>', bank_code='CMB',
             rule_id='r', subject='s', sender='s', email_date='2026-10-01',
@@ -408,13 +441,15 @@ class TestA4FxRatesDisaggregationAndAverages(unittest.TestCase):
 
         # 核心断言：
         # 1. 商户顶层真实算术平均值必须是 7.171429，绝对不能只是首笔样本 7.142857！
-        self.assertEqual(Decimal(m['avg_fx_rate_sample']), Decimal('7.171428'))
+        self.assertEqual(Decimal(m['avg_fx_rate_sample']), Decimal('7.171429'))
+        monthly = m['months'][0]['currencies'][0]['fx_pairs']['USD/CNY']
+        self.assertEqual(Decimal(monthly['simple_avg_rate']), Decimal('7.171429'))
         self.assertEqual(m['avg_fx_rate_algorithm'], 'simple_arithmetic_mean')
 
         # 2. 币种对汇总信息准确
         fx_summary = m['fx_pairs_summary']['USD/CNY']
         self.assertEqual(fx_summary['count'], 2)
-        self.assertEqual(Decimal(fx_summary['simple_avg_rate']), Decimal('7.171428'))
+        self.assertEqual(Decimal(fx_summary['simple_avg_rate']), Decimal('7.171429'))
         # 加权平均: (100 + 72) / (14 + 10) = 172 / 24 ≈ 7.166667
         self.assertEqual(Decimal(fx_summary['weighted_avg_rate']), Decimal('7.166667'))
 
