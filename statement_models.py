@@ -85,6 +85,8 @@ class QualityEventRecord:
     diagnostics: List[Diagnostic] = _dc_field(default_factory=list)
     evidence_refs: List[dict] = _dc_field(default_factory=list)
     occurrence_count: int = 1
+    revision: int = 1               # 单调递增版本号，用于条件确认与并发保护
+    cycle_id: int = 1               # 发生周期计数，解决后复发递增开启新周期
     event_id: Optional[str] = None  # 由 case_key 确定性派生（statement_db 负责）
 
 

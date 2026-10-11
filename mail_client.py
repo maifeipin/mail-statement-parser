@@ -52,7 +52,7 @@ CONFIG_CANDIDATES = [
 DOWNLOAD_DIR = os.path.expanduser('email-downloads')
 RULES_DIR = os.path.expanduser('rules')
 VALIDATION_REPORT_DIR = os.path.expanduser('validation-reports')
-DB_PATH = os.path.expanduser('statements.db')
+DB_PATH = os.path.expanduser(os.environ.get('MAIL_STATEMENT_DB_PATH', 'statements.db'))
 
 BANK_NAME_MAP = {
     'HX': '华夏银行',
@@ -1296,12 +1296,13 @@ def _emit_envelope(command, data=None, errors=None):
     return envelope
 
 
-def cli_quality_events(limit=100):
+def cli_quality_events(limit=100, kind=None):
     errors = []
     data = {'events': []}
     try:
         # 只读命令严禁调用 init_db 触发迁移
-        events = get_unacked_quality_events(DB_PATH, limit=max(1, int(limit)))
+        events = get_unacked_quality_events(DB_PATH, limit=max(1, int(limit)),
+            event_types=('quality_detected', 'quality_updated', 'quality_resolved') if kind == 'quality' else None)
         for e in events:
             try:
                 e['diagnostics'] = json.loads(e.get('diagnostics_json') or '[]')
@@ -1313,6 +1314,7 @@ def cli_quality_events(limit=100):
                 e['evidence_refs'] = []
             e.pop('diagnostics_json', None)
             e.pop('evidence_refs_json', None)
+            e.pop('observation_keys_json', None)
         data['events'] = events
         data['count'] = len(events)
     except Exception as exc:
@@ -1320,13 +1322,13 @@ def cli_quality_events(limit=100):
     return _emit_envelope('quality_events', data, errors)
 
 
-def cli_quality_ack(event_id, todo_id):
+def cli_quality_ack(event_id, todo_id, revision=None):
     errors = []
     data = {}
     try:
-        data = ack_quality_event(DB_PATH, event_id, todo_id)
-        if not data.get('acked') and data.get('reason') == 'not_found':
-            errors.append(f'事件不存在：{event_id}')
+        data = ack_quality_event(DB_PATH, event_id, todo_id, revision=revision)
+        if data.get('acked') is not True:
+            errors.append(f"quality_ack rejected: {data.get('reason')} (revision={revision})")
     except Exception as exc:
         errors.append(f'quality_ack: {exc}')
         data = {'acked': False, 'event_id': event_id, 'todo_id': todo_id, 'reason': 'error'}
@@ -1532,25 +1534,30 @@ def main():
 
     elif cmd == 'quality_events':
         opts, _, errs = _parse_cmd_args(sys.argv[2:], {
-            'limit': {'type': 'int', 'default': 100, 'min': 1}
+            'limit': {'type': 'int', 'default': 100, 'min': 1},
+            'kind': {'type': 'str'}
         }, ('limit',))
+        if opts.get('kind') not in (None, 'quality'):
+            errs.append('kind must be quality')
         if errs:
             _emit_envelope('quality_events', {'events': [], 'count': 0}, errs)
             sys.exit(1)
-        res = cli_quality_events(opts['limit'])
+        res = cli_quality_events(opts['limit'], kind=opts.get('kind'))
         if res.get('status') != 'ok':
             sys.exit(1)
 
     elif cmd == 'quality_ack':
         opts, _, errs = _parse_cmd_args(sys.argv[2:], {
-            'event-id': {'type': 'str'}, 'todo-id': {'type': 'str'}
+            'event-id': {'type': 'str'},
+            'todo-id': {'type': 'str'},
+            'revision': {'type': 'int', 'min': 1}
         }, ('event-id', 'todo-id'))
-        if not opts['event-id'] or not opts['todo-id']:
-            errs.append('用法：quality_ack --event-id <ID> --todo-id <ID>')
+        if not opts['event-id'] or not opts['todo-id'] or not opts.get('revision'):
+            errs.append('用法：quality_ack --event-id <ID> --todo-id <ID> --revision <N>')
         if errs:
             _emit_envelope('quality_ack', {'acked': False}, errs)
             sys.exit(1)
-        res = cli_quality_ack(opts['event-id'], opts['todo-id'])
+        res = cli_quality_ack(opts['event-id'], opts['todo-id'], revision=opts.get('revision'))
         if res.get('status') != 'ok':
             sys.exit(1)
 

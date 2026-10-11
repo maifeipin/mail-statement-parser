@@ -8,6 +8,7 @@
 
 import re
 import json
+import hashlib
 import os
 import glob
 from datetime import datetime, timezone, timedelta
@@ -787,7 +788,9 @@ def validate_and_save_email_message(msg, uid, rules=None, account_name=None):
                     event_type='quality_detected', account_name=account_name,
                     template_version=template_version, diagnostics=[suspicious],
                     evidence_refs=[{'kind': 'email', 'account': account_name, 'uid': str(uid),
-                                    'subject': subj[:80]}],
+                                    'subject': subj[:80],
+                                    'message_id': _to_text(msg.get('Message-ID', '')).strip() or None,
+                                    'content_hash': hashlib.sha256(body_text.encode()).hexdigest()}],
                 )
                 try:
                     init_db(DB_PATH)
@@ -939,7 +942,8 @@ def validate_and_save_email_message(msg, uid, rules=None, account_name=None):
         # ---------- 诊断组装（用途隔离，重构契约 §2.1）----------
         template_version = _to_text(rule.get('template_version') or rule.get('rule_id', ''))
         evidence_ref = {'kind': 'statement', 'account': account_name, 'uid': str(uid),
-                        'message_id': message_id, 'report_path': out}
+                        'message_id': message_id, 'report_path': out,
+                        'content_hash': hashlib.sha256(body_text.encode()).hexdigest()}
         diagnostics = []
         # 校验错误（必填缺失）→ EXTRACTION_FAILED（账单级合法性判据已由 parse_status 承担，这里只加诊断）
         for issue in vr.errors:

@@ -89,6 +89,7 @@ def _migrate_account_name(cur) -> None:
 def init_db(db_path: str) -> None:
     conn = sqlite3.connect(db_path)
     try:
+        conn.execute('BEGIN IMMEDIATE')
         cur = conn.cursor()
         cur.execute(
             """
@@ -319,6 +320,8 @@ def init_db(db_path: str) -> None:
                 diagnostics_json TEXT NOT NULL,
                 evidence_refs_json TEXT NOT NULL DEFAULT '[]',
                 occurrence_count INTEGER NOT NULL DEFAULT 1,
+                revision INTEGER NOT NULL DEFAULT 1,
+                cycle_id INTEGER NOT NULL DEFAULT 1,
                 first_seen_at TEXT NOT NULL,
                 last_seen_at TEXT NOT NULL,
                 acked_at TEXT,
@@ -327,6 +330,14 @@ def init_db(db_path: str) -> None:
         """)
         cur.execute("CREATE INDEX IF NOT EXISTS idx_quality_events_case ON quality_events(case_key)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_quality_events_unacked ON quality_events(acked_at) WHERE acked_at IS NULL")
+        cur.execute("PRAGMA table_info(quality_events)")
+        qe_cols = {row[1] for row in cur.fetchall()}
+        if 'revision' not in qe_cols:
+            cur.execute("ALTER TABLE quality_events ADD COLUMN revision INTEGER NOT NULL DEFAULT 1")
+        if 'cycle_id' not in qe_cols:
+            cur.execute("ALTER TABLE quality_events ADD COLUMN cycle_id INTEGER NOT NULL DEFAULT 1")
+        if "observation_keys_json" not in qe_cols:
+            cur.execute("ALTER TABLE quality_events ADD COLUMN observation_keys_json TEXT NOT NULL DEFAULT '[]'")
 
         # ---------- 跨进程互斥租约（重构契约 §1.4）：覆盖并发 cron / 手动命令 / 重试
         cur.execute("""
@@ -401,47 +412,100 @@ def derive_event_id(case_key: str) -> str:
     return hashlib.sha256(('quality://' + case_key).encode('utf-8')).hexdigest()[:32]
 
 
-def _upsert_quality_event_locked(cur, event: 'QualityEventRecord') -> str:
-    """在已持有写锁的事务内 upsert 质量事件。返回 event_id。
+def _evidence_identity(ref):
+    """Message-ID survives UID drift; scope identity by mailbox."""
+    account = ref.get('account') or ref.get('account_name') or ''
+    if ref.get('message_id'):
+        return (account, 'message_id', str(ref['message_id']).strip())
+    if ref.get('uid') is not None:
+        return (account, 'uid', str(ref['uid']))
+    if ref.get('statement_id') is not None:
+        return (account, 'statement_id', str(ref['statement_id']))
+    return (account, 'evidence', json.dumps(ref, sort_keys=True, ensure_ascii=False))
 
-    - 新 case → quality_detected，occurrence=1；
-    - 已存在且未 ack → quality_updated，occurrence+1，诊断就地更新；
-    - 已存在且已 ack（复发）→ 清除 ack（新发生周期），occurrence+1；
-    - event_type='quality_resolved' → 标记该 case 解决（由解析层在无诊断时显式发出）；
-    - event_type='statement_recorded' → 新账单落库事件（含关键字段变化时的重新可见）。
-    """
+
+def _dedupe_evidence_refs(existing_refs, new_refs):
+    combined = {_evidence_identity(r): r for r in existing_refs or []}
+    combined.update({_evidence_identity(r): r for r in new_refs or []})
+    return list(combined.values())
+
+
+def _observation_key(diagnostics, refs, template_version):
+    # Report paths and transport UIDs are delivery details, not new observations.
+    semantic_diags = [{k: v for k, v in d.items() if k != 'evidence_ref'} for d in diagnostics]
+    semantic_refs = []
+    for ref in refs:
+        semantic_refs.append({'identity': _evidence_identity(ref), **{
+            k: ref[k] for k in ('content_hash', 'parser_version', 'due_date', 'total_due') if k in ref}})
+    payload = [template_version, sorted(semantic_diags, key=lambda d: json.dumps(d, sort_keys=True)),
+               sorted(semantic_refs, key=lambda r: json.dumps(r, sort_keys=True))]
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+
+
+def _upsert_quality_event_locked(cur, event: 'QualityEventRecord') -> str:
+    """Delivery acknowledgment does not resolve a problem. Only new evidence advances it."""
+    if event.event_type not in ('quality_detected', 'quality_updated', 'quality_resolved', 'statement_recorded'):
+        raise ValueError('unsupported quality event type')
     now = _utc_now_iso()
     event_id = derive_event_id(event.case_key)
-    cur.execute("SELECT event_id, acked_at, occurrence_count FROM quality_events WHERE event_id = ?", (event_id,))
-    row = cur.fetchone()
+    row = cur.execute("""SELECT event_type, diagnostics_json, evidence_refs_json,
+        revision, cycle_id, observation_keys_json, template_version
+        FROM quality_events WHERE event_id=?""", (event_id,)).fetchone()
+    diagnostics = [d.to_dict() for d in event.diagnostics]
+    refs = _dedupe_evidence_refs([], event.evidence_refs)
+    if event.event_type == 'quality_resolved':
+        if row is None:
+            raise ValueError('cannot resolve an unknown quality case')
+        old_type, _, _, rev, cycle, _, _ = row
+        if old_type == 'statement_recorded':
+            raise ValueError('statement event is not a quality case')
+        if old_type == 'quality_resolved' and event.cycle_id == cycle and event.revision in (rev, rev - 1):
+            return event_id
+        if event.revision != rev or event.cycle_id != cycle:
+            raise ValueError('stale quality resolution: revision/cycle mismatch')
+        if old_type != 'quality_resolved':
+            cur.execute("""UPDATE quality_events SET event_type='quality_resolved',
+                diagnostics_json='[]', revision=revision+1, last_seen_at=?,
+                acked_at=NULL, acked_todo_id=NULL WHERE event_id=?""", (now, event_id))
+        return event_id
+    observation = _observation_key(diagnostics, refs, event.template_version)
     if row is None:
-        cur.execute(
-            """INSERT INTO quality_events (
-                event_id, case_key, event_type, account_name, bank_code, template_version,
-                diagnostics_json, evidence_refs_json, occurrence_count, first_seen_at, last_seen_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)""",
-            (event_id, event.case_key, event.event_type, event.account_name, event.bank_code,
-             event.template_version,
-             json.dumps([d.to_dict() for d in event.diagnostics], ensure_ascii=False),
-             json.dumps(event.evidence_refs or [], ensure_ascii=False),
-             now, now),
-        )
-    else:
-        cur.execute(
-            """UPDATE quality_events SET
-                event_type = ?, account_name = COALESCE(?, account_name),
-                bank_code = COALESCE(?, bank_code), template_version = COALESCE(?, template_version),
-                diagnostics_json = ?, evidence_refs_json = ?,
-                occurrence_count = occurrence_count + 1, last_seen_at = ?,
-                acked_at = NULL, acked_todo_id = NULL
-               WHERE event_id = ?""",
-            (event.event_type, event.account_name, event.bank_code, event.template_version,
-             json.dumps([d.to_dict() for d in event.diagnostics], ensure_ascii=False),
-             json.dumps(event.evidence_refs or [], ensure_ascii=False),
-             now, event_id),
-        )
+        cur.execute("""INSERT INTO quality_events(event_id,case_key,event_type,account_name,
+            bank_code,template_version,diagnostics_json,evidence_refs_json,occurrence_count,
+            revision,cycle_id,observation_keys_json,first_seen_at,last_seen_at)
+            VALUES(?,?,?,?,?,?,?,?,?,1,1,?,?,?)""",
+            (event_id,event.case_key,event.event_type,event.account_name,event.bank_code,
+             event.template_version,json.dumps(diagnostics,ensure_ascii=False),
+             json.dumps(refs,ensure_ascii=False),len(refs) or 1,
+             json.dumps([observation]),now,now))
+        return event_id
+    old_type, old_diag, old_refs_json, rev, cycle, keys_json, old_template = row
+    if (old_type == 'statement_recorded') != (event.event_type == 'statement_recorded'):
+        raise ValueError('cannot change statement event into quality case')
+    old_refs = json.loads(old_refs_json or '[]')
+    keys = set(json.loads(keys_json or '[]'))
+    if not keys:
+        # Seed legacy events lazily within this write transaction.
+        keys.add(_observation_key(json.loads(old_diag or '[]'), old_refs, old_template))
+    repeated = observation in keys
+    if event.event_type == 'statement_recorded':
+        # A financial field can change back to a prior value: notify that change too.
+        repeated = observation == _observation_key(json.loads(old_diag or '[]'), old_refs, old_template)
+    if repeated:
+        cur.execute('UPDATE quality_events SET observation_keys_json=? WHERE event_id=?',
+                    (json.dumps(sorted(keys)), event_id))
+        return event_id
+    keys.add(observation)
+    merged = _dedupe_evidence_refs(old_refs, refs)
+    new_cycle = cycle + 1 if old_type == 'quality_resolved' else cycle
+    cur.execute("""UPDATE quality_events SET event_type=?,account_name=COALESCE(?,account_name),
+        bank_code=COALESCE(?,bank_code),template_version=COALESCE(?,template_version),
+        diagnostics_json=?,evidence_refs_json=?,occurrence_count=?,revision=?,cycle_id=?,
+        observation_keys_json=?,last_seen_at=?,acked_at=NULL,acked_todo_id=NULL WHERE event_id=?""",
+        (event.event_type,event.account_name,event.bank_code,event.template_version,
+         json.dumps(diagnostics,ensure_ascii=False),json.dumps(merged,ensure_ascii=False),
+         len(merged) or 1,rev+1,new_cycle,json.dumps(sorted(keys)),now,event_id))
     return event_id
-
 
 def upsert_quality_event(db_path: str, event: 'QualityEventRecord') -> str:
     """独立连接版本（供工具/测试使用）；主路径在 save_statement_with_transactions 事务内调用。"""
@@ -458,7 +522,7 @@ def upsert_quality_event(db_path: str, event: 'QualityEventRecord') -> str:
         conn.close()
 
 
-def get_unacked_quality_events(db_path: str, limit: int = 100) -> list:
+def get_unacked_quality_events(db_path: str, limit: int = 100, event_types=None) -> list:
     """未确认质量事件（只读），按最近发生排序。
     若数据库文件不存在或缺少 quality_events 表，显式向上抛出异常，
     由外层转为结构化错误回执，严禁静默吞掉异常伪装为空队列。"""
@@ -467,37 +531,46 @@ def get_unacked_quality_events(db_path: str, limit: int = 100) -> list:
     conn = sqlite3.connect(f'file:{db_path}?mode=ro', uri=True)
     conn.row_factory = sqlite3.Row
     try:
-        rows = conn.execute(
-            """SELECT * FROM quality_events WHERE acked_at IS NULL
-               ORDER BY last_seen_at DESC LIMIT ?""", (limit,)).fetchall()
+        where = 'acked_at IS NULL'
+        params = []
+        if event_types is not None:
+            if not event_types:
+                return []
+            where += ' AND event_type IN (' + ','.join('?' for _ in event_types) + ')'
+            params.extend(event_types)
+        rows = conn.execute('SELECT * FROM quality_events WHERE ' + where +
+                            ' ORDER BY last_seen_at, event_id LIMIT ?', params + [limit]).fetchall()
         return [dict(r) for r in rows]
     finally:
         conn.close()
 
 
-def ack_quality_event(db_path: str, event_id: str, todo_id: str) -> dict:
-    """幂等确认事件：未确认则确认；已确认且 todo_id 一致 no-op；事件不存在返回 not_found。"""
-    now = _utc_now_iso()
+def ack_quality_event(db_path: str, event_id: str, todo_id: str, revision: Optional[int] = None) -> dict:
+    """Exact version CAS; delivery ack does not advance the occurrence cycle."""
+    result = {'acked': False, 'event_id': event_id, 'todo_id': todo_id, 'revision': revision}
+    if not isinstance(revision, int) or isinstance(revision, bool) or revision < 1:
+        return {**result, 'reason': 'revision_required'}
+    if not event_id or not todo_id:
+        return {**result, 'reason': 'identity_required'}
     conn = sqlite3.connect(db_path)
     try:
         conn.execute('BEGIN IMMEDIATE')
-        cur = conn.cursor()
-        cur.execute("SELECT event_id, acked_todo_id FROM quality_events WHERE event_id = ?", (event_id,))
-        row = cur.fetchone()
+        row = conn.execute('SELECT acked_todo_id,acked_at,revision FROM quality_events WHERE event_id=?',
+                           (event_id,)).fetchone()
         if row is None:
-            conn.rollback()
-            return {'acked': False, 'event_id': event_id, 'todo_id': todo_id, 'reason': 'not_found'}
-        if row[1] == todo_id:
-            conn.rollback()  # 已被同一 todo 确认，幂等 no-op
-            return {'acked': True, 'event_id': event_id, 'todo_id': todo_id, 'reason': 'already_acked'}
-        cur.execute("UPDATE quality_events SET acked_at = ?, acked_todo_id = ? WHERE event_id = ? AND acked_at IS NULL",
-                    (now, todo_id, event_id))
+            return {**result, 'reason': 'not_found'}
+        owner, acked_at, current = row
+        if revision != current:
+            return {**result, 'current_revision': current,
+                    'reason': 'stale_revision' if revision < current else 'revision_mismatch'}
+        if acked_at is not None:
+            return {**result, 'acked': owner == todo_id,
+                    'reason': 'already_acked' if owner == todo_id else 'owner_mismatch'}
+        cur = conn.execute("""UPDATE quality_events SET acked_at=?,acked_todo_id=?
+            WHERE event_id=? AND revision=? AND acked_at IS NULL""",
+            (_utc_now_iso(),todo_id,event_id,revision))
         conn.commit()
-        return {'acked': bool(cur.rowcount), 'event_id': event_id, 'todo_id': todo_id,
-                'reason': 'acked' if cur.rowcount else 'already_acked'}
-    except Exception:
-        conn.rollback()
-        raise
+        return {**result, 'acked': cur.rowcount == 1, 'reason': 'acked'}
     finally:
         conn.close()
 
@@ -690,7 +763,8 @@ def save_statement_with_transactions(db_path: str, s: StatementRecord,
                 diagnostics=[],
                 evidence_refs=[{'kind': 'statement', 'statement_id': statement_id,
                                 'account': s.account_name, 'uid': str(s.uid),
-                                'message_id': s.message_id}],
+                                'message_id': s.message_id, 'due_date': s.due_date,
+                                'total_due': s.total_due}],
             ))
 
         for ev in (quality_events or []):

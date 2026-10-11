@@ -170,31 +170,35 @@ class TestSuspiciousStatement(unittest.TestCase):
 class TestQualityEventLifecycle(TempDbMixin, unittest.TestCase):
     """回归矩阵：同一异常重复/并发/重启重投 → 一条 Todo；影响计数按稳定身份去重。"""
 
-    def _event(self, case_key='k1', event_type='quality_detected'):
+    def _event(self, case_key='k1', event_type='quality_detected', uid='U1'):
         return QualityEventRecord(
             case_key=case_key, event_type=event_type, account_name='acc',
             bank_code='CMB', template_version='CMB_TEMPLATE_V1.20261011',
             diagnostics=[Diagnostic(code='CURRENCY_UNKNOWN', field='original_currency',
                                     reason='r', affected_purposes=['fx_analysis'])],
-            evidence_refs=[{'kind': 'statement', 'uid': 'U1'}])
+            evidence_refs=[{'kind': 'statement', 'uid': uid}])
 
     def test_repeated_scans_update_not_insert(self):
         for _ in range(3):
             sd.upsert_quality_event(self.db, self._event())
         events = sd.get_unacked_quality_events(self.db)
         self.assertEqual(len(events), 1)
-        self.assertEqual(events[0]['occurrence_count'], 3)
+        self.assertEqual(events[0]['occurrence_count'], 1)
+        self.assertEqual(events[0]['revision'], 1)
         self.assertEqual(events[0]['event_type'], 'quality_detected')
 
     def test_ack_idempotent_and_relapse_reopens(self):
         eid = sd.upsert_quality_event(self.db, self._event())
-        first = sd.ack_quality_event(self.db, eid, 'T1')
-        again = sd.ack_quality_event(self.db, eid, 'T1')
+        first = sd.ack_quality_event(self.db, eid, 'T1', revision=1)
+        again = sd.ack_quality_event(self.db, eid, 'T1', revision=1)
         self.assertTrue(first['acked'])
         self.assertEqual(again['reason'], 'already_acked')
         self.assertEqual(len(sd.get_unacked_quality_events(self.db)), 0)
-        # 复发：同 case 再来 → ack 清除，事件重新可见（新发生周期）
+        # Delivery ack is not resolution, and re-scanning old evidence is silent.
         sd.upsert_quality_event(self.db, self._event())
+        self.assertEqual(sd.get_unacked_quality_events(self.db), [])
+        sd.upsert_quality_event(self.db, self._event(event_type='quality_resolved'))
+        sd.upsert_quality_event(self.db, self._event(uid='U2'))
         reopened = sd.get_unacked_quality_events(self.db)
         self.assertEqual(len(reopened), 1)
         self.assertEqual(reopened[0]['event_id'], eid)
@@ -203,6 +207,183 @@ class TestQualityEventLifecycle(TempDbMixin, unittest.TestCase):
         k1 = mq.make_case_key('acc1', 'CMB', 'v1', 'CURRENCY_UNKNOWN', 'original_currency')
         k2 = mq.make_case_key('acc2', 'CMB', 'v1', 'CURRENCY_UNKNOWN', 'original_currency')
         self.assertNotEqual(k1, k2)  # 不同账户不共享 case（证据不互相泄露）
+
+    def test_evidence_refs_deduped_across_repeated_scans(self):
+        """R3 契约：重复扫描同一封邮件证据不重复累加，不同邮件证据合并去重。"""
+        ev1 = QualityEventRecord(
+            case_key='k_dedup', event_type='quality_detected', account_name='acc',
+            bank_code='CMB', template_version='v1',
+            diagnostics=[Diagnostic(code='ERR', field='f', reason='r')],
+            evidence_refs=[{'kind': 'statement', 'account': 'acc', 'uid': '101', 'message_id': '<m1@b>'}]
+        )
+        sd.upsert_quality_event(self.db, ev1)
+        # 重复扫描完全相同的邮件
+        sd.upsert_quality_event(self.db, ev1)
+        # 扫描第二封不同邮件
+        ev2 = QualityEventRecord(
+            case_key='k_dedup', event_type='quality_detected', account_name='acc',
+            bank_code='CMB', template_version='v1',
+            diagnostics=[Diagnostic(code='ERR', field='f', reason='r')],
+            evidence_refs=[{'kind': 'statement', 'account': 'acc', 'uid': '102', 'message_id': '<m2@b>'}]
+        )
+        sd.upsert_quality_event(self.db, ev2)
+
+        events = sd.get_unacked_quality_events(self.db)
+        self.assertEqual(len(events), 1)
+        e = events[0]
+        # occurrence_count counts unique affected emails, not scans
+        self.assertEqual(e['occurrence_count'], 2)
+        # 证据引用按 (account, uid, message_id) 严格去重，仅 2 项
+        import json
+        refs = json.loads(e['evidence_refs_json'])
+        self.assertEqual(len(refs), 2)
+        uids = {r['uid'] for r in refs}
+        self.assertEqual(uids, {'101', '102'})
+
+    def test_monotonic_revision_and_stale_ack_rejection(self):
+        """R3 契约：单调递增 revision，旧版本确认拒绝，防止吞掉新事件。"""
+        eid = sd.upsert_quality_event(self.db, self._event('k_rev'))
+        events = sd.get_unacked_quality_events(self.db)
+        self.assertEqual(events[0]['revision'], 1)
+        self.assertEqual(events[0]['cycle_id'], 1)
+
+        # 生产者更新事件（发生未解决问题更新）
+        sd.upsert_quality_event(self.db, self._event('k_rev', uid='U2'))
+        events = sd.get_unacked_quality_events(self.db)
+        self.assertEqual(events[0]['revision'], 2)
+
+        # 消费者试图用旧 revision=1 确认 -> 必须拒绝
+        stale_ack = sd.ack_quality_event(self.db, eid, 'T_STALE', revision=1)
+        self.assertFalse(stale_ack['acked'])
+        self.assertEqual(stale_ack['reason'], 'stale_revision')
+        self.assertEqual(stale_ack['current_revision'], 2)
+
+        # 事件仍然未被确认，继续对消费者可见
+        self.assertEqual(len(sd.get_unacked_quality_events(self.db)), 1)
+
+        # 用匹配的最新 revision=2 确认 -> 成功
+        good_ack = sd.ack_quality_event(self.db, eid, 'T_GOOD', revision=2)
+        self.assertTrue(good_ack['acked'])
+        self.assertEqual(len(sd.get_unacked_quality_events(self.db)), 0)
+
+    def test_relapse_increments_cycle_id_and_reopens(self):
+        """Only explicit resolution followed by new evidence opens a new cycle."""
+        eid = sd.upsert_quality_event(self.db, self._event('k_cycle'))
+        sd.ack_quality_event(self.db, eid, 'T1', revision=1)
+        self.assertEqual(len(sd.get_unacked_quality_events(self.db)), 0)
+
+        sd.upsert_quality_event(self.db, self._event('k_cycle', event_type='quality_resolved'))
+        # New email after resolution, rather than the same old observation.
+        sd.upsert_quality_event(self.db, self._event('k_cycle', uid='U2'))
+        events = sd.get_unacked_quality_events(self.db)
+        self.assertEqual(len(events), 1)
+        reopened = events[0]
+        self.assertEqual(reopened['event_id'], eid)
+        self.assertEqual(reopened['cycle_id'], 2)
+        self.assertEqual(reopened['revision'], 3)
+        self.assertIsNone(reopened['acked_at'])
+
+    def test_quality_resolved_lifecycle(self):
+        """R3 契约：显式解决事件将类型置为 quality_resolved，清除诊断，revision 递增。"""
+        eid = sd.upsert_quality_event(self.db, self._event('k_res'))
+        res_event = QualityEventRecord(
+            case_key='k_res', event_type='quality_resolved', account_name='acc',
+            bank_code='CMB', template_version='v1', diagnostics=[], evidence_refs=[]
+        )
+        sd.upsert_quality_event(self.db, res_event)
+        events = sd.get_unacked_quality_events(self.db)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]['event_type'], 'quality_resolved')
+        self.assertEqual(events[0]['revision'], 2)
+
+    def test_uid_drift_and_report_path_do_not_count_as_new_email(self):
+        event = self._event('drift')
+        event.evidence_refs = [{'account':'acc','uid':'1','message_id':'<m@b>','report_path':'one'}]
+        eid = sd.upsert_quality_event(self.db,event)
+        sd.ack_quality_event(self.db,eid,'T',revision=1)
+        event.evidence_refs[0].update(uid='999',report_path='two')
+        sd.upsert_quality_event(self.db,event)
+        self.assertEqual(sd.get_unacked_quality_events(self.db),[])
+        conn=sqlite3.connect(self.db)
+        self.assertEqual(conn.execute('SELECT revision,cycle_id,occurrence_count FROM quality_events').fetchone(),(1,1,1))
+        conn.close()
+
+    def test_exact_ack_rejects_missing_future_and_wrong_owner(self):
+        eid=sd.upsert_quality_event(self.db,self._event())
+        self.assertEqual(sd.ack_quality_event(self.db,eid,'T')['reason'],'revision_required')
+        self.assertFalse(sd.ack_quality_event(self.db,eid,'T',revision=2)['acked'])
+        self.assertTrue(sd.ack_quality_event(self.db,eid,'T',revision=1)['acked'])
+        self.assertFalse(sd.ack_quality_event(self.db,eid,'T',revision=2)['acked'])
+        self.assertFalse(sd.ack_quality_event(self.db,eid,'other',revision=1)['acked'])
+
+    def test_new_evidence_after_ack_stays_same_unresolved_cycle(self):
+        eid=sd.upsert_quality_event(self.db,self._event())
+        sd.ack_quality_event(self.db,eid,'T',revision=1)
+        sd.upsert_quality_event(self.db,self._event(uid='U2'))
+        event=sd.get_unacked_quality_events(self.db)[0]
+        self.assertEqual((event['revision'],event['cycle_id'],event['occurrence_count']),(2,1,2))
+        self.assertFalse(sd.ack_quality_event(self.db,eid,'T',revision=1)['acked'])
+
+    def test_old_observation_and_resolution_cannot_reopen_or_close_new_cycle(self):
+        sd.upsert_quality_event(self.db,self._event())
+        resolved=self._event(event_type='quality_resolved')
+        sd.upsert_quality_event(self.db,resolved)
+        sd.upsert_quality_event(self.db,self._event())
+        self.assertEqual(sd.get_unacked_quality_events(self.db)[0]['event_type'],'quality_resolved')
+        sd.upsert_quality_event(self.db,self._event(uid='U2'))
+        with self.assertRaises(ValueError):
+            sd.upsert_quality_event(self.db,resolved)
+        event=sd.get_unacked_quality_events(self.db)[0]
+        self.assertEqual((event['event_type'],event['cycle_id'],event['revision']),('quality_detected',2,3))
+
+    def test_statement_updates_after_ack_keep_type_and_do_not_starve_quality(self):
+        statement=self._event('statement',event_type='statement_recorded')
+        eid=sd.upsert_quality_event(self.db,statement)
+        sd.ack_quality_event(self.db,eid,'B',revision=1)
+        statement.evidence_refs[0]['due_date']='2026-12-01'
+        sd.upsert_quality_event(self.db,statement)
+        sd.upsert_quality_event(self.db,self._event('quality'))
+        all_events=sd.get_unacked_quality_events(self.db)
+        self.assertIn('statement_recorded',{e['event_type'] for e in all_events})
+        only_quality=sd.get_unacked_quality_events(self.db,limit=1,event_types=('quality_detected',))
+        self.assertEqual(only_quality[0]['case_key'],'quality')
+
+    def test_concurrent_same_observation_is_one_revision(self):
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=6) as executor:
+            list(executor.map(lambda _: sd.upsert_quality_event(self.db,self._event()), range(18)))
+        event=sd.get_unacked_quality_events(self.db)[0]
+        self.assertEqual((event['revision'],event['cycle_id'],event['occurrence_count']),(1,1,1))
+
+    def test_changed_content_same_message_can_recur_but_not_inflate_email_count(self):
+        event=self._event('content')
+        event.evidence_refs[0]['content_hash']='old'
+        sd.upsert_quality_event(self.db,event)
+        sd.upsert_quality_event(self.db,self._event('content',event_type='quality_resolved'))
+        event.evidence_refs[0]['content_hash']='new'
+        sd.upsert_quality_event(self.db,event)
+        row=sd.get_unacked_quality_events(self.db)[0]
+        self.assertEqual((row['revision'],row['cycle_id'],row['occurrence_count']),(3,2,1))
+
+    def test_concurrent_schema_migrations_are_atomic_and_idempotent(self):
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=6) as executor:
+            list(executor.map(lambda _: sd.init_db(self.db),range(12)))
+        sd.upsert_quality_event(self.db,self._event())
+        self.assertEqual(sd.get_unacked_quality_events(self.db)[0]['revision'],1)
+
+    def test_statement_field_change_back_to_prior_value_is_deliverable(self):
+        event=self._event('statement-back',event_type='statement_recorded')
+        event.evidence_refs[0]['due_date']='2026-10-28'
+        eid=sd.upsert_quality_event(self.db,event)
+        sd.ack_quality_event(self.db,eid,'B',revision=1)
+        event.evidence_refs[0]['due_date']='2026-10-29'
+        sd.upsert_quality_event(self.db,event)
+        sd.ack_quality_event(self.db,eid,'B',revision=2)
+        event.evidence_refs[0]['due_date']='2026-10-28'
+        sd.upsert_quality_event(self.db,event)
+        row=sd.get_unacked_quality_events(self.db)[0]
+        self.assertEqual((row['event_type'],row['revision'],row['cycle_id']),('statement_recorded',3,1))
 
 
 class TestCoverageGap(TempDbMixin, unittest.TestCase):
@@ -256,7 +437,8 @@ class TestStatementRecordedAndPaidProtection(TempDbMixin, unittest.TestCase):
         sd.save_statement_with_transactions(self.db, s2, [])
         evs3 = sd.get_unacked_quality_events(self.db)
         rec3 = [e for e in evs3 if e['event_type'] == 'statement_recorded'][0]
-        self.assertEqual(rec3['occurrence_count'], 2)
+        self.assertEqual(rec3['occurrence_count'], 1)
+        self.assertEqual(rec3['revision'], 2)
 
     def test_is_paid_not_regressed_on_resave(self):
         s = self._mk_statement()
