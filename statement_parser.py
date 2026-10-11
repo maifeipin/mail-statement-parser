@@ -25,7 +25,9 @@ from statement_db import (
     init_db, upsert_statement, save_validation_run, replace_transactions,
     save_statement_with_transactions, find_message_id_conflicts, MessageIdentityConflict,
     upsert_quality_event, capture_quality_cases, confirm_quality_sources,
+    find_canonical_by_transport, associate_transport_identity, get_transport_identity, save_statement_evidence_index, get_statement_evidence,
 )
+import statement_identity as si
 from mail_parse import decode_mime, _to_text, extract_email_content, _parse_email_datetime
 from mail_quality import (
     split_markdown_table_blocks, dedupe_table_blocks, structure_fingerprint,
@@ -752,7 +754,7 @@ def _validation_result_to_dict(vr):
         ],
     }
 
-def validate_and_save_email_message(msg, uid, rules=None, account_name=None, *, context=None):
+def validate_and_save_email_message(msg, uid, rules=None, account_name=None, *, context=None, raw_bytes=None, transport_kind='pop3_uidl', is_synthesized=False):
     """从已下载的 msg 解析、校验并落库账单（三态分流）。
 
     返回 dict，status 取值：
@@ -787,6 +789,7 @@ def validate_and_save_email_message(msg, uid, rules=None, account_name=None, *, 
 
     account_name = account_name or 'default'
     try:
+        out = None
         subj = decode_mime(msg.get('Subject', ''))
         frm = decode_mime(msg.get('From', ''))
         content = extract_email_content(msg)
@@ -854,14 +857,161 @@ def validate_and_save_email_message(msg, uid, rules=None, account_name=None, *, 
 
         bank_code = _to_text(rule.get('bank_code', ''))
 
-        # Message-ID 冲突检测：同账户+银行+Message-ID 但 uid 不同 → 记录冲突告警，不静默覆盖
+        # 1. 优先查 statement_transport_identities: 当前 uid 是否已有关联记录 (R3 严格核验内容)
+        canonical = find_canonical_by_transport(
+            context.db_path, account_name, str(uid), bank_code=bank_code, transport_kind=transport_kind
+        )
+        if canonical:
+            # U3: Parser 调用统一事务服务 associate_transport_identity，复用内容等价规范化规则
+            source_ev = si.build_evidence_from_email_message(
+                msg, raw_bytes=raw_bytes, account_name=account_name, bank_code=bank_code,
+                transport_kind=transport_kind, transport_uid=str(uid), is_synthesized=is_synthesized
+            )
+            assoc_res = associate_transport_identity(
+                context.db_path,
+                account_name=account_name,
+                transport_kind=transport_kind,
+                transport_uid=str(uid),
+                bank_code=bank_code,
+                statement_id=canonical['id'],
+                message_id=message_id,
+                source_raw_bytes=raw_bytes,
+                source_evidence=source_ev,
+                evidence_digest=source_ev.get('complete_content_digest'),
+                raw_content_hash=source_ev.get('raw_content_hash'),
+                method='digest_equal',
+                actor='parser_sync',
+                reason='canonical identity verification'
+            )
+            if assoc_res.get('status') in ('already_associated', 'associated'):
+                return {
+                    'status': 'associated_existing',
+                    'statement_id': canonical['id'],
+                    'uid': str(uid),
+                    'bank_code': bank_code,
+                    'message_id': message_id,
+                    'idempotent': True,
+                }
+            elif assoc_res.get('status') == 'repeated_key_unverified':
+                return {
+                    'status': 'repeated_key_unverified',
+                    'statement_id': canonical['id'],
+                    'uid': str(uid),
+                    'bank_code': bank_code,
+                    'message_id': message_id,
+                    'idempotent': True,
+                }
+
+        # 2. Message-ID 冲突检测与内容证据比对 (R3 候选必须唯一，R5 归档闭环)
         conflicts = find_message_id_conflicts(context.db_path, account_name, message_id, bank_code, str(uid))
         if conflicts:
+            if len(conflicts) > 1:
+                print(f"⚠️ 多锚点歧义冲突：存在 {len(conflicts)} 个相同 Message-ID 的历史账单，拒绝盲目自动关联")
+                vr.errors.append(ValidationIssue(
+                    code='MESSAGE_ID_CONFLICT', field='message_id', severity='error',
+                    left=str(uid), right=','.join(str(c['uid']) for c in conflicts), op='ne'))
+                return {
+                    'status': 'identity_conflict',
+                    'error': f'Multiple conflicting anchor statements ({len(conflicts)}) exist for Message-ID {message_id}',
+                    'conflict_ids': [c['id'] for c in conflicts]
+                }
+
             conflict_uids = ','.join(str(c['uid']) for c in conflicts)
-            vr.warnings.append(ValidationIssue(
-                code='MESSAGE_ID_CONFLICT', field='message_id', severity='warning',
-                left=str(uid), right=conflict_uids, op='ne'))
-            print(f'⚠️ Message-ID 冲突：UID={str(uid)[:24]} 与已存记录 {conflict_uids[:40]} 相同，已记冲突告警')
+            source_ev = si.build_evidence_from_email_message(
+                msg, raw_bytes=raw_bytes, account_name=account_name, bank_code=bank_code,
+                transport_kind=transport_kind, transport_uid=str(uid), is_synthesized=is_synthesized
+            )
+            if raw_bytes and source_ev.get('raw_content_hash'):
+                si.archive_evidence_eml(context.data_root, raw_bytes, source_ev['raw_content_hash'], context=context)
+
+            target_cand = conflicts[0]
+            target_id = target_cand['id']
+            target_uid = target_cand['uid']
+
+            target_raw_bytes = None
+            target_ev_info = get_statement_evidence(context.db_path, target_id)
+            if target_ev_info and target_ev_info.get('archive_path') and os.path.exists(target_ev_info['archive_path']):
+                try:
+                    with open(target_ev_info['archive_path'], 'rb') as fp:
+                        target_raw_bytes = fp.read()
+                except Exception:
+                    pass
+            if not target_raw_bytes:
+                target_eml_path = os.path.join(context.download_dir, f"{target_uid}.eml")
+                if os.path.exists(target_eml_path):
+                    try:
+                        with open(target_eml_path, 'rb') as fp:
+                            target_raw_bytes = fp.read()
+                    except Exception:
+                        pass
+
+            if target_raw_bytes:
+                target_ev = si.build_evidence_from_raw_eml(
+                    target_raw_bytes, account_name=account_name, bank_code=bank_code,
+                    transport_kind=transport_kind, transport_uid=str(target_uid)
+                )
+            else:
+                target_ev = {
+                    'normalization_version': si.NORMALIZATION_VERSION,
+                    'account_name': account_name,
+                    'bank_code': bank_code,
+                    'transport_kind': transport_kind,
+                    'transport_uid': str(target_uid),
+                    'headers': {
+                        'message_id': message_id,
+                        'subject': target_cand['subject'] or '',
+                        'from': '',
+                        'date': '',
+                        'headers_fingerprint': '',
+                    },
+                    'message_id': message_id,
+                    'coverage_status': 'coverage_unknown',
+                    'complete_mime': False,
+                    'complete_content_digest': None,
+                    'comparable_body_digest': None,
+                    'missing_reason': 'target_raw_eml_not_found',
+                }
+
+            decision, reasons, details = si.compare_evidence(source_ev, target_ev)
+            if decision == 'associated_existing':
+                associate_transport_identity(
+                    context.db_path,
+                    account_name=account_name,
+                    transport_kind=transport_kind,
+                    transport_uid=str(uid),
+                    bank_code=bank_code,
+                    statement_id=target_id,
+                    message_id=message_id,
+                    evidence_digest=source_ev.get('complete_content_digest'),
+                    evidence_version=si.NORMALIZATION_VERSION,
+                    raw_content_hash=source_ev.get('raw_content_hash'),
+                    method='digest_equal',
+                    actor='auto_sync',
+                    reason='content digest equal',
+                    source_evidence=source_ev,
+                    target_evidence=target_ev,
+                    source_raw_bytes=raw_bytes,
+                )
+                print(f'🔗 运输身份自动关联成功：UID={str(uid)[:20]} 关联至既有账单 id={target_id}')
+                return {
+                    'status': 'associated_existing',
+                    'statement_id': target_id,
+                    'uid': str(uid),
+                    'bank_code': bank_code,
+                    'message_id': message_id,
+                    'method': 'digest_equal',
+                    'idempotent': False,
+                }
+            elif decision == 'identity_conflict':
+                print(f'⚠️ Message-ID 冲突：UID={str(uid)[:24]} 与已存记录 {conflict_uids[:40]} 相同，但内容存在差异')
+                vr.errors.append(ValidationIssue(
+                    code='MESSAGE_ID_CONFLICT', field='message_id', severity='error',
+                    left=str(uid), right=conflict_uids, op='ne'))
+            else:
+                print(f'⚠️ Message-ID 冲突且证据不足：UID={str(uid)[:24]}，原因：{"; ".join(reasons)}')
+                vr.warnings.append(ValidationIssue(
+                    code='INSUFFICIENT_EVIDENCE', field='message_id', severity='warning',
+                    left=str(uid), right=conflict_uids, op='ne'))
 
         validation_dict = _validation_result_to_dict(vr)
         parse_status = 'ok' if vr.passed else 'failed'
@@ -1071,6 +1221,50 @@ def validate_and_save_email_message(msg, uid, rules=None, account_name=None, *, 
             },
         )
 
+        # 建立证据索引并归档不可变 EML 原文 (E1 R3, R5)
+        if raw_bytes and statement_id:
+            try:
+                source_ev = si.build_evidence_from_email_message(
+                    msg, raw_bytes=raw_bytes, account_name=account_name, bank_code=bank_code,
+                    transport_kind=transport_kind, transport_uid=str(uid), is_synthesized=is_synthesized
+                )
+                raw_hash = source_ev.get("raw_content_hash")
+                if raw_hash:
+                    archive_path = si.archive_evidence_eml(context.data_root, raw_bytes, raw_hash, context=context)
+                    save_statement_evidence_index(
+                        context.db_path,
+                        statement_id=statement_id,
+                        account_name=account_name,
+                        bank_code=bank_code,
+                        message_id=message_id,
+                        raw_content_hash=raw_hash,
+                        evidence_digest=source_ev.get("complete_content_digest") or "",
+                        coverage_status=source_ev.get("coverage_status") or "coverage_unknown",
+                        archive_path=archive_path,
+                        evidence_version=si.NORMALIZATION_VERSION
+                    )
+                    associate_transport_identity(
+                        context.db_path,
+                        account_name=account_name,
+                        transport_kind=transport_kind,
+                        transport_uid=str(uid),
+                        bank_code=bank_code,
+                        statement_id=statement_id,
+                        message_id=message_id,
+                        evidence_digest=source_ev.get("complete_content_digest"),
+                        evidence_version=si.NORMALIZATION_VERSION,
+                        raw_content_hash=raw_hash,
+                        method="digest_equal",
+                        actor="auto_sync",
+                        reason="initial statement parse",
+                        source_evidence=source_ev,
+                        target_evidence=source_ev
+                    )
+            except Exception as e_ev:
+                ev_err = f"证据归档/索引失败: {e_ev}"
+                vr.warnings.append(ValidationIssue(code='EVIDENCE_INDEX_FAILED', field='evidence', severity='warning'))
+                print(f"⚠️ {ev_err}")
+
         run_id = save_validation_run(
             context.db_path,
             account_name,
@@ -1101,6 +1295,7 @@ def validate_and_save_email_message(msg, uid, rules=None, account_name=None, *, 
             'template_version': template_version,
             'message_id': message_id,
             'parse_status': parse_status,
+            'evidence_status': 'failed' if any(getattr(w, 'code', None) == 'EVIDENCE_INDEX_FAILED' for w in vr.warnings) else 'indexed',
             'diagnostics': [d.to_dict() for d in diagnostics],
             'txn_stats': txn_stats,
             'purpose_availability': quality_data['purpose_availability'],
@@ -1111,9 +1306,12 @@ def validate_and_save_email_message(msg, uid, rules=None, account_name=None, *, 
         # Keep the new transport's original body/report and validation audit;
         # reject duplicate financial rows rather than overwriting old evidence.
         issue = ValidationIssue(code='MESSAGE_ID_CONFLICT', field='message_id', severity='error')
-        run_id = save_validation_run(context.db_path, account_name, uid=str(uid), bank_code=bank_code,
-                    rule_id=_to_text(rule.get('rule_id', '')), passed=False, report_path=out,
-                    errors=[issue], warnings=vr.warnings)
+        bank_c = bank_code if 'bank_code' in locals() else ''
+        rule_c = _to_text(rule.get('rule_id', '')) if ('rule' in locals() and rule) else ''
+        warns = vr.warnings if 'vr' in locals() else []
+        run_id = save_validation_run(context.db_path, account_name, uid=str(uid), bank_code=bank_c,
+                    rule_id=rule_c, passed=False, report_path=out or '',
+                    errors=[issue], warnings=warns)
         print(f'身份冲突：{exc}；原账单及交易保持不变，已归档新邮件证据')
         return {'status': 'identity_conflict', 'run_id': run_id, 'report_path': out, 'error': str(exc)}
     except Exception as e:

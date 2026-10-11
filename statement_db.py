@@ -6,7 +6,7 @@ import hashlib
 import json
 import sqlite3
 from datetime import datetime, timedelta, timezone
-from typing import Iterable, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from statement_models import (StatementRecord, ValidationIssue, StatementTransactionRecord,
                               EmailSummaryRecord, QualityEventRecord, StatementBalanceRecord)
@@ -365,6 +365,78 @@ def init_db(db_path: str) -> None:
             )
         """)
 
+        # ---------- 运输身份映射与审计（E1 契约 §4, §10） ----------
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS statement_transport_identities (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_name TEXT NOT NULL,
+                transport_kind TEXT NOT NULL,
+                transport_uid TEXT NOT NULL,
+                bank_code TEXT NOT NULL,
+                statement_id INTEGER NOT NULL,
+                message_id TEXT NOT NULL,
+                evidence_digest TEXT,
+                evidence_version TEXT NOT NULL DEFAULT 'v1',
+                raw_content_hash TEXT,
+                method TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(statement_id) REFERENCES statements(id),
+                UNIQUE(account_name, transport_kind, transport_uid, bank_code)
+            )
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_stmt_trans_sid ON statement_transport_identities(statement_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_stmt_trans_lookup ON statement_transport_identities(account_name, transport_uid)")
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS statement_identity_audit (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                batch_id TEXT NOT NULL,
+                plan_id TEXT,
+                plan_hash TEXT,
+                action TEXT NOT NULL,
+                account_name TEXT NOT NULL,
+                transport_kind TEXT NOT NULL,
+                transport_uid TEXT NOT NULL,
+                bank_code TEXT NOT NULL,
+                statement_id INTEGER NOT NULL,
+                old_statement_id INTEGER,
+                new_statement_id INTEGER,
+                message_id TEXT NOT NULL,
+                normalization_version TEXT NOT NULL,
+                source_raw_hash TEXT,
+                source_digest TEXT,
+                target_raw_hash TEXT,
+                target_digest TEXT,
+                coverage_status TEXT,
+                missing_reason TEXT,
+                method TEXT NOT NULL,
+                actor TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_stmt_audit_sid ON statement_identity_audit(statement_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_stmt_audit_uid ON statement_identity_audit(account_name, transport_uid)")
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS statement_evidence_index (
+                statement_id INTEGER PRIMARY KEY,
+                account_name TEXT NOT NULL,
+                bank_code TEXT NOT NULL,
+                message_id TEXT NOT NULL,
+                raw_content_hash TEXT NOT NULL,
+                evidence_digest TEXT NOT NULL,
+                evidence_version TEXT NOT NULL DEFAULT 'v1',
+                coverage_status TEXT NOT NULL,
+                archive_path TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(statement_id) REFERENCES statements(id)
+            )
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_stmt_ev_msg ON statement_evidence_index(account_name, bank_code, message_id)")
+
+
         # 历史账单还款状态不再由 init_db 推断：到期日已过不构成还款证据，
         # is_paid 仅通过显式标记（mark_paid / 清洗继承）变更。
 
@@ -689,7 +761,14 @@ def save_statement_with_transactions(db_path: str, s: StatementRecord,
                         (s.account_name, s.bank_code, s.message_id, str(s.uid)))
             conflicts = [row[0] for row in cur.fetchall()]
             if conflicts:
-                raise MessageIdentityConflict('Message-ID already belongs to statement IDs ' + str(conflicts))
+                cur.execute(
+                    "SELECT statement_id FROM statement_transport_identities WHERE account_name=? AND transport_uid=? AND bank_code=?",
+                    (s.account_name, str(s.uid), s.bank_code)
+                )
+                mapped_sids = {row[0] for row in cur.fetchall()}
+                unmapped = [cid for cid in conflicts if cid not in mapped_sids]
+                if unmapped:
+                    raise MessageIdentityConflict('Message-ID already belongs to statement IDs ' + str(unmapped))
 
         incoming_status = s.parse_status or 'ok'
         # R1 核心保护：若已有账单为合法账单 (parse_status='ok')，重解析失败 (parse_status!='ok')
@@ -833,6 +912,7 @@ def find_message_id_conflicts(db_path: str, account_name: str, message_id: str,
     """同账户+银行+Message-ID 但 uid 不同的已存账单（疑似重复投递/重复入库）。
 
     仅检测并交由调用方记录冲突告警，绝不静默覆盖。message_id 为空时直接返回空。
+    排除已合法映射到目标账单的别名 UID。
     """
     if not message_id:
         return []
@@ -849,7 +929,23 @@ def find_message_id_conflicts(db_path: str, account_name: str, message_id: str,
             """,
             (account_name, bank_code, message_id, str(uid)),
         )
-        return list(cur.fetchall())
+        candidates = list(cur.fetchall())
+        if not candidates:
+            return []
+        try:
+            cur.execute(
+                """
+                SELECT statement_id FROM statement_transport_identities
+                WHERE account_name = ? AND transport_uid = ? AND bank_code = ?
+                """,
+                (account_name, str(uid), bank_code)
+            )
+            mapped_sids = {row[0] for row in cur.fetchall()}
+            if mapped_sids:
+                candidates = [c for c in candidates if c['id'] not in mapped_sids]
+        except sqlite3.OperationalError:
+            pass
+        return candidates
     finally:
         conn.close()
 
@@ -982,25 +1078,34 @@ def replace_transactions(db_path: str, account_name: str, uid: str, bank_code: s
 
 
 def uid_exists(db_path: str, uid: str, account_name: str = None) -> bool:
-    """检查 uid 是否已存在于 statements 表。
-
-    若提供 account_name，则先通过 email_summaries 找到对应 bank_code，
-    再精确匹配 uid + bank_code（防跨账户 UID 碰撞）。
-    """
+    """检查 uid 是否已存在于 statements 表或已关联别名表。"""
     conn = sqlite3.connect(db_path)
     try:
         cur = conn.cursor()
         if account_name:
-            # statements 现自带 account_name，直查（不再桥接 email_summaries）
             cur.execute(
                 "SELECT 1 FROM statements WHERE account_name = ? AND uid = ? LIMIT 1",
-                (account_name, uid)
+                (account_name, str(uid))
             )
-            return cur.fetchone() is not None
+            if cur.fetchone() is not None:
+                return True
+            try:
+                cur.execute(
+                    "SELECT 1 FROM statement_transport_identities WHERE account_name = ? AND transport_uid = ? LIMIT 1",
+                    (account_name, str(uid))
+                )
+                return cur.fetchone() is not None
+            except sqlite3.OperationalError:
+                return False
         else:
-            # 兼容旧调用（无 account_name 上下文）
-            cur.execute("SELECT 1 FROM statements WHERE uid = ? LIMIT 1", (uid,))
-            return cur.fetchone() is not None
+            cur.execute("SELECT 1 FROM statements WHERE uid = ? LIMIT 1", (str(uid),))
+            if cur.fetchone() is not None:
+                return True
+            try:
+                cur.execute("SELECT 1 FROM statement_transport_identities WHERE transport_uid = ? LIMIT 1", (str(uid),))
+                return cur.fetchone() is not None
+            except sqlite3.OperationalError:
+                return False
     finally:
         conn.close()
 
@@ -1524,8 +1629,8 @@ def get_recent_email_headers(db_path: str, limit: int = 15) -> list[sqlite3.Row]
         cur.execute(
             """
             SELECT id, account_name, uid, sender, subject, email_date, category, importance, status, processed_at
-            FROM email_summaries 
-            ORDER BY email_date DESC, id DESC 
+            FROM email_summaries
+            ORDER BY email_date DESC, id DESC
             LIMIT ?
             """,
             (limit,)
@@ -1546,9 +1651,9 @@ def get_potential_missed_emails(db_path: str, limit: int = 15) -> list[sqlite3.R
         cur.execute(
             """
             SELECT id, account_name, uid, sender, subject, email_date, category, importance, summary, status
-            FROM email_summaries 
+            FROM email_summaries
             WHERE importance != 'high' AND category != 'Spam' AND status IN ('processed', 'skipped') AND email_date >= ?
-            ORDER BY email_date DESC, id DESC 
+            ORDER BY email_date DESC, id DESC
             LIMIT ?
             """,
             (cutoff_date, limit)
@@ -1633,6 +1738,588 @@ def confirm_quality_sources(db_path, captured_cases, evidence_ref, current_case_
             current_case_keys, template_version, parser_version, parse_passed, verified_fields)
         conn.commit()
         return results
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def get_transport_identity(db_path: str, account_name: str, transport_kind: str,
+                           transport_uid: str, bank_code: str) -> Optional[dict]:
+    conn = sqlite3.connect(f'file:{db_path}?mode=ro', uri=True)
+    conn.row_factory = sqlite3.Row
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT id, account_name, transport_kind, transport_uid, bank_code, statement_id,
+                   message_id, evidence_digest, evidence_version, raw_content_hash, method,
+                   created_at, updated_at
+            FROM statement_transport_identities
+            WHERE account_name = ? AND transport_kind = ? AND transport_uid = ? AND bank_code = ?
+        """, (account_name, transport_kind, str(transport_uid), bank_code))
+        row = cur.fetchone()
+        return dict(row) if row else None
+    except sqlite3.OperationalError:
+        return None
+    finally:
+        conn.close()
+
+
+def find_canonical_by_transport(db_path: str, account_name: str, transport_uid: str,
+                                bank_code: Optional[str] = None,
+                                transport_kind: Optional[str] = None) -> Optional[sqlite3.Row]:
+    conn = sqlite3.connect(f'file:{db_path}?mode=ro', uri=True)
+    conn.row_factory = sqlite3.Row
+    try:
+        cur = conn.cursor()
+        q = """
+            SELECT s.* FROM statements s
+            JOIN statement_transport_identities ti ON s.id = ti.statement_id
+            WHERE ti.account_name = ? AND ti.transport_uid = ?
+        """
+        params = [account_name, str(transport_uid)]
+        if bank_code:
+            q += " AND ti.bank_code = ?"
+            params.append(bank_code)
+        if transport_kind:
+            q += " AND ti.transport_kind = ?"
+            params.append(transport_kind)
+        cur.execute(q, params)
+        rows = cur.fetchall()
+        if len(rows) > 1:
+            raise MessageIdentityConflict(f'Ambiguous transport identity matches {len(rows)} canonical statements')
+        return rows[0] if rows else None
+    except sqlite3.OperationalError:
+        return None
+    finally:
+        conn.close()
+
+
+
+def save_statement_evidence_index(
+    db_path: str,
+    statement_id: int,
+    account_name: str,
+    bank_code: str,
+    message_id: str,
+    raw_content_hash: str,
+    evidence_digest: str,
+    coverage_status: str,
+    archive_path: Optional[str] = None,
+    evidence_version: str = "v1"
+) -> None:
+    now = _utc_now_iso()
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute('PRAGMA foreign_keys = ON')
+        conn.execute('BEGIN IMMEDIATE')
+        cur = conn.cursor()
+
+        # 验证 statement_id 必须存在于 statements 表
+        cur.execute("SELECT id FROM statements WHERE id = ?", (statement_id,))
+        if not cur.fetchone():
+            raise ValueError(f"Target statement {statement_id} does not exist in statements table")
+
+        cur.execute("""
+            SELECT statement_id, account_name, bank_code, message_id,
+                   raw_content_hash, evidence_digest, evidence_version,
+                   coverage_status, archive_path
+            FROM statement_evidence_index WHERE statement_id = ?
+        """, (statement_id,))
+        existing = cur.fetchone()
+
+        if existing is None:
+            cur.execute("""
+                INSERT INTO statement_evidence_index (
+                    statement_id, account_name, bank_code, message_id,
+                    raw_content_hash, evidence_digest, evidence_version,
+                    coverage_status, archive_path, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (statement_id, account_name, bank_code, message_id,
+                  raw_content_hash, evidence_digest, evidence_version,
+                  coverage_status, archive_path, now))
+        else:
+            ext_cov = existing[7]
+            ext_digest = existing[5]
+            ext_raw_hash = existing[4]
+            ext_archive = existing[8]
+
+            if ext_cov == 'complete':
+                # 基线保护 (T4)：已有完整证据基线，禁止被失败重解析或不完整覆盖降级替换
+                if coverage_status != 'complete':
+                    return
+                # 同为 complete 时验证摘要不可变
+                if ext_digest != evidence_digest or ext_raw_hash != raw_content_hash:
+                    raise ValueError(
+                        f"Cannot overwrite immutable evidence index for statement_id={statement_id}: "
+                        f"existing digest={ext_digest}, raw_hash={ext_raw_hash} != "
+                        f"new digest={evidence_digest}, raw_hash={raw_content_hash}"
+                    )
+                # 幂等合并归档路径
+                if not ext_archive and archive_path:
+                    cur.execute(
+                        "UPDATE statement_evidence_index SET archive_path = ? WHERE statement_id = ?",
+                        (archive_path, statement_id)
+                    )
+            else:
+                # 原记录不完整，新记录达到完整覆盖时允许升级为基线
+                if coverage_status == 'complete':
+                    cur.execute("""
+                        UPDATE statement_evidence_index SET
+                            account_name = ?, bank_code = ?, message_id = ?,
+                            raw_content_hash = ?, evidence_digest = ?, evidence_version = ?,
+                            coverage_status = ?, archive_path = ?
+                        WHERE statement_id = ?
+                    """, (account_name, bank_code, message_id, raw_content_hash,
+                          evidence_digest, evidence_version, coverage_status,
+                          archive_path or ext_archive, statement_id))
+
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_statement_evidence(db_path: str, statement_id: int) -> Optional[Dict[str, Any]]:
+    conn = sqlite3.connect(f'file:{db_path}?mode=ro', uri=True)
+    conn.row_factory = sqlite3.Row
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT statement_id, account_name, bank_code, message_id,
+                   raw_content_hash, evidence_digest, evidence_version,
+                   coverage_status, archive_path, created_at
+            FROM statement_evidence_index
+            WHERE statement_id = ?
+        """, (statement_id,))
+        row = cur.fetchone()
+        if not row:
+            return None
+        return dict(row)
+    finally:
+        conn.close()
+
+
+def _verify_manual_plan(plan_path: Optional[str], plan_id: Optional[str], plan_hash: Optional[str],
+                        statement_id: int, account_name: str, bank_code: str, transport_uid: str,
+                        target_row: Any, db_path: str, *, transport_kind: Optional[str] = None,
+                        source_ev: Optional[dict] = None) -> dict:
+    import statement_identity as si
+    from datetime import datetime, timezone
+
+    if not plan_id or not plan_hash:
+        raise ValueError("manual_verified 必须提供已批准的 plan_id 与 plan_hash")
+
+    # 定位计划报告
+    cand_path = plan_path
+    if not cand_path or not os.path.exists(cand_path):
+        try:
+            from parser_paths import resolve_parser_paths
+            ctx = resolve_parser_paths()
+            cand_path = os.path.join(ctx.data_root, 'identity_reports', f'plan_{plan_id}.json')
+        except Exception:
+            cand_path = None
+
+    if not cand_path or not os.path.exists(cand_path):
+        raise ValueError(f"manual_verified 必须提供受控预览生成的有效计划报告文件 (未找到计划文件或计划未验证: plan_id={plan_id})")
+
+    with open(cand_path, 'r', encoding='utf-8') as fp:
+        plan = json.load(fp)
+
+    computed_hash = si.compute_plan_hash(plan)
+    if computed_hash != plan_hash:
+        raise ValueError(f"计划哈希不匹配: computed={computed_hash} != provided={plan_hash}")
+    if plan.get('plan_hash') != plan_hash:
+        raise ValueError(f"计划内存储哈希不匹配: {plan.get('plan_hash')} != {plan_hash}")
+
+    if plan.get('schema_version') != 1:
+        raise ValueError(f"不支持的计划 schema_version: {plan.get('schema_version')}")
+    if plan.get('normalization_version') != 'v1':
+        raise ValueError(f"不支持的计划 normalization_version: {plan.get('normalization_version')}")
+
+    expires_at_str = plan.get('expires_at')
+    if not expires_at_str:
+        raise ValueError("计划缺少 expires_at 时效时间戳")
+    exp_dt = datetime.fromisoformat(expires_at_str)
+    if datetime.now(timezone.utc) > exp_dt:
+        raise ValueError(f"计划已于 {expires_at_str} 过期，禁止执行确认")
+
+    if plan.get('target_statement_id') != statement_id:
+        raise ValueError(f"计划目标账单 ID 不匹配: {plan.get('target_statement_id')} != {statement_id}")
+    if plan.get('account_name') != account_name or plan.get('bank_code') != bank_code:
+        raise ValueError(f"计划账户/银行不匹配: ({plan.get('account_name')}/{plan.get('bank_code')}) != ({account_name}/{bank_code})")
+    if str(plan.get('transport_uid')) != str(transport_uid):
+        raise ValueError(f"计划运输 UID 不匹配: {plan.get('transport_uid')} != {transport_uid}")
+
+    if plan.get('status') not in ('associated_existing', 'insufficient_evidence'):
+        raise ValueError(f"计划状态 '{plan.get('status')}' 不允许执行人工确认")
+
+    if plan.get('plan_id') != plan_id:
+        raise ValueError("计划 ID 与所引用计划不符")
+    if transport_kind is not None and plan.get('transport_kind') != transport_kind:
+        raise ValueError("计划运输类型不匹配")
+    if source_ev is None:
+        raise ValueError("人工计划缺少可重建的源端证据")
+    promised_source = plan.get('source_evidence_summary') or {}
+    for field in ('raw_content_hash', 'complete_content_digest', 'message_id'):
+        if promised_source.get(field) != source_ev.get(field):
+            raise ValueError(f"源端证据与批准计划不符: {field}")
+
+    # 验证 preview 之后目标账单是否发生被改写或修改 (U1)
+    plan_anchor = plan.get('anchor_snapshot') or {}
+    if 'total_due' in plan_anchor and str(plan_anchor['total_due']) != str(target_row[5]):
+        raise ValueError("目标账单金额在 preview 后被修改，计划作废")
+    if 'is_paid' in plan_anchor and int(plan_anchor['is_paid']) != int(target_row[6] or 0):
+        raise ValueError("目标账单还款状态在 preview 后被修改，计划作废")
+    if 'message_id' in plan_anchor and plan_anchor['message_id'] and plan_anchor['message_id'] != target_row[3]:
+        raise ValueError("目标账单 Message-ID 在 preview 后被修改，计划作废")
+
+    return plan
+
+
+def associate_transport_identity(
+    db_path: str,
+    account_name: str,
+    transport_kind: str,
+    transport_uid: str,
+    bank_code: str,
+    statement_id: int,
+    message_id: str,
+    evidence_digest: Optional[str] = None,
+    evidence_version: str = 'v1',
+    raw_content_hash: Optional[str] = None,
+    method: str = 'digest_equal',
+    actor: str = 'auto_sync',
+    reason: str = 'content digest equal',
+    plan_id: Optional[str] = None,
+    plan_hash: Optional[str] = None,
+    source_evidence: Optional[dict] = None,
+    target_evidence: Optional[dict] = None,
+    anchor_snapshot: Optional[dict] = None,
+    batch_id: Optional[str] = None,
+    target_ref: Optional[dict] = None,
+    source_ref: Optional[dict] = None,
+    source_raw_bytes: Optional[bytes] = None,
+    plan_path: Optional[str] = None,
+) -> dict:
+    import statement_identity as si
+
+    if not account_name or account_name in ('__orphan__', 'default'):
+        raise ValueError(f'Cannot associate transport identity for placeholder account: {account_name}')
+    if not actor or not actor.strip():
+        raise ValueError('actor must be provided')
+    if not reason or not reason.strip():
+        raise ValueError('reason must be provided')
+    if not message_id or not message_id.strip():
+        raise ValueError('message_id must be provided')
+    if method not in ('digest_equal', 'manual_verified'):
+        raise ValueError(f'Invalid method: {method}')
+    if evidence_version != 'v1':
+        raise ValueError(f'Unsupported evidence version: {evidence_version}')
+
+    now = _utc_now_iso()
+    batch_id = batch_id or f'batch_{now}_{transport_uid}'
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute('PRAGMA foreign_keys = ON')
+        conn.execute('BEGIN IMMEDIATE')
+        cur = conn.cursor()
+
+        # 1. 锁内校验目标 statement_id
+        cur.execute(
+            'SELECT id, account_name, bank_code, message_id, statement_month, total_due, is_paid, subject, sender, email_date '
+            'FROM statements WHERE id = ?',
+            (statement_id,)
+        )
+        target_row = cur.fetchone()
+        if not target_row:
+            raise ValueError(f'Target statement id {statement_id} does not exist')
+        if target_row[1] != account_name or target_row[2] != bank_code:
+            raise ValueError(f'Target statement mismatch: acct/bank ({target_row[1]}/{target_row[2]}) != ({account_name}/{bank_code})')
+
+        # 2. 统一源端提取与构建 (Step A)
+        src_bytes = source_raw_bytes
+        if src_bytes is None and source_evidence and isinstance(source_evidence, dict):
+            src_bytes = source_evidence.get('raw_bytes')
+        if src_bytes is None:
+            cand_src_path = (source_ref or {}).get('archive_path') or (source_ref or {}).get('eml_path') or (source_evidence or {}).get('archive_path') or (source_evidence or {}).get('eml_path')
+            if cand_src_path and os.path.exists(cand_src_path):
+                try:
+                    with open(cand_src_path, 'rb') as fp:
+                        src_bytes = fp.read()
+                except Exception:
+                    pass
+
+        rebuilt_src_ev = None
+        if src_bytes is not None:
+            rebuilt_src_ev = si.build_evidence_from_raw_eml(
+                src_bytes, account_name=account_name, bank_code=bank_code,
+                transport_kind=transport_kind, transport_uid=str(transport_uid)
+            )
+            # 防篡改校验：如果调用者传入了 source_evidence 字典，必须与从原始字节重建的内容完全吻合 (S1)
+            if source_evidence and isinstance(source_evidence, dict):
+                if source_evidence.get('complete_content_digest') and source_evidence['complete_content_digest'] != rebuilt_src_ev['complete_content_digest']:
+                    raise ValueError(f"源端证据摘要与原始字节重建摘要矛盾: 摘要不匹配 {source_evidence['complete_content_digest']} != {rebuilt_src_ev['complete_content_digest']}")
+                if source_evidence.get('raw_content_hash') and source_evidence['raw_content_hash'] != rebuilt_src_ev['raw_content_hash']:
+                    raise ValueError("源端 raw_content_hash 与原始字节矛盾")
+                src_hdr = source_evidence.get('headers') or {}
+                reb_hdr = rebuilt_src_ev.get('headers') or {}
+                if src_hdr.get('from') and src_hdr.get('from') != reb_hdr.get('from'):
+                    raise ValueError(f"源端证据 From 头与原始字节重建头部不符: {src_hdr.get('from')} != {reb_hdr.get('from')}")
+                if src_hdr.get('subject') and src_hdr.get('subject') != reb_hdr.get('subject'):
+                    raise ValueError(f"源端证据 Subject 头与原始字节重建头部不符: {src_hdr.get('subject')} != {reb_hdr.get('subject')}")
+                if src_hdr.get('message_id') and src_hdr.get('message_id') != reb_hdr.get('message_id'):
+                    raise ValueError(f"源端证据 Message-ID 头与原始字节重建头部不符: {src_hdr.get('message_id')} != {reb_hdr.get('message_id')}")
+                if source_evidence.get('tree_nodes') and source_evidence['tree_nodes'] != rebuilt_src_ev['tree_nodes']:
+                    raise ValueError("源端证据 MIME 树结构与原始字节重建树不符")
+
+        if rebuilt_src_ev is None and source_evidence:
+            raise ValueError("源端证据字典缺少原始字节或可信归档引用，必须有可重读原文")
+
+        # 3. 统一已知硬元数据矛盾排查 (Step B, U1: 人工只放宽完整性，不放宽已知硬矛盾)
+        src_subject = (rebuilt_src_ev.get('headers', {}).get('subject') if rebuilt_src_ev else None) or (source_evidence or {}).get('headers', {}).get('subject')
+        src_from = (rebuilt_src_ev.get('headers', {}).get('from') if rebuilt_src_ev else None) or (source_evidence or {}).get('headers', {}).get('from')
+        src_date = (rebuilt_src_ev.get('headers', {}).get('date') if rebuilt_src_ev else None) or (source_evidence or {}).get('headers', {}).get('date')
+
+        # 1) Message-ID
+        if target_row[3] and message_id and target_row[3] != message_id:
+            raise ValueError(f"硬元数据矛盾：目标账单 Message-ID={target_row[3]} 与源={message_id} 不一致，禁止关联")
+
+        # 2) Subject
+        tgt_subject = target_row[7]
+        if src_subject and tgt_subject and src_subject != tgt_subject:
+            raise ValueError(f"硬元数据矛盾：主题不匹配: src={src_subject!r} != tgt={tgt_subject!r}")
+
+        # 3) From / Sender
+        tgt_sender = target_row[8]
+        if src_from and tgt_sender and src_from != tgt_sender:
+            raise ValueError(f"硬元数据矛盾：发件人不匹配: src={src_from!r} != tgt={tgt_sender!r}")
+
+        # 4) Date / email_date
+        tgt_date = target_row[9]
+        if src_date and tgt_date:
+            sv_ymd = si._parse_date_to_ymd(src_date)
+            tv_ymd = si._parse_date_to_ymd(tgt_date)
+            if sv_ymd and tv_ymd:
+                if sv_ymd != tv_ymd:
+                    raise ValueError(f"硬元数据矛盾：日期不匹配: src={src_date!r} ({sv_ymd}) != tgt={tgt_date!r} ({tv_ymd})")
+            elif src_date != tgt_date:
+                raise ValueError(f"硬元数据矛盾：日期不匹配: src={src_date!r} != tgt={tgt_date!r}")
+
+        # 5) 唯一有效锚点核对 (锁内核对唯一主账单)
+        cur.execute('SELECT id FROM statements WHERE account_name = ? AND bank_code = ? AND message_id = ?',
+                    (account_name, bank_code, message_id))
+        matching_anchors = [r[0] for r in cur.fetchall()]
+        if len(matching_anchors) > 1:
+            raise MessageIdentityConflict(f'Multiple anchor statements exist for Message-ID: {matching_anchors}')
+        if matching_anchors and matching_anchors[0] != statement_id:
+            raise MessageIdentityConflict(f'Target statement {statement_id} is not the primary anchor ({matching_anchors[0]})')
+
+        # 6) 锚点快照财务一致性 (防止财务漂移)
+        if anchor_snapshot:
+            if 'total_due' in anchor_snapshot and str(anchor_snapshot['total_due']) != str(target_row[5]):
+                raise ValueError(f'Anchor total_due drifted: current={target_row[5]} != snapshot={anchor_snapshot["total_due"]}')
+            if 'is_paid' in anchor_snapshot and int(anchor_snapshot['is_paid']) != int(target_row[6] or 0):
+                raise ValueError(f'Anchor is_paid drifted: current={target_row[6]} != snapshot={anchor_snapshot["is_paid"]}')
+
+        # 4. 检查现有运输键映射 (Step C, U2: 已有映射的幂等返回必须在证据验证之后)
+        cur.execute("""
+            SELECT id, statement_id, message_id, raw_content_hash, evidence_digest
+            FROM statement_transport_identities
+            WHERE account_name = ? AND transport_kind = ? AND transport_uid = ? AND bank_code = ?
+        """, (account_name, transport_kind, str(transport_uid), bank_code))
+        existing = cur.fetchone()
+
+        if existing:
+            ext_id, ext_sid, ext_msgid, ext_raw_hash, ext_digest = existing
+            if ext_sid != statement_id:
+                raise MessageIdentityConflict(
+                    f'Transport key ({account_name},{transport_kind},{transport_uid},{bank_code}) '
+                    f'already bound to statement ID {ext_sid}, cannot bind to {statement_id}'
+                )
+            if message_id and ext_msgid and message_id != ext_msgid:
+                raise MessageIdentityConflict(
+                    f'Transport key reused for different Message-ID: {message_id} != {ext_msgid}'
+                )
+
+            # U2: 如果完全缺证据重投 (只有运输键查重而无新正文/证据)
+            if src_bytes is None and not source_evidence:
+                conn.commit()
+                return {'status': 'repeated_key_unverified', 'statement_id': ext_sid, 'idempotent': True}
+
+            # 候选经验证仍为同邮件：核验源端与内容等价性
+            if rebuilt_src_ev is not None:
+                cand_digest = rebuilt_src_ev.get('complete_content_digest')
+                if ext_digest and cand_digest != ext_digest:
+                    raise MessageIdentityConflict(
+                        f'Transport key reused for different raw content hash / digest: {cand_digest} != {ext_digest}'
+                    )
+                if evidence_digest and ext_digest and evidence_digest != ext_digest:
+                    raise MessageIdentityConflict(
+                        f'Transport key reused for different raw content hash / digest: {evidence_digest} != {ext_digest}'
+                    )
+                if ext_raw_hash and rebuilt_src_ev.get('raw_content_hash') != ext_raw_hash and not ext_digest:
+                    raise MessageIdentityConflict(
+                        f'Transport key reused for different raw content hash: {rebuilt_src_ev.get("raw_content_hash")} != {ext_raw_hash}'
+                    )
+
+                if method == 'digest_equal':
+                    if rebuilt_src_ev.get('coverage_status') != 'complete':
+                        raise ValueError(f"源端字节重建证据未达 complete 覆盖: coverage_status={rebuilt_src_ev.get('coverage_status')}")
+                elif method == 'manual_verified':
+                    _verify_manual_plan(plan_path, plan_id, plan_hash, statement_id, account_name, bank_code, transport_uid, target_row, db_path, transport_kind=transport_kind, source_ev=rebuilt_src_ev)
+
+            conn.commit()
+            return {'status': 'already_associated', 'statement_id': statement_id, 'idempotent': True}
+
+        # 5. 首次关联分支
+        if method == 'digest_equal':
+            # ==================== 自动关联 (digest_equal) 契约 ====================
+            # 目标端必须具备数据库证据索引
+            cur.execute("""
+                SELECT statement_id, account_name, bank_code, message_id,
+                   raw_content_hash, evidence_digest, evidence_version,
+                   coverage_status, archive_path
+                FROM statement_evidence_index WHERE statement_id = ?
+            """, (statement_id,))
+            ev_row = cur.fetchone()
+            if not ev_row:
+                raise ValueError(f"目标账单 id={statement_id} 缺失数据库可信证据索引 (statement_evidence_index / target_evidence)，无法建立关联")
+
+            if ev_row[1] != account_name or ev_row[2] != bank_code:
+                raise ValueError(f"目标证据索引元数据不匹配: ({ev_row[1]}/{ev_row[2]}) != ({account_name}/{bank_code})")
+            if ev_row[3] != message_id:
+                raise ValueError(f"目标证据索引 Message-ID 不匹配: {ev_row[3]} != {message_id}")
+            if ev_row[6] != 'v1':
+                raise ValueError(f"目标证据版本不受支持: {ev_row[6]}")
+            if ev_row[7] != 'complete':
+                raise ValueError(f"目标证据未达完整覆盖状态: {ev_row[7]}")
+
+            tgt_archive = ev_row[8] or (target_ref or {}).get('archive_path')
+            if not tgt_archive or not os.path.exists(tgt_archive):
+                raise ValueError(f"目标证据必须具备可重读原始归档文件: {tgt_archive}")
+
+            try:
+                with open(tgt_archive, 'rb') as fp:
+                    tgt_bytes = fp.read()
+            except Exception as e_arch:
+                raise ValueError(f"无法读取目标归档文件: {e_arch}")
+
+            tgt_arch_hash = hashlib.sha256(tgt_bytes).hexdigest()
+            if tgt_arch_hash != ev_row[4]:
+                raise ValueError(f"目标证据归档哈希被篡改: {tgt_arch_hash} != {ev_row[4]}")
+
+            # 锁内对目标原始字节重建证据
+            rebuilt_tgt_ev = si.build_evidence_from_raw_eml(
+                tgt_bytes, account_name=account_name, bank_code=bank_code,
+                transport_kind=transport_kind, transport_uid=str(statement_id)
+            )
+            if rebuilt_tgt_ev.get('coverage_status') != 'complete':
+                raise ValueError("目标归档字节重建证据未达 complete 覆盖")
+            if rebuilt_tgt_ev.get('complete_content_digest') != ev_row[5]:
+                raise ValueError(f"目标归档字节重建摘要与索引矛盾: {rebuilt_tgt_ev.get('complete_content_digest')} != {ev_row[5]}")
+
+            # 源端必须获取真实原始字节并重建证据
+            if src_bytes is None or rebuilt_src_ev is None:
+                raise ValueError("源端证据缺少真实原始字节或可信归档引用，拒绝未经验证的字典 (source_evidence / raw_bytes)")
+
+            if source_evidence and isinstance(source_evidence, dict):
+                if source_evidence.get('coverage_status') and source_evidence.get('coverage_status') != 'complete':
+                    raise ValueError(f"源端证据未达 complete 覆盖状态: coverage_status={source_evidence.get('coverage_status')}")
+
+            if rebuilt_src_ev.get('coverage_status') != 'complete':
+                raise ValueError(f"源端字节重建证据未达 complete 覆盖: coverage_status={rebuilt_src_ev.get('coverage_status')}")
+
+            # 运行 compare_evidence 全套正向契约
+            decision, reasons, details = si.compare_evidence(rebuilt_src_ev, rebuilt_tgt_ev)
+            if decision != 'associated_existing':
+                raise ValueError(f"全内容证据比对未达等价契约: decision={decision}, reasons={reasons}, 摘要不匹配")
+
+            evidence_digest = rebuilt_src_ev['complete_content_digest']
+            raw_content_hash = rebuilt_src_ev['raw_content_hash']
+            src_ev = rebuilt_src_ev
+            tgt_ev = rebuilt_tgt_ev
+
+        elif method == 'manual_verified':
+            # ==================== 人工确认 (manual_verified) 契约 (U1, S3) ====================
+            if not actor or not actor.strip() or actor == 'auto_sync':
+                raise ValueError("manual_verified 必须提供明确的人类审查人 (actor)")
+            if not reason or not reason.strip():
+                raise ValueError("manual_verified 必须提供明确的审查理由 (reason)")
+            if not anchor_snapshot:
+                raise ValueError("manual_verified 必须提供 anchor_snapshot 进行锚点核验")
+
+            # 计划完整性与受控 preview 验证 (U1)
+            verified_plan = _verify_manual_plan(
+                plan_path, plan_id, plan_hash, statement_id, account_name, bank_code, transport_uid, target_row, db_path,
+                transport_kind=transport_kind, source_ev=rebuilt_src_ev
+            )
+
+            cur.execute("""
+                SELECT statement_id, account_name, bank_code, message_id,
+                       raw_content_hash, evidence_digest, evidence_version,
+                       coverage_status, archive_path
+                FROM statement_evidence_index WHERE statement_id = ?
+            """, (statement_id,))
+            ev_row = cur.fetchone()
+            if ev_row:
+                tgt_ev = {
+                    'complete_content_digest': ev_row[5],
+                    'normalization_version': ev_row[6],
+                    'raw_content_hash': ev_row[4],
+                    'coverage_status': ev_row[7],
+                    'archive_path': ev_row[8],
+                }
+            else:
+                tgt_ev = target_evidence or {
+                    'complete_content_digest': None,
+                    'normalization_version': 'v1',
+                    'raw_content_hash': None,
+                    'coverage_status': 'coverage_unknown',
+                    'archive_path': None,
+                }
+
+            src_ev = rebuilt_src_ev or source_evidence or {}
+            evidence_digest = src_ev.get('complete_content_digest')
+            raw_content_hash = src_ev.get('raw_content_hash')
+
+        # 6. 插入新映射
+        cur.execute("""
+            INSERT INTO statement_transport_identities (
+                account_name, transport_kind, transport_uid, bank_code, statement_id,
+                message_id, evidence_digest, evidence_version, raw_content_hash, method,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            account_name, transport_kind, str(transport_uid), bank_code, statement_id,
+            message_id, evidence_digest, evidence_version, raw_content_hash, method,
+            now, now
+        ))
+
+        # 7. 插入审计记录
+        cur.execute("""
+            INSERT INTO statement_identity_audit (
+                batch_id, plan_id, plan_hash, action, account_name, transport_kind,
+                transport_uid, bank_code, statement_id, old_statement_id, new_statement_id,
+                message_id, normalization_version, source_raw_hash, source_digest,
+                target_raw_hash, target_digest, coverage_status, missing_reason,
+                method, actor, reason, created_at
+            ) VALUES (?, ?, ?, 'associate', ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            batch_id, plan_id, plan_hash, account_name, transport_kind,
+            str(transport_uid), bank_code, statement_id, statement_id,
+            message_id, evidence_version,
+            raw_content_hash or (src_ev or {}).get('raw_content_hash'),
+            evidence_digest or (src_ev or {}).get('complete_content_digest'),
+            (tgt_ev or {}).get('raw_content_hash'),
+            (tgt_ev or {}).get('complete_content_digest'),
+            (src_ev or {}).get('coverage_status') or 'coverage_unknown',
+            (src_ev or {}).get('missing_reason'),
+            method, actor, reason, now
+        ))
+
+        conn.commit()
+        return {'status': 'associated', 'statement_id': statement_id, 'idempotent': False}
     except Exception:
         conn.rollback()
         raise

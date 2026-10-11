@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """163 邮箱邮件技能 - 支持发送、读取、搜索、下载（含 HTML 表格解析）"""
 
-import json, os, sys, email, re, glob, time
+import json, os, sys, email, re, glob, time, sqlite3
+from typing import Optional, Dict, Any, List, Tuple
 from datetime import datetime, timezone, timedelta
 
 # Windows 终端中文编码与 emoji 兼容性适配
@@ -390,7 +391,11 @@ def validate_email_by_uid(uid, account_name=None, *, context=None):
         context = resolve_parser_paths()
     try:
         msg = pop3_fetch_message_by_uid(uid, account_name=account_name)
-        validate_and_save_email_message(msg, uid, account_name=account_name, context=context)
+        raw_bytes = msg.as_bytes() if hasattr(msg, "as_bytes") else None
+        validate_and_save_email_message(
+            msg, uid, account_name=account_name, context=context,
+            raw_bytes=raw_bytes, transport_kind="pop3_uidl", is_synthesized=False
+        )
     except Exception as e:
         print(f'验证失败：{e}')
 
@@ -901,10 +906,19 @@ def validate_recent_bank_emails(months=3, *, context=None):
                 try:
                     if is_graph:
                         msg = pop3_fetch_message_by_uid(uid, account_name=account_name)
+                        raw_bytes = msg.as_bytes() if hasattr(msg, "as_bytes") else None
+                        t_kind = "graph_api"
+                        is_synth = True
                     else:
                         _, headers, _ = pop3_retr_by_uid(mail, uid)
-                        msg = email.message_from_bytes(b'\r\n'.join(headers))
-                    result = validate_and_save_email_message(msg, uid, rules=rules, account_name=account_name, context=context)
+                        raw_bytes = b'\r\n'.join(headers)
+                        msg = email.message_from_bytes(raw_bytes)
+                        t_kind = "pop3_uidl"
+                        is_synth = False
+                    result = validate_and_save_email_message(
+                        msg, uid, rules=rules, account_name=account_name, context=context,
+                        raw_bytes=raw_bytes, transport_kind=t_kind, is_synthesized=is_synth
+                    )
                     st = (result or {}).get('status')
                     if st in ('saved', 'parse_failed'):
                         ok += 1
@@ -966,11 +980,17 @@ def sync_recent_bank_emails(months=3, account_budget_s=60, total_budget_s=270, *
                 return
             if msg is None:  # Graph MIME preserves Message-ID and HTML evidence.
                 msg = pop3_fetch_message_by_uid(uid, account_name=account_name)
+            raw_bytes = msg.as_bytes() if hasattr(msg, "as_bytes") else None
+            t_kind = "graph_api" if is_graph else "pop3_uidl"
+            is_synth = is_graph
             if need_download:
                 _save_email_message(uid, msg, output_dir=DOWNLOAD_DIR, format='md', account_name=account_name)
                 acct['downloaded'] += 1
             if need_db:
-                result = validate_and_save_email_message(msg, uid, rules=rules, account_name=account_name, context=context)
+                result = validate_and_save_email_message(
+                    msg, uid, rules=rules, account_name=account_name, context=context,
+                    raw_bytes=raw_bytes, transport_kind=t_kind, is_synthesized=is_synth
+                )
                 key = {'saved': 'saved', 'parse_failed': 'parse_failed',
                        'not_statement': 'gated'}.get((result or {}).get('status'), 'errors')
                 acct[key] += 1
@@ -1389,6 +1409,433 @@ def cli_mark_paid_by_id(statement_id):
     return _emit_envelope('mark_paid', data, errors)
 
 
+def cli_identity_preview(statement_id: int, account: str, transport_kind: str,
+                         transport_uid: str, bank: str, eml_path: Optional[str] = None):
+    errors = []
+    data = {}
+    try:
+        from parser_paths import resolve_parser_paths
+        from statement_db import get_statement_evidence
+        import statement_identity as si
+
+        context = resolve_parser_paths()
+        conn = sqlite3.connect(f'file:{context.db_path}?mode=ro', uri=True)
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM statements WHERE id = ?", (statement_id,))
+        target_row = cur.fetchone()
+        conn.close()
+
+        if not target_row:
+            errors.append(f"Statement ID {statement_id} not found")
+            return _emit_envelope('identity_preview', data, errors)
+
+        target_dict = dict(target_row)
+        if target_dict['account_name'] != account or target_dict['bank_code'] != bank:
+            errors.append(
+                f"Target statement mismatch: ({target_dict['account_name']}/{target_dict['bank_code']}) "
+                f"!= ({account}/{bank})"
+            )
+            return _emit_envelope('identity_preview', data, errors)
+
+        source_raw_bytes = None
+        source_eml_path = None
+        if eml_path and os.path.exists(eml_path):
+            source_eml_path = eml_path
+            with open(eml_path, 'rb') as fp:
+                source_raw_bytes = fp.read()
+        else:
+            default_eml = os.path.join(context.download_dir, f"{transport_uid}.eml")
+            if os.path.exists(default_eml):
+                source_eml_path = default_eml
+                with open(default_eml, 'rb') as fp:
+                    source_raw_bytes = fp.read()
+
+        if not source_raw_bytes:
+            errors.append(f"Source EML not found for UID {transport_uid}")
+            return _emit_envelope('identity_preview', data, errors)
+
+        source_ev = si.build_evidence_from_raw_eml(
+            source_raw_bytes, account_name=account, bank_code=bank,
+            transport_kind=transport_kind, transport_uid=str(transport_uid)
+        )
+
+        target_raw_bytes = None
+        target_archive_path = None
+
+        # 优先从 statement_evidence_index 读取可信目标归档 (Gap 5 P1)
+        ev_index = get_statement_evidence(context.db_path, statement_id)
+        if ev_index and ev_index.get('archive_path') and os.path.exists(ev_index['archive_path']):
+            target_archive_path = ev_index['archive_path']
+            with open(target_archive_path, 'rb') as fp:
+                target_raw_bytes = fp.read()
+        else:
+            cand_eml = os.path.join(context.download_dir, f"{target_dict['uid']}.eml")
+            if os.path.exists(cand_eml):
+                target_archive_path = cand_eml
+                with open(cand_eml, 'rb') as fp:
+                    target_raw_bytes = fp.read()
+
+        from statement_db import save_statement_evidence_index
+        if target_raw_bytes:
+            target_ev = si.build_evidence_from_raw_eml(
+                target_raw_bytes, account_name=account, bank_code=bank,
+                transport_kind=transport_kind, transport_uid=str(target_dict['uid'])
+            )
+            if target_ev.get('coverage_status') == 'complete':
+                target_archive_path = si.archive_evidence_eml(
+                    context.data_root, target_raw_bytes, target_ev['raw_content_hash'], context=context
+                )
+                save_statement_evidence_index(
+                    context.db_path,
+                    statement_id=statement_id,
+                    account_name=account,
+                    bank_code=bank,
+                    message_id=target_dict.get('message_id') or '',
+                    raw_content_hash=target_ev['raw_content_hash'],
+                    evidence_digest=target_ev.get('complete_content_digest') or '',
+                    coverage_status='complete',
+                    archive_path=target_archive_path,
+                    evidence_version=si.NORMALIZATION_VERSION
+                )
+        else:
+            target_ev = {
+                'normalization_version': si.NORMALIZATION_VERSION,
+                'account_name': account,
+                'bank_code': bank,
+                'transport_kind': transport_kind,
+                'transport_uid': str(target_dict['uid']),
+                'headers': {
+                    'message_id': target_dict.get('message_id') or '',
+                    'subject': target_dict.get('subject') or '',
+                    'from': target_dict.get('sender') or '',
+                    'date': target_dict.get('email_date') or '',
+                    'headers_fingerprint': '',
+                },
+                'message_id': target_dict.get('message_id') or '',
+                'coverage_status': 'coverage_unknown',
+                'complete_mime': False,
+                'complete_content_digest': None,
+                'comparable_body_digest': None,
+                'missing_reason': 'target_raw_eml_not_found',
+            }
+
+        anchor_snapshot = {
+            'statement_id': statement_id,
+            'uid': target_dict['uid'],
+            'message_id': target_dict.get('message_id'),
+            'statement_month': target_dict.get('statement_month'),
+            'total_due': target_dict.get('total_due'),
+            'is_paid': target_dict.get('is_paid'),
+        }
+
+        # 原子归档源端 EML 为内容寻址证据 (T3)
+        source_archive_path = None
+        if source_raw_bytes and source_ev.get('raw_content_hash'):
+            source_archive_path = si.archive_evidence_eml(
+                context.data_root, source_raw_bytes, source_ev['raw_content_hash'], context=context
+            )
+
+        source_ref = {
+            'archive_path': os.path.abspath(source_archive_path) if source_archive_path else None,
+            'eml_path': os.path.abspath(source_eml_path) if source_eml_path else None,
+            'raw_content_hash': source_ev.get('raw_content_hash'),
+            'complete_content_digest': source_ev.get('complete_content_digest'),
+        }
+        target_ref = {
+            'statement_id': statement_id,
+            'archive_path': os.path.abspath(target_archive_path) if target_archive_path else None,
+            'raw_content_hash': target_ev.get('raw_content_hash'),
+            'complete_content_digest': target_ev.get('complete_content_digest'),
+        }
+
+        plan = si.generate_identity_plan(
+            source_ev, target_ev,
+            target_statement_id=statement_id,
+            anchor_snapshot=anchor_snapshot,
+            source_ref=source_ref,
+            target_ref=target_ref
+        )
+
+        diff_report = {
+            'plan_id': plan['plan_id'],
+            'plan_hash': plan['plan_hash'],
+            'target_statement_id': statement_id,
+            'metadata_diff': {
+                'subject': {'source': source_ev['headers'].get('subject'), 'target': target_ev['headers'].get('subject')},
+                'from': {'source': source_ev['headers'].get('from'), 'target': target_ev['headers'].get('from')},
+                'date': {'source': source_ev['headers'].get('date'), 'target': target_ev['headers'].get('date')},
+                'message_id': {'source': source_ev.get('message_id'), 'target': target_ev.get('message_id')},
+            },
+            'mime_tree': {
+                'source_parts_count': source_ev.get('parts_count'),
+                'target_parts_count': target_ev.get('parts_count'),
+                'source_tree_nodes': source_ev.get('tree_nodes', []),
+                'target_tree_nodes': target_ev.get('tree_nodes', []),
+            },
+            'body_and_digest': {
+                'source_comparable_body_digest': source_ev.get('comparable_body_digest'),
+                'target_comparable_body_digest': target_ev.get('comparable_body_digest'),
+                'source_complete_content_digest': source_ev.get('complete_content_digest'),
+                'target_complete_content_digest': target_ev.get('complete_content_digest'),
+                'source_raw_hash': source_ev.get('raw_content_hash'),
+                'target_raw_hash': target_ev.get('raw_content_hash'),
+            },
+            'coverage': {
+                'source_coverage_status': source_ev.get('coverage_status'),
+                'target_coverage_status': target_ev.get('coverage_status'),
+                'source_missing_reason': source_ev.get('missing_reason'),
+                'target_missing_reason': target_ev.get('missing_reason'),
+            }
+        }
+        diff_path = si.save_identity_diff_report(context.data_root, plan['plan_id'], diff_report, context=context)
+        report_path = si.save_identity_plan_report(context.data_root, plan, context=context)
+
+        data = {
+            'plan_id': plan['plan_id'],
+            'plan_hash': plan['plan_hash'],
+            'status': plan['status'],
+            'report_path': report_path,
+            'diff_path': diff_path,
+            'target_statement_id': statement_id,
+            'transport_key': {
+                'account': account,
+                'transport_kind': transport_kind,
+                'transport_uid': str(transport_uid),
+                'bank': bank,
+            },
+            'summary': {
+                'reasons': plan['reasons'],
+                'source_digest': source_ev.get('complete_content_digest'),
+                'target_digest': target_ev.get('complete_content_digest'),
+                'can_confirm': plan['status'] in ('associated_existing', 'insufficient_evidence')
+            }
+        }
+    except Exception as exc:
+        errors.append(f"identity_preview: {exc}")
+    return _emit_envelope('identity_preview', data, errors)
+
+
+def cli_identity_confirm(plan_path: str, plan_hash: str, actor: str, reason: str):
+    errors = []
+    data = {}
+    try:
+        from parser_paths import resolve_parser_paths
+        from statement_db import associate_transport_identity
+        import statement_identity as si
+
+        if not actor or not actor.strip():
+            errors.append("必须提供明确的 --actor（操作人标识），禁止自动或空操作人")
+            return _emit_envelope('identity_confirm', data, errors)
+        if not reason or not reason.strip():
+            errors.append("必须提供明确的 --reason（确认理由）")
+            return _emit_envelope('identity_confirm', data, errors)
+
+        if not os.path.exists(plan_path):
+            errors.append(f"Plan file not found: {plan_path}")
+            return _emit_envelope('identity_confirm', data, errors)
+
+        with open(plan_path, 'r', encoding='utf-8') as fp:
+            plan = json.load(fp)
+
+        # 1. 重算规范化计划哈希 (R1: 防字段篡改)
+        computed_hash = si.compute_plan_hash(plan)
+        if computed_hash != plan_hash:
+            errors.append(f"Plan content hash mismatch: computed={computed_hash} != provided={plan_hash}")
+            return _emit_envelope('identity_confirm', data, errors)
+        if plan.get('plan_hash') != plan_hash:
+            errors.append(f"Stored plan_hash mismatch: {plan.get('plan_hash')} != {plan_hash}")
+            return _emit_envelope('identity_confirm', data, errors)
+
+        # 2. 版本与必需字段校验
+        if plan.get('schema_version') != 1:
+            errors.append(f"Invalid schema_version: {plan.get('schema_version')}")
+            return _emit_envelope('identity_confirm', data, errors)
+        if plan.get('normalization_version') != 'v1':
+            errors.append(f"Invalid normalization_version: {plan.get('normalization_version')}")
+            return _emit_envelope('identity_confirm', data, errors)
+
+        for req_field in ('account_name', 'bank_code', 'transport_kind', 'transport_uid',
+                         'target_statement_id', 'anchor_snapshot', 'source_evidence_summary',
+                         'target_evidence_summary'):
+            if not plan.get(req_field):
+                errors.append(f"Missing required plan field: {req_field}")
+                return _emit_envelope('identity_confirm', data, errors)
+
+        # 3. 时效性校验
+        expires_at_str = plan.get('expires_at')
+        if not expires_at_str:
+            errors.append("Plan missing expires_at timestamp")
+            return _emit_envelope('identity_confirm', data, errors)
+        exp_dt = datetime.fromisoformat(expires_at_str)
+        if datetime.now(timezone.utc) > exp_dt:
+            errors.append(f"Plan has expired at {expires_at_str}")
+            return _emit_envelope('identity_confirm', data, errors)
+
+        # 4. 状态白名单校验 (仅允许 associated_existing 或 insufficient_evidence 进入人工流程)
+        plan_status = plan.get('status')
+        if plan_status not in ('associated_existing', 'insufficient_evidence'):
+            errors.append(f"Plan status '{plan_status}' is not eligible for confirmation (only associated_existing or insufficient_evidence allowed)")
+            return _emit_envelope('identity_confirm', data, errors)
+
+        # 5. 重读并重核源文件和目标归档证据 (Gap 2 P0)
+        source_ref = plan.get('source_ref') or {}
+        source_eml_path = source_ref.get('eml_path')
+        if not source_eml_path or not os.path.exists(source_eml_path):
+            errors.append(f"Source EML file not found at confirmation time: {source_eml_path}")
+            return _emit_envelope('identity_confirm', data, errors)
+
+        with open(source_eml_path, 'rb') as fp:
+            re_read_source_bytes = fp.read()
+        re_read_source_ev = si.build_evidence_from_raw_eml(
+            re_read_source_bytes,
+            account_name=plan['account_name'],
+            bank_code=plan['bank_code'],
+            transport_kind=plan['transport_kind'],
+            transport_uid=plan['transport_uid']
+        )
+        if re_read_source_ev.get('raw_content_hash') != source_ref.get('raw_content_hash'):
+            errors.append(
+                f"Source EML file was replaced or modified after preview: "
+                f"current_hash={re_read_source_ev.get('raw_content_hash')} != preview_hash={source_ref.get('raw_content_hash')}"
+            )
+            return _emit_envelope('identity_confirm', data, errors)
+        if re_read_source_ev.get('complete_content_digest') != source_ref.get('complete_content_digest'):
+            errors.append(
+                f"Source EML evidence digest has changed after preview: "
+                f"current_digest={re_read_source_ev.get('complete_content_digest')} != preview_digest={source_ref.get('complete_content_digest')}"
+            )
+            return _emit_envelope('identity_confirm', data, errors)
+
+        # 目标归档重核 (T3: 声明归档则缺失必须拒绝，禁止回退到计划摘要)
+        target_ref = plan.get('target_ref') or {}
+        target_archive_path = target_ref.get('archive_path')
+        if target_archive_path:
+            if not os.path.exists(target_archive_path):
+                errors.append(
+                    f"Target archive declared in plan is missing or deleted at confirm time: {target_archive_path}"
+                )
+                return _emit_envelope('identity_confirm', data, errors)
+            with open(target_archive_path, 'rb') as fp:
+                re_read_target_bytes = fp.read()
+            re_read_target_ev = si.build_evidence_from_raw_eml(
+                re_read_target_bytes,
+                account_name=plan['account_name'],
+                bank_code=plan['bank_code'],
+                transport_kind=plan['transport_kind'],
+                transport_uid=str(plan['target_statement_id'])
+            )
+            if re_read_target_ev.get('raw_content_hash') != target_ref.get('raw_content_hash'):
+                errors.append(
+                    f"Target EML archive was modified after preview: "
+                    f"current_hash={re_read_target_ev.get('raw_content_hash')} != preview_hash={target_ref.get('raw_content_hash')}"
+                )
+                return _emit_envelope('identity_confirm', data, errors)
+        else:
+            re_read_target_ev = None
+
+        context = resolve_parser_paths()
+        method = 'digest_equal' if plan_status == 'associated_existing' else 'manual_verified'
+
+        assoc_res = associate_transport_identity(
+            context.db_path,
+            account_name=plan['account_name'],
+            transport_kind=plan['transport_kind'],
+            transport_uid=plan['transport_uid'],
+            bank_code=plan['bank_code'],
+            statement_id=plan['target_statement_id'],
+            message_id=plan['source_evidence_summary']['message_id'] or '',
+            evidence_digest=re_read_source_ev.get('complete_content_digest'),
+            evidence_version=plan.get('normalization_version', 'v1'),
+            raw_content_hash=re_read_source_ev.get('raw_content_hash'),
+            method=method,
+            actor=actor.strip(),
+            reason=reason.strip(),
+            plan_id=plan['plan_id'],
+            plan_hash=plan_hash,
+            source_evidence=re_read_source_ev,
+            target_evidence=re_read_target_ev,
+            anchor_snapshot=plan.get('anchor_snapshot'),
+            target_ref=target_ref,
+            source_ref=source_ref,
+            source_raw_bytes=re_read_source_bytes,
+            plan_path=plan_path,
+        )
+
+        # 归档源端 EML
+        if re_read_source_bytes and re_read_source_ev.get('raw_content_hash'):
+            si.archive_evidence_eml(
+                context.data_root, re_read_source_bytes,
+                re_read_source_ev['raw_content_hash'], context=context
+            )
+
+        data = {
+            'confirmed': True,
+            'statement_id': plan['target_statement_id'],
+            'transport_uid': plan['transport_uid'],
+            'method': method,
+            'idempotent': assoc_res.get('idempotent', False),
+        }
+    except Exception as exc:
+        errors.append(f"identity_confirm: {exc}")
+    return _emit_envelope('identity_confirm', data, errors)
+
+
+def cli_identity_status(statement_id: Optional[int] = None, account: Optional[str] = None,
+                        transport_uid: Optional[str] = None):
+    errors = []
+    data = {'identities': [], 'audits': []}
+    try:
+        from parser_paths import resolve_parser_paths
+        context = resolve_parser_paths()
+        conn = sqlite3.connect(f'file:{context.db_path}?mode=ro', uri=True)
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+
+        q_id = "SELECT * FROM statement_transport_identities WHERE 1=1"
+        p_id = []
+        if statement_id:
+            q_id += " AND statement_id = ?"
+            p_id.append(statement_id)
+        if account:
+            q_id += " AND account_name = ?"
+            p_id.append(account)
+        if transport_uid:
+            q_id += " AND transport_uid = ?"
+            p_id.append(str(transport_uid))
+        q_id += " ORDER BY id DESC LIMIT 50"
+
+        try:
+            cur.execute(q_id, p_id)
+            data['identities'] = [dict(r) for r in cur.fetchall()]
+        except sqlite3.OperationalError:
+            data['identities'] = []
+
+        q_au = "SELECT * FROM statement_identity_audit WHERE 1=1"
+        p_au = []
+        if statement_id:
+            q_au += " AND statement_id = ?"
+            p_au.append(statement_id)
+        if account:
+            q_au += " AND account_name = ?"
+            p_au.append(account)
+        if transport_uid:
+            q_au += " AND transport_uid = ?"
+            p_au.append(str(transport_uid))
+        q_au += " ORDER BY id DESC LIMIT 50"
+
+        try:
+            cur.execute(q_au, p_au)
+            data['audits'] = [dict(r) for r in cur.fetchall()]
+        except sqlite3.OperationalError:
+            data['audits'] = []
+
+        conn.close()
+    except Exception as exc:
+        errors.append(f"identity_status: {exc}")
+    return _emit_envelope('identity_status', data, errors)
+
+
 def _parse_cmd_args(argv, allowed_options, positional_options=()):
     """严格解析命令行选项（契约 §3）。
     allowed_options: {'flag_name': {'type': 'int'|'str', 'default': val, 'min': 1}}
@@ -1547,6 +1994,67 @@ def main():
             sys.exit(1)
         else:
             mark_statement_paid_cmd(args[0], args[1] if len(args) > 1 else None)
+
+    elif cmd == 'identity_preview':
+        opts, _, errs = _parse_cmd_args(sys.argv[2:], {
+            'statement-id': {'type': 'int', 'min': 1},
+            'account': {'type': 'str'},
+            'transport-kind': {'type': 'str', 'default': 'pop3_uidl'},
+            'transport-uid': {'type': 'str'},
+            'bank': {'type': 'str'},
+            'eml': {'type': 'str'}
+        })
+        for req in ('statement-id', 'account', 'transport-uid', 'bank'):
+            if not opts.get(req):
+                errs.append(f'必须提供 --{req}')
+        if errs:
+            _emit_envelope('identity_preview', {}, errs)
+            sys.exit(1)
+        res = cli_identity_preview(
+            statement_id=opts['statement-id'], account=opts['account'],
+            transport_kind=opts.get('transport-kind') or 'pop3_uidl',
+            transport_uid=opts['transport-uid'], bank=opts['bank'],
+            eml_path=opts.get('eml')
+        )
+        if res.get('status') != 'ok':
+            sys.exit(1)
+
+    elif cmd == 'identity_confirm':
+        opts, _, errs = _parse_cmd_args(sys.argv[2:], {
+            'plan': {'type': 'str'},
+            'plan-hash': {'type': 'str'},
+            'actor': {'type': 'str'},
+            'reason': {'type': 'str'}
+        })
+        for req in ('plan', 'plan-hash', 'actor', 'reason'):
+            if not opts.get(req):
+                errs.append(f'必须提供 --{req}')
+        if errs:
+            _emit_envelope('identity_confirm', {}, errs)
+            sys.exit(1)
+        res = cli_identity_confirm(
+            plan_path=opts['plan'], plan_hash=opts['plan-hash'],
+            actor=opts['actor'], reason=opts['reason']
+        )
+        if res.get('status') != 'ok':
+            sys.exit(1)
+
+    elif cmd == 'identity_status':
+        opts, _, errs = _parse_cmd_args(sys.argv[2:], {
+            'statement-id': {'type': 'int', 'min': 1},
+            'account': {'type': 'str'},
+            'transport-uid': {'type': 'str'}
+        })
+        if errs:
+            _emit_envelope('identity_status', {}, errs)
+            sys.exit(1)
+        res = cli_identity_status(
+            statement_id=opts.get('statement-id'),
+            account=opts.get('account'),
+            transport_uid=opts.get('transport-uid')
+        )
+        if res.get('status') != 'ok':
+            sys.exit(1)
 
     elif cmd == 'quality_events':
         opts, _, errs = _parse_cmd_args(sys.argv[2:], {

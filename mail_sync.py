@@ -238,14 +238,20 @@ def fetch_recent_emails_and_summarize(months=1, llm_enabled=True, account_budget
                         # 保留 HTML 原文，使账单交易明细解析器能从 HTML 表格提取 markdown
                         if msg_obj.get('html'):
                             msg.add_alternative(msg_obj['html'], subtype='html')
+                        raw_bytes = msg.as_bytes()
+                        transport_kind = "graph_api"
+                        is_synth = True
                         # Graph 正文同样落库，供 enrich 阶段离线读取（真分层）
                         upsert_email_body(context.db_path, account_name, uid,
                                           raw_html=msg_obj.get('html'),
                                           plain_text=body_text,
                                           markdown_tables="")
                     else:
+                        transport_kind = "pop3_uidl"
+                        is_synth = False
                         _, headers, _ = mail.retr(i)
-                        msg = email.message_from_bytes(b'\r\n'.join(headers))
+                        raw_bytes = b'\r\n'.join(headers)
+                        msg = email.message_from_bytes(raw_bytes)
                         subj = decode_mime(msg.get('Subject', ''))
                         frm = decode_mime(msg.get('From', ''))
                         date_str = _to_text(msg.get('Date', ''))
@@ -271,7 +277,17 @@ def fetch_recent_emails_and_summarize(months=1, llm_enabled=True, account_budget
                     rule, score = identify_rule(subj, frm, body_text, rules)
                     if rule:
                         print(f'💳 [账单通道] 命中规则 {rule.get("rule_id")} (UID={uid}) 主题: {subj[:30]}')
-                        validate_and_save_email_message(msg, uid, rules=rules, account_name=account_name, context=context)
+                        save_res = validate_and_save_email_message(
+                            msg, uid, rules=rules, account_name=account_name, context=context,
+                            raw_bytes=raw_bytes, transport_kind=transport_kind, is_synthesized=is_synth
+                        )
+                        st = (save_res or {}).get("status")
+                        if st == "associated_existing":
+                            associated_existing += 1
+                        elif st == "identity_conflict":
+                            identity_conflict += 1
+                        elif st == "insufficient_evidence":
+                            insufficient_evidence += 1
                         
                         # 补充插入 email_summaries，确保账单能在 Meilisearch 搜索引擎和前端界面中展示
                         rec = EmailSummaryRecord(
@@ -386,13 +402,19 @@ def fetch_recent_emails_and_summarize(months=1, llm_enabled=True, account_budget
                     pass
             print(f'🏁 账户 {account_name} 扫描完成：新入库账单 {new_bills} 封，通用提炼 {new_summaries} 封，跳过重复 {skipped_dup} 封，处理失败 {errors} 封')
             acct_result.update(scanned=scanned, new_bills=new_bills, new_summaries=new_summaries,
-                               skipped_dup=skipped_dup, errors=errors)
+                               skipped_dup=skipped_dup, errors=errors,
+                               associated_existing=associated_existing,
+                               identity_conflict=identity_conflict,
+                               insufficient_evidence=insufficient_evidence)
             account_results.append(acct_result)
             scanned_total += scanned
             new_bills_total += new_bills
             new_summaries_total += new_summaries
             skipped_dup_total += skipped_dup
             errors_total += errors
+            associated_existing_total += associated_existing
+            identity_conflict_total += identity_conflict
+            insufficient_evidence_total += insufficient_evidence
 
     print(f'\n🏁 全局同步完成：总扫描 {scanned_total} 封，新入库账单 {new_bills_total} 封，通用提炼 {new_summaries_total} 封，跳过重复 {skipped_dup_total} 封，全局失败 {errors_total} 封')
 
@@ -406,6 +428,9 @@ def fetch_recent_emails_and_summarize(months=1, llm_enabled=True, account_budget
             'new_summaries': new_summaries_total,
             'skipped_dup': skipped_dup_total,
             'errors': errors_total,
+            'associated_existing': associated_existing_total,
+            'identity_conflict': identity_conflict_total,
+            'insufficient_evidence': insufficient_evidence_total,
         },
     }
     print('--- JSON_SUMMARY_START ---')

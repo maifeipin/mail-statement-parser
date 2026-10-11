@@ -65,7 +65,12 @@ def _snapshot(cur):
     txns = cur.fetchone()[0]
     cur.execute("SELECT COUNT(*) FROM statements WHERE is_paid = 1")
     paid = cur.fetchone()[0]
-    return {'statements': stmts, 'transactions': txns, 'paid_statements': paid}
+    try:
+        cur.execute("SELECT COUNT(*) FROM statement_transport_identities")
+        identities = cur.fetchone()[0]
+    except sqlite3.OperationalError:
+        identities = 0
+    return {'statements': stmts, 'transactions': txns, 'paid_statements': paid, 'identities': identities}
 
 
 def _txn_count(cur, statement_id, account_name, uid, bank_code):
@@ -256,8 +261,100 @@ def apply_merges(cur, groups, now):
                 (p['uid'], g['account_name'], m['account_name'], m['uid'], g['bank_code']),
             )
 
-        # 4. 删除重复账单 + 旧新 ID 映射
+        # 4. 正向内容等价证明与运输身份迁移 (Gap 4 P0: 有身份映射参与必须正向等价证明)
         for dup in g['duplicates']:
+            cur.execute(
+                "SELECT id, account_name, transport_kind, transport_uid, bank_code, message_id "
+                "FROM statement_transport_identities WHERE statement_id = ?",
+                (dup['id'],)
+            )
+            dup_identities = cur.fetchall()
+
+            cur.execute(
+                "SELECT COUNT(*) FROM statement_transport_identities WHERE statement_id = ?",
+                (p['id'],)
+            )
+            prim_has_identities = (cur.fetchone()[0] > 0)
+
+            cur.execute("SELECT evidence_digest, raw_content_hash, evidence_version, coverage_status FROM statement_evidence_index WHERE statement_id = ?", (p['id'],))
+            prim_ev = cur.fetchone()
+            cur.execute("SELECT evidence_digest, raw_content_hash, evidence_version, coverage_status FROM statement_evidence_index WHERE statement_id = ?", (dup['id'],))
+            dup_ev = cur.fetchone()
+
+            # 有身份映射或证据索引参与的合并：必须正向要求两端已绑定可信原文、完整覆盖、同版本且等价；缺任一证据拒绝并回滚 (T2)
+            if dup_identities or prim_has_identities or prim_ev or dup_ev:
+                if not prim_ev or not prim_ev[0]:
+                    raise ValueError(f"安全拒绝：主记录 id={p['id']} 缺失可信内容证据 (statement_evidence_index)，缺少正向等价证明，禁止合并")
+                if not dup_ev or not dup_ev[0]:
+                    raise ValueError(f"安全拒绝：副本记录 id={dup['id']} 缺失可信内容证据 (statement_evidence_index)，缺少正向等价证明，禁止合并")
+
+                if prim_ev[2] != 'v1' or dup_ev[2] != 'v1' or prim_ev[2] != dup_ev[2]:
+                    raise ValueError(f"安全拒绝：证据版本不匹配: primary={prim_ev[2]} != duplicate={dup_ev[2]}")
+                if prim_ev[3] != 'complete' or dup_ev[3] != 'complete':
+                    raise ValueError(f"安全拒绝：证据覆盖未达完整: primary={prim_ev[3]}, duplicate={dup_ev[3]}")
+                if prim_ev[0] != dup_ev[0]:
+                    raise ValueError(f"安全拒绝：全内容摘要不一致: primary={prim_ev[0]} != duplicate={dup_ev[0]}")
+                # S2: 原始哈希证明各自归档完整性，两端内容等价性由 evidence_digest 决定，禁止因传输头/换行不同导致的 raw_content_hash 差异而拒绝
+
+            try:
+                cur.execute(
+                    "SELECT id, account_name, transport_kind, transport_uid, bank_code, message_id "
+                    "FROM statement_transport_identities WHERE statement_id = ?",
+                    (dup['id'],)
+                )
+                dup_identities = cur.fetchall()
+                for row in dup_identities:
+                    tid, acct, tkind, tuid, bank, msgid = row
+                    if acct != g['account_name'] or bank != g['bank_code'] or msgid != g['message_id']:
+                        raise ValueError(f"安全拒绝：身份映射证据不匹配，拒绝盲目重挂: {row}")
+
+                    cur.execute(
+                        "SELECT id FROM statement_transport_identities "
+                        "WHERE account_name = ? AND transport_kind = ? AND transport_uid = ? AND bank_code = ? AND id <> ?",
+                        (acct, tkind, tuid, bank, tid)
+                    )
+                    colliding = cur.fetchone()
+                    if colliding:
+                        raise ValueError(f"安全拒绝：重挂撞运输键: id={colliding[0]}")
+                    cur.execute(
+                        "UPDATE statement_transport_identities SET statement_id = ?, updated_at = ? WHERE id = ?",
+                        (p['id'], now, tid)
+                    )
+                    cur.execute("""
+                        INSERT INTO statement_identity_audit (
+                            batch_id, plan_id, plan_hash, action, account_name, transport_kind,
+                            transport_uid, bank_code, statement_id, old_statement_id, new_statement_id,
+                            message_id, normalization_version, source_raw_hash, source_digest,
+                            target_raw_hash, target_digest, coverage_status, missing_reason,
+                            method, actor, reason, created_at
+                        ) VALUES (?, NULL, NULL, 'migrate', ?, ?, ?, ?, ?, ?, ?, ?, 'v1', ?, ?, ?, ?, 'complete', NULL, 'digest_equal', 'clean_script', 'duplicate merge migration', ?)
+                    """, (f"clean_{now}", acct, tkind, tuid, bank, p['id'], dup['id'], p['id'], msgid,
+                          dup_ev[1], dup_ev[0], prim_ev[1], prim_ev[0], now))
+            except sqlite3.OperationalError:
+                pass
+
+            # 处理副本证据索引 (T2)：若主记录缺归档路径则继承，记录合并审计，清理副本证据索引防止外键悬挂
+            cur.execute("SELECT archive_path FROM statement_evidence_index WHERE statement_id = ?", (dup['id'],))
+            dup_ev_idx = cur.fetchone()
+            if dup_ev_idx:
+                dup_arch = dup_ev_idx[0]
+                cur.execute("SELECT archive_path FROM statement_evidence_index WHERE statement_id = ?", (p['id'],))
+                prim_ev_idx = cur.fetchone()
+                if prim_ev_idx and not prim_ev_idx[0] and dup_arch:
+                    cur.execute("UPDATE statement_evidence_index SET archive_path = ? WHERE statement_id = ?", (dup_arch, p['id']))
+                cur.execute("""
+                    INSERT INTO statement_identity_audit (
+                        batch_id, plan_id, plan_hash, action, account_name, transport_kind,
+                        transport_uid, bank_code, statement_id, old_statement_id, new_statement_id,
+                        message_id, normalization_version, source_raw_hash, source_digest,
+                        target_raw_hash, target_digest, coverage_status, missing_reason,
+                        method, actor, reason, created_at
+                    ) VALUES (?, NULL, NULL, 'archive_merge', ?, 'evidence_index', ?, ?, ?, ?, ?, ?, 'v1', ?, ?, ?, ?, 'complete', NULL, 'digest_equal', 'clean_script', 'duplicate evidence index merged to primary', ?)
+                """, (f"clean_{now}", g['account_name'], f"stmt_{dup['id']}", g['bank_code'], p['id'], dup['id'], p['id'], g['message_id'],
+                      dup_ev[1] if dup_ev else None, dup_ev[0] if dup_ev else None,
+                      prim_ev[1] if prim_ev else None, prim_ev[0] if prim_ev else None, now))
+                cur.execute("DELETE FROM statement_evidence_index WHERE statement_id = ?", (dup['id'],))
+
             cur.execute("DELETE FROM statements WHERE id = ?", (dup['id'],))
             cur.execute(
                 """INSERT INTO cleanup_id_map (old_statement_id, new_statement_id, account_name, bank_code, message_id, reason, merged_at)
@@ -277,6 +374,17 @@ def apply_ghosts(cur, ghosts, now):
         for tid in ids:
             cur.execute("DELETE FROM statement_transactions WHERE id = ?", (tid,))
             removed_txns += 1
+        try:
+            cur.execute("SELECT COUNT(*) FROM statement_transport_identities WHERE statement_id = ?", (g['id'],))
+            has_id = cur.fetchone()[0]
+            if has_id > 0:
+                raise ValueError(f"安全拒绝：幽灵账单 id={g['id']} 存在活动身份映射，禁止静默级联删除")
+            cur.execute("SELECT COUNT(*) FROM statement_evidence_index WHERE statement_id = ?", (g['id'],))
+            has_ev = cur.fetchone()[0]
+            if has_ev > 0:
+                raise ValueError(f"安全拒绝：幽灵账单 id={g['id']} 存在活动证据索引，禁止静默级联删除")
+        except sqlite3.OperationalError:
+            pass
         cur.execute("DELETE FROM statements WHERE id = ?", (g['id'],))
         if not cur.rowcount:
             continue  # 已被合并流程删除（防御：正常不会发生，计划已互斥）
@@ -333,6 +441,7 @@ def main():
             init_db(args.db)  # 仅 schema 迁移（无还款状态副作用）
 
             conn = sqlite3.connect(args.db, isolation_level=None)  # 显式事务控制
+            conn.execute("PRAGMA foreign_keys = ON")
             cur = conn.cursor()
             cur.execute('BEGIN IMMEDIATE')  # 取写锁：计划/执行/核对同一事务同一快照
             cur.execute(
@@ -454,6 +563,11 @@ def main():
                 group_txn_ok = False
                 group_txn_detail.append(f"组主记录 id={g['primary']['id']} 期望交易 {want} 条实际 {got} 条")
 
+        cur.execute("PRAGMA foreign_key_check")
+        fk_violations = cur.fetchall()
+        if fk_violations:
+            print(f"❌ 发现悬挂外键: {fk_violations}")
+
         checks = [
             ('statements 数量核对（并集去重）', after['statements'] == expected_stmts,
              f"{before['statements']} - 删除并集 {len(deleted_ids)} = {expected_stmts}，实际 {after['statements']}"),
@@ -466,6 +580,10 @@ def main():
             ('合并组交易重数保留', group_txn_ok, '；'.join(group_txn_detail) or f"{len(groups)} 组全部通过"),
             ('cleanup_id_map 映射完整', map_rows - map_rows_before == len(deleted_ids),
              f"删除 {len(deleted_ids)} 条 ↔ 本次新增映射 {map_rows - map_rows_before} 行（历史累计 {map_rows} 行）"),
+            ('statement_transport_identities 映射守恒且无悬挂', after['identities'] == before['identities'],
+             f"清洗前后活动身份数量守恒: 前={before['identities']} 实际={after['identities']}"),
+            ('外键完整性无悬挂 (foreign_key_check 为空)', len(fk_violations) == 0,
+             f"违规数: {len(fk_violations)}"),
         ]
         all_ok = all(ok for _, ok, _ in checks)
         print('\n---------- 核对报告 ----------')
