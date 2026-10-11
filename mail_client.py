@@ -49,10 +49,13 @@ CONFIG_CANDIDATES = [
     os.path.expanduser('email-config.json'),
     os.path.expanduser('email-config.example.json'),
 ]
-DOWNLOAD_DIR = os.path.expanduser('email-downloads')
-RULES_DIR = os.path.expanduser('rules')
-VALIDATION_REPORT_DIR = os.path.expanduser('validation-reports')
-DB_PATH = os.path.expanduser(os.environ.get('MAIL_STATEMENT_DB_PATH', 'statements.db'))
+from parser_paths import resolve_parser_paths, ParserPaths, validate_write_target
+
+_DEFAULT_PATHS = resolve_parser_paths()
+DOWNLOAD_DIR = _DEFAULT_PATHS.download_dir
+RULES_DIR = _DEFAULT_PATHS.rules_dir
+VALIDATION_REPORT_DIR = _DEFAULT_PATHS.report_dir
+DB_PATH = _DEFAULT_PATHS.db_path
 
 BANK_NAME_MAP = {
     'HX': '华夏银行',
@@ -381,11 +384,13 @@ def classify_email_by_uid(uid):
     except Exception as e:
         print(f'❌ 分类失败：{e}')
 
-def validate_email_by_uid(uid, account_name=None):
+def validate_email_by_uid(uid, account_name=None, *, context=None):
     """按规则解析并输出校验报告。"""
+    if context is None:
+        context = resolve_parser_paths()
     try:
         msg = pop3_fetch_message_by_uid(uid, account_name=account_name)
-        validate_and_save_email_message(msg, uid, account_name=account_name)
+        validate_and_save_email_message(msg, uid, account_name=account_name, context=context)
     except Exception as e:
         print(f'验证失败：{e}')
 
@@ -836,10 +841,12 @@ def download_recent_bank_emails(months=3, output_dir=None):
             print(f'❌ 账户 {account_name} 批量下载失败：{e}')
 
 
-def validate_recent_bank_emails(months=3):
+def validate_recent_bank_emails(months=3, *, context=None):
     """专用指令：按规则关键字匹配，批量解析校验并写入 SQLite（每账户单会话复用）。"""
-    init_db(DB_PATH)
-    rules = load_rule_files()
+    if context is None:
+        context = resolve_parser_paths()
+    init_db(context.db_path)
+    rules = load_rule_files(context=context)
     if not rules:
         print('❌ 未找到规则文件，请先在 rules 目录下放置 *.json')
         return
@@ -897,7 +904,7 @@ def validate_recent_bank_emails(months=3):
                     else:
                         _, headers, _ = pop3_retr_by_uid(mail, uid)
                         msg = email.message_from_bytes(b'\r\n'.join(headers))
-                    result = validate_and_save_email_message(msg, uid, rules=rules, account_name=account_name)
+                    result = validate_and_save_email_message(msg, uid, rules=rules, account_name=account_name, context=context)
                     st = (result or {}).get('status')
                     if st in ('saved', 'parse_failed'):
                         ok += 1
@@ -921,16 +928,19 @@ def validate_recent_bank_emails(months=3):
         )
 
 
-def sync_recent_bank_emails(months=3, account_budget_s=60, total_budget_s=270):
+def sync_recent_bank_emails(months=3, account_budget_s=60, total_budget_s=270, *, context=None):
     """Scan, archive and parse in one POP3 session, with bounded account deadlines.
 
     No LLM is used. The global deadline leaves room for the caller's 300s limit
     and always emits a receipt for every configured account.
     """
-    init_db(DB_PATH)
-    rules = load_rule_files()
+    if context is None:
+        context = resolve_parser_paths()
+    init_db(context.db_path)
+    rules = load_rule_files(context=context)
     accounts = load_accounts()
-    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+    validate_write_target(context, context.download_dir)
+    os.makedirs(context.download_dir, exist_ok=True)
     target_banks = {'HX', 'CMB', 'SPDB', 'CMBC', 'ICBC', 'CITIC'}
     account_results = []
     overall_deadline = time.monotonic() + total_budget_s
@@ -960,7 +970,7 @@ def sync_recent_bank_emails(months=3, account_budget_s=60, total_budget_s=270):
                 _save_email_message(uid, msg, output_dir=DOWNLOAD_DIR, format='md', account_name=account_name)
                 acct['downloaded'] += 1
             if need_db:
-                result = validate_and_save_email_message(msg, uid, rules=rules, account_name=account_name)
+                result = validate_and_save_email_message(msg, uid, rules=rules, account_name=account_name, context=context)
                 key = {'saved': 'saved', 'parse_failed': 'parse_failed',
                        'not_statement': 'gated'}.get((result or {}).get('status'), 'errors')
                 acct[key] += 1
@@ -1513,7 +1523,7 @@ def main():
         if len(sys.argv) < 4:
             print('用法：reparse_cached <account_name> <uid>')
             sys.exit(1)
-        result = reparse_cached_statement(sys.argv[2], sys.argv[3])
+        result = reparse_cached_statement(sys.argv[2], sys.argv[3], context=resolve_parser_paths())
         print(json.dumps(result, ensure_ascii=False))
 
     elif cmd == 'unpaid':

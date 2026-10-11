@@ -7,7 +7,7 @@
 - reprocess_by_status: 重试指定状态(failed/pending)的邮件，复用 _retry_llm_summary 的 429 退避。
 - _retry_llm_summary: 带 429 退避的 LLM 摘要（修正原 mail_client 中 time 未导入的潜在 NameError）。
 
-约束：本模块禁止顶层 import mail_client（避免循环依赖）；load_accounts/DB_PATH 在函数内按需延迟导入。
+约束：本模块禁止顶层 import mail_client（避免循环依赖）；load_accounts/context.db_path 在函数内按需延迟导入。
 """
 
 import json
@@ -51,7 +51,7 @@ from statement_parser import (
 )
 
 
-def fetch_recent_emails_and_summarize(months=1, llm_enabled=True, account_budget_s=180):
+def fetch_recent_emails_and_summarize(months=1, llm_enabled=True, account_budget_s=180, *, context=None):
     """双通道收网网关命令：批量抓取解析正则账单，并对其他邮件进行 LLM 结构化摘要提炼。
 
     llm_enabled=False（fetch_only）：通道 A/B 保持（无 LLM），通道 C 仅 upsert_email_body
@@ -62,10 +62,23 @@ def fetch_recent_emails_and_summarize(months=1, llm_enabled=True, account_budget
 
     返回结构化 dict 并在末尾输出 JSON_SUMMARY 区块，供 lite_agent 摆脱日志关键词猜测。
     """
-    from mail_client import DB_PATH, load_accounts  # 延迟导入避免循环依赖
+    from parser_paths import resolve_parser_paths, ParserPaths, validate_write_target
+    if context is None:
+        context = resolve_parser_paths()
+    elif isinstance(context, dict):
+        context = resolve_parser_paths(**context)
+    elif isinstance(context, ParserPaths):
+        pass
+    else:
+        raise TypeError(f"context 必须为 ParserPaths 实例或 dict，收到: {type(context).__name__}")
 
-    init_db(DB_PATH)
-    rules = load_rule_files()
+    validate_write_target(context, context.db_path)
+    validate_write_target(context, context.report_dir)
+
+    from mail_client import load_accounts  # 延迟导入避免循环依赖
+
+    init_db(context.db_path)
+    rules = load_rule_files(context=context)
 
     cutoff = _month_subtract(datetime.now(timezone.utc), int(months))
     mode_label = '拉取+LLM提炼' if llm_enabled else '仅拉取(无LLM,标pending)'
@@ -162,8 +175,8 @@ def fetch_recent_emails_and_summarize(months=1, llm_enabled=True, account_budget
                         print(f'⚠️ 邮件序号 {i} 缺少 UIDL，跳过持久化')
                         continue
 
-                is_dup_bill = uid_exists(DB_PATH, uid, account_name)
-                status, retry_cnt = get_email_summary_status(DB_PATH, account_name, uid)
+                is_dup_bill = uid_exists(context.db_path, uid, account_name)
+                status, retry_cnt = get_email_summary_status(context.db_path, account_name, uid)
                 is_dup_summary = (status in ('processed', 'skipped', 'noise') or (status == 'failed' and retry_cnt >= 3))
                 if not llm_enabled:
                     # fetch-only: pending 与 failed(retry<3) 也跳过（正文已存或交由 enrich/reprocess），只入全新邮件
@@ -182,7 +195,7 @@ def fetch_recent_emails_and_summarize(months=1, llm_enabled=True, account_budget
                         except Exception:
                             pass
                     if _check_subj:
-                        if not check_summary_uid_match(DB_PATH, account_name, uid, _check_subj):
+                        if not check_summary_uid_match(context.db_path, account_name, uid, _check_subj):
                             is_dup_summary = False
                             print(f'  ⚠️ UID={uid} 已被回收 (新主题={_check_subj[:30]}), 重新处理')
 
@@ -226,7 +239,7 @@ def fetch_recent_emails_and_summarize(months=1, llm_enabled=True, account_budget
                         if msg_obj.get('html'):
                             msg.add_alternative(msg_obj['html'], subtype='html')
                         # Graph 正文同样落库，供 enrich 阶段离线读取（真分层）
-                        upsert_email_body(DB_PATH, account_name, uid,
+                        upsert_email_body(context.db_path, account_name, uid,
                                           raw_html=msg_obj.get('html'),
                                           plain_text=body_text,
                                           markdown_tables="")
@@ -249,7 +262,7 @@ def fetch_recent_emails_and_summarize(months=1, llm_enabled=True, account_budget
 
                         content = extract_email_content(msg)
                         body_text = (content.get('plain', '') + '\n' + content.get('markdown', '')).strip()
-                        upsert_email_body(DB_PATH, account_name, uid,
+                        upsert_email_body(context.db_path, account_name, uid,
                                           raw_html=content.get('html'),
                                           plain_text=body_text,
                                           markdown_tables=content.get('markdown'))
@@ -258,7 +271,7 @@ def fetch_recent_emails_and_summarize(months=1, llm_enabled=True, account_budget
                     rule, score = identify_rule(subj, frm, body_text, rules)
                     if rule:
                         print(f'💳 [账单通道] 命中规则 {rule.get("rule_id")} (UID={uid}) 主题: {subj[:30]}')
-                        validate_and_save_email_message(msg, uid, rules=rules, account_name=account_name)
+                        validate_and_save_email_message(msg, uid, rules=rules, account_name=account_name, context=context)
                         
                         # 补充插入 email_summaries，确保账单能在 Meilisearch 搜索引擎和前端界面中展示
                         rec = EmailSummaryRecord(
@@ -275,13 +288,13 @@ def fetch_recent_emails_and_summarize(months=1, llm_enabled=True, account_budget
                             retry_count=0,
                             processed_at=datetime.now(timezone.utc).isoformat()
                         )
-                        rec.id = upsert_email_summary(DB_PATH, rec)
+                        rec.id = upsert_email_summary(context.db_path, rec)
                         
                         new_bills += 1
                         continue
 
                     # 双通道分流 B: 启发式降噪
-                    is_noise, cat, imp = is_noise_email(frm, subj, body_text, DB_PATH)
+                    is_noise, cat, imp = is_noise_email(frm, subj, body_text, context.db_path)
                     if is_noise:
                         print(f'🔕 [降噪拦截] 自动匹配规则 (UID={uid}) 主题: {subj[:30]}')
                         rec = EmailSummaryRecord(
@@ -298,7 +311,7 @@ def fetch_recent_emails_and_summarize(months=1, llm_enabled=True, account_budget
                             retry_count=0,
                             processed_at=datetime.now(timezone.utc).isoformat()
                         )
-                        rec_id = upsert_email_summary(DB_PATH, rec)
+                        rec_id = upsert_email_summary(context.db_path, rec)
                         rec.id = rec_id
                         new_summaries += 1
                         continue
@@ -315,7 +328,7 @@ def fetch_recent_emails_and_summarize(months=1, llm_enabled=True, account_budget
                             status="pending",
                             retry_count=0,
                         )
-                        upsert_email_summary(DB_PATH, rec)
+                        upsert_email_summary(context.db_path, rec)
                         new_summaries += 1
                         continue
 
@@ -338,7 +351,7 @@ def fetch_recent_emails_and_summarize(months=1, llm_enabled=True, account_budget
                             retry_count=retry_cnt,
                             processed_at=datetime.now(timezone.utc).isoformat()
                         )
-                        rec_id = upsert_email_summary(DB_PATH, rec)
+                        rec_id = upsert_email_summary(context.db_path, rec)
                         rec.id = rec_id
                         new_summaries += 1
 
@@ -357,7 +370,7 @@ def fetch_recent_emails_and_summarize(months=1, llm_enabled=True, account_budget
                             status="failed",
                             retry_count=new_retry
                         )
-                        rec_id = upsert_email_summary(DB_PATH, rec)
+                        rec_id = upsert_email_summary(context.db_path, rec)
                         rec.id = rec_id
                         errors += 1
 
@@ -538,7 +551,7 @@ def _emit_high_imp_push(high_importance_summaries, max_days=3):
     print("--- JSON_PUSH_END ---")
 
 
-def reprocess_by_status(db_path=None, status='failed', limit=None):
+def reprocess_by_status(db_path=None, status='failed', limit=None, *, context=None):
     """重试指定状态的邮件：重新连接邮箱拉取正文 + LLM 摘要。
 
     status='failed': 仅 retry_count<3（原有补跑语义）。
@@ -552,8 +565,20 @@ def reprocess_by_status(db_path=None, status='failed', limit=None):
     from statement_db import init_db as _init_db, upsert_email_summary as _upsert
     from mail_client import DB_PATH, load_accounts  # 延迟导入避免循环依赖
 
-    if db_path is None:
-        db_path = DB_PATH
+    from parser_paths import resolve_parser_paths, ParserPaths, validate_write_target
+    if context is not None:
+        if isinstance(context, dict):
+            context = resolve_parser_paths(**context)
+        elif not isinstance(context, ParserPaths):
+            raise TypeError(f"context 必须为 ParserPaths 实例或 dict，收到: {type(context).__name__}")
+        if db_path is not None and os.path.abspath(db_path) != os.path.abspath(context.db_path):
+            raise ValueError(f"显式 db_path ({db_path}) 与传入 context.db_path ({context.db_path}) 不一致")
+    else:
+        context = resolve_parser_paths(db_path=db_path)
+
+    validate_write_target(context, context.db_path)
+    validate_write_target(context, context.report_dir)
+    db_path = context.db_path
     _init_db(db_path)
 
     conn = sqlite3.connect(db_path)

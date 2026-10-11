@@ -87,6 +87,9 @@ def _migrate_account_name(cur) -> None:
 
 
 def init_db(db_path: str) -> None:
+    parent = os.path.dirname(os.path.abspath(db_path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
     conn = sqlite3.connect(db_path)
     try:
         conn.execute('BEGIN IMMEDIATE')

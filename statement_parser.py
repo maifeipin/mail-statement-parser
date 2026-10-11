@@ -15,6 +15,7 @@ from datetime import datetime, timezone, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
+from parser_paths import resolve_parser_paths, validate_write_target, ParserPaths
 from statement_models import (
     StatementRecord, StatementTransactionRecord,
     ValidationResult, ValidationIssue,
@@ -46,10 +47,11 @@ def evidence_version(rule):
     return PARSER_EVIDENCE_VERSION + '-' + hashlib.sha256(
         json.dumps({k:v for k,v in rule.items() if k != '_path'}, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:16]
 
-# 路径常量（与 mail_client 同级目录，os.path.expanduser("rules") 解析结果相同）
-RULES_DIR = os.path.expanduser("rules")
-DB_PATH = os.path.expanduser("statements.db")
-VALIDATION_REPORT_DIR = os.path.expanduser("validation-reports")
+# 路径常量（保持向后兼容/诊断值；内部全面使用显式 context）
+_DEFAULT_PATHS = resolve_parser_paths()
+RULES_DIR = _DEFAULT_PATHS.rules_dir
+DB_PATH = _DEFAULT_PATHS.db_path
+VALIDATION_REPORT_DIR = _DEFAULT_PATHS.report_dir
 
 
 def _safe_decimal(v, strip_tokens=None):
@@ -522,11 +524,22 @@ def parse_citic_transactions_from_body(uid, statement_month, body_text):
     return rows
 
 
-def load_rule_files():
-    """加载规则文件（当前支持 JSON）。"""
-    os.makedirs(RULES_DIR, exist_ok=True)
+def load_rule_files(rules_dir=None, *, context=None):
+    """加载规则文件（当前支持 JSON）。只读访问，不主动创建目录。"""
+    if context is not None:
+        target_dir = context.rules_dir
+    elif rules_dir is not None:
+        target_dir = os.path.abspath(rules_dir)
+    elif RULES_DIR != _DEFAULT_PATHS.rules_dir:
+        target_dir = os.path.abspath(RULES_DIR)
+    else:
+        target_dir = _DEFAULT_PATHS.rules_dir
+
+    if not os.path.isdir(target_dir):
+        return []
+
     rules = []
-    for path in sorted(glob.glob(os.path.join(RULES_DIR, '*.json'))):
+    for path in sorted(glob.glob(os.path.join(target_dir, '*.json'))):
         try:
             with open(path, 'r', encoding='utf-8') as f:
                 rule = json.load(f)
@@ -739,7 +752,7 @@ def _validation_result_to_dict(vr):
         ],
     }
 
-def validate_and_save_email_message(msg, uid, rules=None, account_name=None):
+def validate_and_save_email_message(msg, uid, rules=None, account_name=None, *, context=None):
     """从已下载的 msg 解析、校验并落库账单（三态分流）。
 
     返回 dict，status 取值：
@@ -749,8 +762,25 @@ def validate_and_save_email_message(msg, uid, rules=None, account_name=None):
       - 'not_statement' 未命中账单模板（非账单），不入 statements 表
       - 'error'        处理异常
     """
+    if context is None:
+        kwargs = {}
+        if DB_PATH != _DEFAULT_PATHS.db_path:
+            kwargs['db_path'] = DB_PATH
+        if VALIDATION_REPORT_DIR != _DEFAULT_PATHS.report_dir:
+            kwargs['report_dir'] = VALIDATION_REPORT_DIR
+        context = resolve_parser_paths(**kwargs)
+    elif isinstance(context, dict):
+        context = resolve_parser_paths(**context)
+    elif isinstance(context, ParserPaths):
+        pass
+    else:
+        raise TypeError(f"context 必须为 ParserPaths 实例或 dict，收到: {type(context).__name__}")
+
+    validate_write_target(context, context.db_path)
+    validate_write_target(context, context.report_dir)
+
     if rules is None:
-        rules = load_rule_files()
+        rules = load_rule_files(context=context)
     if not rules:
         print('未找到规则文件，请先在 rules 目录下放置 *.json')
         return {'status': 'error', 'error': 'no_rules'}
@@ -762,7 +792,9 @@ def validate_and_save_email_message(msg, uid, rules=None, account_name=None):
         content = extract_email_content(msg)
         body_text = (content.get('plain', '') + '\n' + content.get('markdown', '')).strip()
         from statement_db import upsert_email_body
-        upsert_email_body(DB_PATH, account_name or 'default', str(uid),
+        validate_write_target(context, context.db_path)
+        init_db(context.db_path)
+        upsert_email_body(context.db_path, account_name or 'default', str(uid),
                           raw_html=content.get('html'),
                           plain_text=body_text,
                           markdown_tables=content.get('markdown'))
@@ -784,8 +816,8 @@ def validate_and_save_email_message(msg, uid, rules=None, account_name=None):
                         'parser_version': PARSER_EVIDENCE_VERSION}],
                 )
                 try:
-                    init_db(DB_PATH)
-                    event_id = upsert_quality_event(DB_PATH, ev)
+                    init_db(context.db_path)
+                    event_id = upsert_quality_event(context.db_path, ev)
                     print(f'⚠️ 疑似账单未命中模板，已记录质量事件：{event_id[:12]}')
                 except Exception as qe:
                     print(f'疑似账单事件写入失败（不影响跳过入库）：{qe}')
@@ -796,7 +828,7 @@ def validate_and_save_email_message(msg, uid, rules=None, account_name=None):
             return {'status': 'not_statement'}
 
         parser_version = evidence_version(rule)
-        captured_cases = capture_quality_cases(DB_PATH, account_name, rule.get('bank_code'))
+        captured_cases = capture_quality_cases(context.db_path, account_name, rule.get('bank_code'))
         fields, fields_meta = extract_statement_by_rule(rule, subj, body_text, return_meta=True)
         pre_outer = {k: fields.get(k) for k in fields}
         _apply_statement_date_month_fallbacks(rule, _to_text(msg.get('Date', '')), fields)
@@ -823,7 +855,7 @@ def validate_and_save_email_message(msg, uid, rules=None, account_name=None):
         bank_code = _to_text(rule.get('bank_code', ''))
 
         # Message-ID 冲突检测：同账户+银行+Message-ID 但 uid 不同 → 记录冲突告警，不静默覆盖
-        conflicts = find_message_id_conflicts(DB_PATH, account_name, message_id, bank_code, str(uid))
+        conflicts = find_message_id_conflicts(context.db_path, account_name, message_id, bank_code, str(uid))
         if conflicts:
             conflict_uids = ','.join(str(c['uid']) for c in conflicts)
             vr.warnings.append(ValidationIssue(
@@ -852,14 +884,15 @@ def validate_and_save_email_message(msg, uid, rules=None, account_name=None):
             'validation': validation_dict
         }
 
-        os.makedirs(VALIDATION_REPORT_DIR, exist_ok=True)
         ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-        out = os.path.join(VALIDATION_REPORT_DIR, f'validation_uid_{uid}_{ts}.json')
+        out = os.path.join(context.report_dir, f'validation_uid_{uid}_{ts}.json')
+        validate_write_target(context, out)
+        os.makedirs(context.report_dir, exist_ok=True)
         with open(out, 'w', encoding='utf-8') as f:
             json.dump(report, f, ensure_ascii=False, indent=2)
 
         # 落库：账单 + 交易明细单事务原子保存（即使新明细为空也清空旧明细，防重解析残留）
-        init_db(DB_PATH)
+        init_db(context.db_path)
         statement = StatementRecord(
             account_name=account_name,
             uid=str(uid),
@@ -1027,7 +1060,7 @@ def validate_and_save_email_message(msg, uid, rules=None, account_name=None):
         verified_fields -= {d.field for d in diagnostics}
         resolution_results = []
         statement_id, txn_count = save_statement_with_transactions(
-            DB_PATH, statement, txns,
+            context.db_path, statement, txns,
             balances=balances, quality_events=quality_event_recs,
             quality_confirmation={
                 'captured_cases': captured_cases, 'evidence_ref': evidence_ref,
@@ -1039,7 +1072,7 @@ def validate_and_save_email_message(msg, uid, rules=None, account_name=None):
         )
 
         run_id = save_validation_run(
-            DB_PATH,
+            context.db_path,
             account_name,
             uid=str(uid),
             bank_code=bank_code,
@@ -1078,7 +1111,7 @@ def validate_and_save_email_message(msg, uid, rules=None, account_name=None):
         # Keep the new transport's original body/report and validation audit;
         # reject duplicate financial rows rather than overwriting old evidence.
         issue = ValidationIssue(code='MESSAGE_ID_CONFLICT', field='message_id', severity='error')
-        run_id = save_validation_run(DB_PATH, account_name, uid=str(uid), bank_code=bank_code,
+        run_id = save_validation_run(context.db_path, account_name, uid=str(uid), bank_code=bank_code,
                     rule_id=_to_text(rule.get('rule_id', '')), passed=False, report_path=out,
                     errors=[issue], warnings=vr.warnings)
         print(f'身份冲突：{exc}；原账单及交易保持不变，已归档新邮件证据')
@@ -1088,16 +1121,31 @@ def validate_and_save_email_message(msg, uid, rules=None, account_name=None):
         return {'status': 'error', 'error': str(e)}
 
 
-def reparse_cached_statement(account_name, uid):
+def reparse_cached_statement(account_name, uid, *, context=None):
     """离线重解析：优先使用 email_bodies 已缓存正文重建邮件，避免网络重拉。
 
     元数据（主题/发件人/日期/Message-ID）取 statements 或 email_summaries 已存记录。
     返回与 validate_and_save_email_message 相同的 dict。
     """
+    if context is None:
+        kwargs = {}
+        if DB_PATH != _DEFAULT_PATHS.db_path:
+            kwargs['db_path'] = DB_PATH
+        if VALIDATION_REPORT_DIR != _DEFAULT_PATHS.report_dir:
+            kwargs['report_dir'] = VALIDATION_REPORT_DIR
+        context = resolve_parser_paths(**kwargs)
+    elif isinstance(context, dict):
+        context = resolve_parser_paths(**context)
+    elif isinstance(context, ParserPaths):
+        pass
+    else:
+        raise TypeError(f"context 必须为 ParserPaths 实例或 dict，收到: {type(context).__name__}")
+
+    validate_write_target(context, context.db_path)
     import sqlite3
     from email.message import EmailMessage
-    init_db(DB_PATH)
-    conn = sqlite3.connect(DB_PATH)
+    init_db(context.db_path)
+    conn = sqlite3.connect(context.db_path)
     conn.row_factory = sqlite3.Row
     try:
         body = conn.execute(
@@ -1124,5 +1172,5 @@ def reparse_cached_statement(account_name, uid):
     msg.set_content(body['plain_text'] or '(无纯文本正文)')
     if body['raw_html']:
         msg.add_alternative(body['raw_html'], subtype='html')
-    return validate_and_save_email_message(msg, uid, account_name=account_name)
+    return validate_and_save_email_message(msg, uid, account_name=account_name, context=context)
 
