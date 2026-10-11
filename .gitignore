@@ -26,3 +26,10 @@ token_*.json
 *.db
 *.sqlite
 *.env
+
+# Database backups and migration temp files
+statements.db.bak*
+statements.db.pre-migrate*
+*.db.bak*
+*.db.pre-migrate*
+replace_script.py
