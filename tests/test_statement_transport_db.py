@@ -777,6 +777,36 @@ class TestStatementTransportDB(unittest.TestCase):
         )
         self.assertEqual(res3['status'], 'identity_conflict')
 
+    def test_manual_incomplete_evidence_replay_requires_identical_bytes(self):
+        import json
+        msg = email.message_from_bytes(self.raw_bytes)
+        msg.replace_header('Content-Type', 'multipart/mixed; boundary="missing"')
+        raw = msg.as_bytes()
+        ev = si.build_evidence_from_raw_eml(raw, account_name='user@163.com',
+                                           bank_code='CMB', transport_uid='manual-partial')
+        self.assertFalse(ev['complete_mime'])
+        anchor = {'total_due': '1234.56', 'is_paid': 0}
+        plan = si.generate_identity_plan(ev, self.ev1, target_statement_id=self.s1_id,
+                                         anchor_snapshot=anchor)
+        path = os.path.join(self.tmp, 'manual-partial-plan.json')
+        with open(path, 'w') as f:
+            json.dump(plan, f)
+        kwargs = dict(account_name='user@163.com', transport_kind='pop3_uidl',
+                      transport_uid='manual-partial', bank_code='CMB',
+                      statement_id=self.s1_id, message_id='<bill.202610@cmb.cn>')
+        sd.associate_transport_identity(self.db, **kwargs, source_evidence=ev,
+                                       source_raw_bytes=raw, method='manual_verified',
+                                       actor='fixture_reviewer', reason='fixture manual approval',
+                                       plan_id=plan['plan_id'], plan_hash=plan['plan_hash'],
+                                       plan_path=path, anchor_snapshot=anchor)
+        result = sd.associate_transport_identity(self.db, **kwargs, source_raw_bytes=raw)
+        self.assertEqual(result['status'], 'already_associated')
+        with self.assertRaises(sd.MessageIdentityConflict):
+            sd.associate_transport_identity(self.db, **kwargs, source_raw_bytes=raw + b'changed')
+        import sqlite3
+        with sqlite3.connect(self.db) as c:
+            self.assertEqual(c.execute('SELECT COUNT(*) FROM statement_identity_audit').fetchone()[0], 1)
+
     def test_existing_claim_without_raw_content_is_rejected(self):
         ev = self._make_candidate_evidence(uid='closeout-claim')
         kwargs = dict(account_name='user@163.com', transport_kind='pop3_uidl',

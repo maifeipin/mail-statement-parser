@@ -2124,14 +2124,14 @@ def associate_transport_identity(
 
         # 4. 检查现有运输键映射 (Step C, U2: 已有映射的幂等返回必须在证据验证之后)
         cur.execute("""
-            SELECT id, statement_id, message_id, raw_content_hash, evidence_digest
+            SELECT id, statement_id, message_id, raw_content_hash, evidence_digest, method
             FROM statement_transport_identities
             WHERE account_name = ? AND transport_kind = ? AND transport_uid = ? AND bank_code = ?
         """, (account_name, transport_kind, str(transport_uid), bank_code))
         existing = cur.fetchone()
 
         if existing:
-            ext_id, ext_sid, ext_msgid, ext_raw_hash, ext_digest = existing
+            ext_id, ext_sid, ext_msgid, ext_raw_hash, ext_digest, ext_method = existing
             if ext_sid != statement_id:
                 raise MessageIdentityConflict(
                     f'Transport key ({account_name},{transport_kind},{transport_uid},{bank_code}) '
@@ -2158,13 +2158,16 @@ def associate_transport_identity(
                     raise MessageIdentityConflict(
                         f'Transport key reused for different raw content hash / digest: {evidence_digest} != {ext_digest}'
                     )
-                if ext_raw_hash and rebuilt_src_ev.get('raw_content_hash') != ext_raw_hash and not ext_digest:
+                if not ext_digest and (not ext_raw_hash or rebuilt_src_ev.get('raw_content_hash') != ext_raw_hash):
                     raise MessageIdentityConflict(
                         f'Transport key reused for different raw content hash: {rebuilt_src_ev.get("raw_content_hash")} != {ext_raw_hash}'
                     )
 
                 if method == 'digest_equal':
-                    if rebuilt_src_ev.get('coverage_status') != 'complete':
+                    approved_same_raw = (ext_method == 'manual_verified' and
+                                         rebuilt_src_ev.get('raw_content_hash') == ext_raw_hash and
+                                         bool(ext_raw_hash))
+                    if rebuilt_src_ev.get('coverage_status') != 'complete' and not approved_same_raw:
                         raise ValueError(f"源端字节重建证据未达 complete 覆盖: coverage_status={rebuilt_src_ev.get('coverage_status')}")
                 elif method == 'manual_verified':
                     _verify_manual_plan(plan_path, plan_id, plan_hash, statement_id, account_name, bank_code, transport_uid, target_row, db_path, transport_kind=transport_kind, source_ev=rebuilt_src_ev)
