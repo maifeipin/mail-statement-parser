@@ -18,6 +18,20 @@ import statement_identity as si
 
 class TestStatementIdentityContract(unittest.TestCase):
 
+    def test_message_policy_cannot_change_raw_evidence_digest(self):
+        raw = (b'Message-ID: <policy@example.invalid>\r\n'
+               b'From: "Bank"<billing@example.invalid>\r\n'
+               b'Subject: Monthly statement\r\n'
+               b'Date: Sat, 10 Oct 2026 10:00:00 +0800\r\n'
+               b'Content-Type: text/plain; charset="utf-8"\r\n\r\nbody\r\n')
+        canonical = si.build_evidence_from_raw_eml(raw, 'fixture', 'CMB')
+        for policy in (email.policy.compat32, email.policy.default):
+            msg = email.message_from_bytes(raw, policy=policy)
+            evidence = si.build_evidence_from_email_message(msg, raw_bytes=raw,
+                                                            account_name='fixture', bank_code='CMB')
+            self.assertEqual(evidence['complete_content_digest'], canonical['complete_content_digest'])
+            self.assertEqual(evidence['headers'], canonical['headers'])
+
     def test_sender_metadata_spacing_preserves_identity_boundaries(self):
         self.assertTrue(si.sender_metadata_equal('Bank <billing@example.invalid>',
                                                 'Bank<billing@example.invalid>'))

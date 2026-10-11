@@ -225,6 +225,11 @@ def build_evidence_from_email_message(
     4. 文本规范化后的度量 (normalized bytes length) 保持一致，避免 CRLF 导致 size 差异；
     5. Graph 合成正文 (is_synthesized=True) 明确标记 coverage_unknown。
     """
+    # Raw evidence uses one parser policy regardless of the caller's Message type.
+    # This preserves the existing v1 raw-EML contract and avoids compat32/default drift.
+    if raw_bytes:
+        msg = email.message_from_bytes(raw_bytes, policy=email.policy.default)
+
     headers = extract_header_evidence(msg)
     raw_hash = hashlib.sha256(raw_bytes).hexdigest() if raw_bytes else None
 
