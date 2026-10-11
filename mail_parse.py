@@ -13,36 +13,42 @@ from datetime import timezone
 
 
 class HTMLTableParser(HTMLParser):
-    """解析 HTML 表格"""
+    """Each physical table owns its rows; layout ancestors never reuse child rows."""
     def __init__(self):
         super().__init__()
         self.tables = []
-        self.current_table = []
-        self.current_row = []
-        self.current_cell = []
-        self.in_cell = False
+        self.stack = []
 
     def handle_starttag(self, tag, attrs):
         if tag == 'table':
-            self.current_table = []
-        elif tag == 'tr':
-            self.current_row = []
-        elif tag in ['td', 'th']:
-            self.in_cell = True
-            self.current_cell = []
+            self.stack.append({'rows': [], 'row': None, 'cell': None})
+        elif self.stack:
+            table = self.stack[-1]
+            if tag == 'tr':
+                table['row'] = []
+            elif tag in ('td', 'th'):
+                table['cell'] = []
 
     def handle_endtag(self, tag):
-        if tag == 'table' and self.current_table:
-            self.tables.append(self.current_table)
-        elif tag == 'tr' and self.current_row:
-            self.current_table.append(self.current_row)
-        elif tag in ['td', 'th']:
-            self.in_cell = False
-            self.current_row.append(''.join(self.current_cell).strip())
+        if not self.stack:
+            return
+        table = self.stack[-1]
+        if tag == 'table':
+            self.stack.pop()
+            if table['rows']:
+                self.tables.append(table['rows'])
+        elif tag == 'tr':
+            if table['row']:
+                table['rows'].append(table['row'])
+            table['row'] = None
+        elif tag in ('td', 'th'):
+            if table['cell'] is not None and table['row'] is not None:
+                table['row'].append(''.join(table['cell']).strip())
+            table['cell'] = None
 
     def handle_data(self, data):
-        if self.in_cell:
-            self.current_cell.append(data.strip())
+        if self.stack and self.stack[-1]['cell'] is not None:
+            self.stack[-1]['cell'].append(data.strip())
 
 
 def decode_mime(s):
@@ -115,8 +121,12 @@ def tables_to_markdown(tables):
 
     md_parts = []
     for table_idx, table in enumerate(tables, 1):
-        if len(table) < 2:
+        if not table:
             continue
+        # Image-labelled layouts often put each detail row in its own table.
+        # Retain the row as data rather than silently treating it as a header.
+        if len(table) == 1:
+            table = [[''] * len(table[0])] + table
 
         md_parts.append(f'\n### 表格 {table_idx}\n')
 

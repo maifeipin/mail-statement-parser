@@ -41,7 +41,8 @@
         "source_probe": {
           "label_pattern": "(?:到期还款日|最后还款日|Payment\\s*Due\\s*Date)",
           "region_pattern": "(?:本期应还金额|账单日|上期应还金额)"
-        }
+        },
+        "html_element_id": "paymentDueDate"
       },
       "total_due": {
         "type": "regex",
@@ -52,7 +53,8 @@
         "source_probe": {
           "label_pattern": "本期应还金额",
           "region_pattern": "(?:本期应还金额|账单日|上期应还金额)"
-        }
+        },
+        "html_element_id": "L1rmbLcurrBal"
       },
       "minimum_due": {
         "type": "regex",
@@ -63,7 +65,8 @@
         "source_probe": {
           "label_pattern": "最低还款(?:金额|额)",
           "region_pattern": "(?:本期应还金额|账单日|上期应还金额)"
-        }
+        },
+        "html_element_id": "L1rmbLdueAmt"
       }
     }
   },

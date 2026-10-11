@@ -16,6 +16,11 @@
       "本期应还",
       "最低还款",
       "还款日"
+    ],
+    "subject_required_patterns": [
+      "电子对账单",
+      "电子对帐单",
+      "电子账单"
     ]
   },
   "extract_rules": {

@@ -23,7 +23,7 @@ from statement_models import (
 )
 from statement_db import (
     init_db, upsert_statement, save_validation_run, replace_transactions,
-    save_statement_with_transactions, find_message_id_conflicts, MessageIdentityConflict,
+    save_statement_with_transactions, find_message_id_conflicts, MessageIdentityConflict, FinancialFieldRegression,
     upsert_quality_event, capture_quality_cases, confirm_quality_sources,
     find_canonical_by_transport, associate_transport_identity, get_transport_identity, save_statement_evidence_index, get_statement_evidence,
 )
@@ -36,7 +36,7 @@ from mail_quality import (
     make_case_key,
 )
 
-from statement_evidence import field_meta, parse_semantic_transactions, detail_fingerprint, purpose_availability, confirmed_currency
+from statement_evidence import html_element_values, field_meta, parse_semantic_transactions, detail_fingerprint, purpose_availability, confirmed_currency
 
 # Resolution evidence must expire after parser/rule changes, not a manually bumped constant.
 PARSER_EVIDENCE_VERSION = 'r6.2-' + hashlib.sha256(b''.join(
@@ -574,6 +574,8 @@ def identify_rule(subject, sender, body_text, rules):
         sender_score = _match_score(sender, m.get('sender_patterns', [])) * 5
         subject_score = _match_score(subject, m.get('subject_patterns', [])) * 3
         body_score = _match_score(body_text, m.get('body_signatures', []))
+        if m.get('subject_required_patterns') and not _match_score(subject, m['subject_required_patterns']):
+            continue
         if m.get('subject_patterns') and subject_score == 0:
             continue
         if sender_score == 0 and subject_score == 0:
@@ -587,12 +589,13 @@ def identify_rule(subject, sender, body_text, rules):
             best_score = score
     return best, best_score
 
-def extract_statement_by_rule(rule, subject, body_text, return_meta=False):
+def extract_statement_by_rule(rule, subject, body_text, return_meta=False, *, html_content=None):
     """提取账单字段。return_meta=True 时返回 (fields, meta)：meta 为
     {字段: {value, source, rule_version?}}，source ∈ FIELD_SOURCES（重构契约 §2.1）。"""
     fields = {}
     raw_values = {}
     matched_values = {}
+    html_evidence = {}
     rules = rule.get('extract_rules', {}).get('statement_fields', {})
     for name, cfg in rules.items():
         source = subject if cfg.get('source') == 'subject' else body_text
@@ -608,6 +611,12 @@ def extract_statement_by_rule(rule, subject, body_text, return_meta=False):
                     value = m.group(1).strip()
                 else:
                     value = m.group(0).strip()
+        if value is None and cfg.get('html_element_id') and html_content is not None:
+            values = html_element_values(html_content, cfg['html_element_id'])
+            if values:
+                html_evidence[name] = {'element_id': cfg['html_element_id'], 'values': values}
+                if len(values) == 1 and values[0] is not None:
+                    value = values[0]
         fields[name] = value
         raw_values[name] = value
         matched_values[name] = m.group(0) if pattern and m else None
@@ -650,6 +659,11 @@ def extract_statement_by_rule(rule, subject, body_text, return_meta=False):
         meta[k] = field_meta(k, v, raw_values.get(k), matched_values.get(k), cfg,
                              subject if cfg.get('source') == 'subject' else body_text,
                              inferred, rule_ver)
+        if k in html_evidence:
+            meta[k]['evidence'].update(source='html_element', **html_evidence[k])
+            if v is None:
+                meta[k]['source'] = 'extraction_failed'
+                meta[k]['evidence']['reason'] = 'HTML element is ambiguous, incomplete or invalid'
         if inferred:
             before=field_meta(k,None,raw_values.get(k),matched_values.get(k),cfg,
                               subject if cfg.get('source') == 'subject' else body_text)
@@ -832,7 +846,7 @@ def validate_and_save_email_message(msg, uid, rules=None, account_name=None, *, 
 
         parser_version = evidence_version(rule)
         captured_cases = capture_quality_cases(context.db_path, account_name, rule.get('bank_code'))
-        fields, fields_meta = extract_statement_by_rule(rule, subj, body_text, return_meta=True)
+        fields, fields_meta = extract_statement_by_rule(rule, subj, body_text, return_meta=True, html_content=content.get('html'))
         pre_outer = {k: fields.get(k) for k in fields}
         _apply_statement_date_month_fallbacks(rule, _to_text(msg.get('Date', '')), fields)
         # 外层 fallback（SPDB 账单日从邮件日期推导等）同样标记 inferred
@@ -1302,6 +1316,28 @@ def validate_and_save_email_message(msg, uid, rules=None, account_name=None, *, 
             'baseline_status': quality_data['baseline_status'],
             'resolution_results': resolution_results,
         }
+    except FinancialFieldRegression as exc:
+        diag = Diagnostic(code='REPARSE_FINANCIAL_REGRESSION', field=','.join(exc.fields),
+                          severity='error', reason=str(exc),
+                          affected_purposes=['financial_summary', 'repayment_reminder'],
+                          evidence_ref=evidence_ref)
+        event = QualityEventRecord(
+            case_key=f'reparse_guard|{account_name}|{bank_code}|{message_id}',
+            event_type='quality_detected', account_name=account_name, bank_code=bank_code,
+            template_version=template_version, diagnostics=[diag], evidence_refs=[evidence_ref])
+        event_id = upsert_quality_event(context.db_path, event)
+        if raw_bytes:
+            si.archive_evidence_eml(context.data_root, raw_bytes, hashlib.sha256(raw_bytes).hexdigest(), context=context)
+        report['save_outcome'] = {'status': 'reparse_blocked', 'retained_statement_id': exc.statement_id,
+                                  'missing_fields': exc.fields, 'quality_event_id': event_id}
+        with open(out, 'w', encoding='utf-8') as f:
+            json.dump(report, f, ensure_ascii=False, indent=2)
+        run_id = save_validation_run(context.db_path, account_name, str(uid), bank_code,
+                                    rule_id=rule.get('rule_id'), passed=False, report_path=out,
+                                    errors=[ValidationIssue(code=diag.code, field=diag.field, severity='error')], warnings=[])
+        return {'status': 'reparse_blocked', 'statement_id': exc.statement_id,
+                'missing_fields': exc.fields, 'quality_event_id': event_id,
+                'run_id': run_id, 'report_path': out}
     except MessageIdentityConflict as exc:
         # Keep the new transport's original body/report and validation audit;
         # reject duplicate financial rows rather than overwriting old evidence.

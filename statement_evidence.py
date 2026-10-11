@@ -1,6 +1,7 @@
 """Deterministic source evidence. No inference from merchants, regions or ratios."""
 import json
 import re
+from html.parser import HTMLParser
 from decimal import Decimal, InvalidOperation
 from mail_quality import dedupe_table_blocks, split_markdown_table_blocks, normalize_header_cell
 from statement_models import StatementTransactionRecord, Diagnostic
@@ -111,6 +112,46 @@ def parse_semantic_transactions(uid, month, markdown, rule, date_parser):
     original_currency=orig,original_currency_source=orig_source,txn_location_code=get('location') or None,
     direction='credit' if amount<0 else 'debit',raw_row_json=json.dumps(raw,ensure_ascii=False)))
  return rows,{'candidate_row_count':candidates,'rejected_row_count':rejected,'table_block_count':len(blocks)},diags
+
+
+def html_element_values(html, element_id):
+    """Closed element texts only; duplicated IDs remain ambiguous to the caller."""
+    class Collector(HTMLParser):
+        def __init__(self):
+            super().__init__(convert_charrefs=True)
+            self.stack = []
+            self.active = []
+            self.values = []
+        def handle_starttag(self, tag, attrs):
+            if tag in ('area','base','br','col','embed','hr','img','input','link','meta','param','source','track','wbr'):
+                return
+            self.stack.append(tag)
+            if dict(attrs).get('id') == element_id:
+                self.active.append((len(self.stack), []))
+        def handle_startendtag(self, tag, attrs):
+            if dict(attrs).get('id') == element_id:
+                self.values.append('')
+        def handle_data(self, data):
+            if 'script' not in self.stack and 'style' not in self.stack:
+                for _, parts in self.active:
+                    parts.append(data)
+        def handle_endtag(self, tag):
+            if tag not in self.stack:
+                return
+            index = len(self.stack) - 1 - self.stack[::-1].index(tag)
+            self.stack = self.stack[:index]
+            remaining = []
+            for depth, parts in self.active:
+                if depth > len(self.stack):
+                    self.values.append(''.join(parts).strip())
+                else:
+                    remaining.append((depth, parts))
+            self.active = remaining
+    parser = Collector()
+    parser.feed(html or '')
+    parser.close()
+    # Unclosed captures cannot be used as complete source evidence.
+    return parser.values + [None for _ in parser.active]
 
 def field_meta(name, value, raw, matched_text, cfg, source_text, inferred=False, rule_version=None):
  evidence={'source':cfg.get('source','body_text'),'matched_text':matched_text,'raw_value':raw}

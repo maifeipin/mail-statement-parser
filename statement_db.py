@@ -12,6 +12,14 @@ from statement_models import (StatementRecord, ValidationIssue, StatementTransac
                               EmailSummaryRecord, QualityEventRecord, StatementBalanceRecord)
 
 
+class FinancialFieldRegression(ValueError):
+    """A nominally valid reparse would erase existing financial fields."""
+    def __init__(self, statement_id, fields):
+        self.statement_id = statement_id
+        self.fields = list(fields)
+        super().__init__('Reparse would erase existing fields: ' + ', '.join(fields))
+
+
 class MessageIdentityConflict(ValueError):
     """Same account/bank/Message-ID under a different transport identity."""
 
@@ -750,7 +758,7 @@ def save_statement_with_transactions(db_path: str, s: StatementRecord,
         cur = conn.cursor()
         # 保存前旧值（判断首次落库与关键字段变化，is_paid 保护不依赖此查询）
         cur.execute(
-            "SELECT id, due_date, total_due, is_paid, parse_status FROM statements WHERE account_name=? AND uid=? AND bank_code=?",
+            "SELECT id, due_date, total_due, is_paid, parse_status, minimum_due, statement_month, statement_date FROM statements WHERE account_name=? AND uid=? AND bank_code=?",
             (s.account_name, str(s.uid), s.bank_code),
         )
         existing = cur.fetchone()
@@ -781,6 +789,15 @@ def save_statement_with_transactions(db_path: str, s: StatementRecord,
             cnt = int(cur.fetchone()[0])
             conn.commit()
             return existing_id, cnt
+
+        if existing and existing[4] == 'ok' and incoming_status == 'ok':
+            protected = {'due_date': 1, 'total_due': 2, 'minimum_due': 5,
+                         'statement_month': 6, 'statement_date': 7}
+            regressions = [name for name, index in protected.items()
+                           if existing[index] is not None and existing[index] != ''
+                           and (getattr(s, name) is None or getattr(s, name) == '')]
+            if regressions:
+                raise FinancialFieldRegression(int(existing[0]), regressions)
 
         cur.execute(
             """

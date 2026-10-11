@@ -65,7 +65,9 @@ class BillingSyncTests(unittest.TestCase):
              patch.object(client, 'load_rule_files', return_value=[{'bank_code': 'CMB'}]), \
              patch.object(client, 'load_accounts', return_value=[{'account': 'a'}, {'account': 'b'}]), \
              patch.object(client, '_collect_recent_bill_uids', side_effect=collector):
-            return client.sync_recent_bank_emails(account_budget_s=budget)
+            return client.sync_recent_bank_emails(account_budget_s=budget,
+                context=client.resolve_parser_paths(data_root=temp, db_path=client.DB_PATH,
+                                                     download_dir=client.DOWNLOAD_DIR))
 
     def test_scan_deadline_interrupts_and_continues_next_account(self):
         original_handler = signal.getsignal(signal.SIGALRM)
