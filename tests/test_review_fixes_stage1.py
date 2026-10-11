@@ -153,7 +153,7 @@ class TestR2IdempotentMigrationAndReadOnlyZeroWrite(unittest.TestCase):
         sid, _ = sd.save_statement_with_transactions(self.db, s, [
             StatementTransactionRecord(
                 account_name='testbox', uid='UID-RO', bank_code='CMB', txn_date='2026-10-02',
-                description='测试消费', amount='200.00', currency='CNY', direction='debit',
+                description='测试消费', amount='200.00', currency='CNY', currency_source='extracted', direction='debit',
             )
         ])
 
@@ -355,27 +355,27 @@ class TestA3DirectionHandlingAndConflicts(unittest.TestCase):
             # 1. 正常支出 100
             StatementTransactionRecord(
                 account_name='box', uid='U-A3', bank_code='CMB', txn_date='2026-10-01',
-                description='M1', amount='100.00', currency='CNY', direction='debit',
+                description='M1', amount='100.00', currency='CNY', currency_source='extracted', direction='debit',
             ),
             # 2. 未知方向 (None) 50
             StatementTransactionRecord(
                 account_name='box', uid='U-A3', bank_code='CMB', txn_date='2026-10-02',
-                description='M1', amount='50.00', currency='CNY', direction=None,
+                description='M1', amount='50.00', currency='CNY', currency_source='extracted', direction=None,
             ),
             # 3. 未知方向 ('unknown') 30
             StatementTransactionRecord(
                 account_name='box', uid='U-A3', bank_code='CMB', txn_date='2026-10-03',
-                description='M1', amount='30.00', currency='CNY', direction='unknown',
+                description='M1', amount='30.00', currency='CNY', currency_source='extracted', direction='unknown',
             ),
             # 4. 方向与符号冲突 (标为 debit 但金额为 -20)
             StatementTransactionRecord(
                 account_name='box', uid='U-A3', bank_code='CMB', txn_date='2026-10-04',
-                description='M1', amount='-20.00', currency='CNY', direction='debit',
+                description='M1', amount='-20.00', currency='CNY', currency_source='extracted', direction='debit',
             ),
             # 5. 正常退款 (credit) -30
             StatementTransactionRecord(
                 account_name='box', uid='U-A3', bank_code='CMB', txn_date='2026-10-05',
-                description='M1', amount='-30.00', currency='CNY', direction='credit',
+                description='M1', amount='-30.00', currency='CNY', currency_source='extracted', direction='credit',
             ),
         ]
         sd.save_statement_with_transactions(self.db, s, txns)
@@ -425,13 +425,13 @@ class TestA4FxRatesDisaggregationAndAverages(unittest.TestCase):
         txns = [
             StatementTransactionRecord(
                 account_name='box', uid='U-A4-1', bank_code='CMB', txn_date='2026-10-01',
-                description='SAAS_TOOL', amount='100.00', currency='CNY', direction='debit',
-                original_amount='14.00', original_currency='USD',
+                description='SAAS_TOOL', amount='100.00', currency='CNY', currency_source='extracted', direction='debit',
+                original_amount='14.00', original_currency='USD', original_currency_source='extracted',
             ),
             StatementTransactionRecord(
                 account_name='box', uid='U-A4-1', bank_code='CMB', txn_date='2026-10-02',
-                description='SAAS_TOOL', amount='72.00', currency='CNY', direction='debit',
-                original_amount='10.00', original_currency='USD',
+                description='SAAS_TOOL', amount='72.00', currency='CNY', currency_source='extracted', direction='debit',
+                original_amount='10.00', original_currency='USD', original_currency_source='extracted',
             ),
         ]
         sd.save_statement_with_transactions(self.db, s, txns)
@@ -469,15 +469,15 @@ class TestA4FxRatesDisaggregationAndAverages(unittest.TestCase):
         sd.save_statement_with_transactions(self.db, s1, [
             StatementTransactionRecord(
                 account_name='box', uid='U-A4-2', bank_code='CMB', txn_date='2026-09-10',
-                description='GLOBAL_STORE', amount='100.00', currency='CNY', direction='debit',
-                original_amount='14.00', original_currency='USD',
+                description='GLOBAL_STORE', amount='100.00', currency='CNY', currency_source='extracted', direction='debit',
+                original_amount='14.00', original_currency='USD', original_currency_source='extracted',
             )
         ])
         sd.save_statement_with_transactions(self.db, s2, [
             StatementTransactionRecord(
                 account_name='box', uid='U-A4-3', bank_code='CMB', txn_date='2026-10-15',
-                description='GLOBAL_STORE', amount='46.00', currency='CNY', direction='debit',
-                original_amount='1000.00', original_currency='JPY',
+                description='GLOBAL_STORE', amount='46.00', currency='CNY', currency_source='extracted', direction='debit',
+                original_amount='1000.00', original_currency='JPY', original_currency_source='extracted',
             )
         ])
 

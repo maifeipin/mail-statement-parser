@@ -13,6 +13,7 @@ import os
 import glob
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal, InvalidOperation
+from pathlib import Path
 
 from statement_models import (
     StatementRecord, StatementTransactionRecord,
@@ -22,7 +23,7 @@ from statement_models import (
 from statement_db import (
     init_db, upsert_statement, save_validation_run, replace_transactions,
     save_statement_with_transactions, find_message_id_conflicts, MessageIdentityConflict,
-    upsert_quality_event,
+    upsert_quality_event, capture_quality_cases, confirm_quality_sources,
 )
 from mail_parse import decode_mime, _to_text, extract_email_content, _parse_email_datetime
 from mail_quality import (
@@ -31,6 +32,19 @@ from mail_quality import (
     diagnose_missing_field, missing_fields_by_purpose, events_from_diagnostics,
     make_case_key,
 )
+
+from statement_evidence import field_meta, parse_semantic_transactions, detail_fingerprint, purpose_availability, confirmed_currency
+
+# Resolution evidence must expire after parser/rule changes, not a manually bumped constant.
+PARSER_EVIDENCE_VERSION = 'r6.2-' + hashlib.sha256(b''.join(
+    (Path(__file__).parent / name).read_bytes()
+    for name in ('statement_parser.py','statement_evidence.py','mail_quality.py')
+)).hexdigest()[:16]
+
+
+def evidence_version(rule):
+    return PARSER_EVIDENCE_VERSION + '-' + hashlib.sha256(
+        json.dumps({k:v for k,v in rule.items() if k != '_path'}, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:16]
 
 # 路径常量（与 mail_client 同级目录，os.path.expanduser("rules") 解析结果相同）
 RULES_DIR = os.path.expanduser("rules")
@@ -48,7 +62,8 @@ def _safe_decimal(v, strip_tokens=None):
     if not s:
         return None
     try:
-        return Decimal(s)
+        value = Decimal(s)
+        return value if value.is_finite() else None
     except InvalidOperation:
         return None
 
@@ -105,7 +120,7 @@ def _resolve_monthly_day_date(v, statement_month):
 
 
 def _infer_cmb_due_date(body_text, statement_date):
-    """招商账单还款日兜底：优先标签匹配，失败时按账单日+18天择优估算。"""
+    """招商账单还款日兜底：仅接受还款标签附近的日期，不使用账单日/广告日期估算。"""
     if not body_text:
         return None
 
@@ -122,37 +137,8 @@ def _infer_cmb_due_date(body_text, statement_date):
         if d:
             return d
 
-    # 2) 标签缺失时，从正文日期候选中按 statement_date+18 天择优
-    if not statement_date:
-        return None
-    try:
-        stmt_dt = datetime.strptime(statement_date, '%Y-%m-%d').date()
-    except ValueError:
-        return None
-
-    candidates = set(re.findall(r'(20\d{2}[/-]\d{1,2}[/-]\d{1,2})', body_text))
-    if not candidates:
-        return None
-
-    parsed_candidates = []
-    for c in candidates:
-        d = _parse_date(c, ['%Y-%m-%d', '%Y/%m/%d'])
-        if not d:
-            continue
-        try:
-            dd = datetime.strptime(d, '%Y-%m-%d').date()
-        except ValueError:
-            continue
-        # 常见信用卡还款日在账单日后 7~40 天内
-        if stmt_dt <= dd <= stmt_dt + timedelta(days=40):
-            parsed_candidates.append(dd)
-
-    if not parsed_candidates:
-        return None
-
-    expected = stmt_dt + timedelta(days=18)
-    best = min(parsed_candidates, key=lambda x: (abs((x - expected).days), x))
-    return best.isoformat()
+    # Unlabeled dates (statement period / advertisements) do not prove repayment dates.
+    return None
 
 
 def _apply_due_date_fallbacks(rule, body_text, fields):
@@ -524,6 +510,7 @@ def parse_citic_transactions_from_body(uid, statement_month, body_text):
                 description=desc,
                 amount=str(d),
                 currency='CNY',
+                currency_source='extracted',
                 direction='credit' if d < 0 else 'debit',
                 raw_row_json=json.dumps(
                     {'txn': txn_raw, 'post': post_raw, 'desc': desc,
@@ -589,6 +576,8 @@ def extract_statement_by_rule(rule, subject, body_text, return_meta=False):
     """提取账单字段。return_meta=True 时返回 (fields, meta)：meta 为
     {字段: {value, source, rule_version?}}，source ∈ FIELD_SOURCES（重构契约 §2.1）。"""
     fields = {}
+    raw_values = {}
+    matched_values = {}
     rules = rule.get('extract_rules', {}).get('statement_fields', {})
     for name, cfg in rules.items():
         source = subject if cfg.get('source') == 'subject' else body_text
@@ -605,6 +594,8 @@ def extract_statement_by_rule(rule, subject, body_text, return_meta=False):
                 else:
                     value = m.group(0).strip()
         fields[name] = value
+        raw_values[name] = value
+        matched_values[name] = m.group(0) if pattern and m else None
 
     normalize = rule.get('normalize_rules', {})
     date_formats = normalize.get('date_formats', [])
@@ -623,7 +614,8 @@ def extract_statement_by_rule(rule, subject, body_text, return_meta=False):
         fields['due_date'] = _parse_date(fields['due_date'], date_formats)
 
     pre_fallback = {k: fields.get(k) for k in fields}  # fallback 前快照（inferred 判据）
-    _apply_due_date_fallbacks(rule, body_text, fields)
+    if not (raw_values.get('due_date') is not None and fields.get('due_date') is None):
+        _apply_due_date_fallbacks(rule, body_text, fields)
     _apply_amount_fallbacks(rule, body_text, fields)
 
     for amt_key in ('total_due', 'minimum_due'):
@@ -638,17 +630,15 @@ def extract_statement_by_rule(rule, subject, body_text, return_meta=False):
     rule_ver = rule.get('template_version') or rule.get('rule_id')
     meta = {}
     for k, v in fields.items():
-        if v is None:
-            meta[k] = {'value': None, 'source': 'unknown'}
-        elif k in ('total_due', 'minimum_due'):
-            if _safe_decimal(pre_fallback.get(k)) == _safe_decimal(v) and v is not None:
-                meta[k] = {'value': v, 'source': 'extracted'}
-            else:
-                meta[k] = {'value': v, 'source': 'inferred', 'rule_version': rule_ver}
-        elif pre_fallback.get(k) != v:
-            meta[k] = {'value': v, 'source': 'inferred', 'rule_version': rule_ver}
-        else:
-            meta[k] = {'value': v, 'source': 'extracted'}
+        inferred = (v is not None and pre_fallback.get(k) is None)
+        cfg = rules[k]
+        meta[k] = field_meta(k, v, raw_values.get(k), matched_values.get(k), cfg,
+                             subject if cfg.get('source') == 'subject' else body_text,
+                             inferred, rule_ver)
+        if inferred:
+            before=field_meta(k,None,raw_values.get(k),matched_values.get(k),cfg,
+                              subject if cfg.get('source') == 'subject' else body_text)
+            meta[k]['evidence']['before_fallback']=before
     return fields, meta
 
 def validate_statement_by_rule(rule, fields):
@@ -657,7 +647,7 @@ def validate_statement_by_rule(rule, fields):
 
     # 必填校验
     for name in vr.get('required_statement_fields', []):
-        if not fields.get(name):
+        if fields.get(name) is None or fields.get(name) == '':
             result.errors.append(ValidationIssue(code='PARSE_REQUIRED_FIELD_MISSING', field=name, severity='error'))
 
     # 规则校验
@@ -790,7 +780,8 @@ def validate_and_save_email_message(msg, uid, rules=None, account_name=None):
                     evidence_refs=[{'kind': 'email', 'account': account_name, 'uid': str(uid),
                                     'subject': subj[:80],
                                     'message_id': _to_text(msg.get('Message-ID', '')).strip() or None,
-                                    'content_hash': hashlib.sha256(body_text.encode()).hexdigest()}],
+                                    'content_hash': hashlib.sha256(body_text.encode()).hexdigest(),
+                        'parser_version': PARSER_EVIDENCE_VERSION}],
                 )
                 try:
                     init_db(DB_PATH)
@@ -804,6 +795,8 @@ def validate_and_save_email_message(msg, uid, rules=None, account_name=None):
             print('未命中账单模板（非账单），跳过入库')
             return {'status': 'not_statement'}
 
+        parser_version = evidence_version(rule)
+        captured_cases = capture_quality_cases(DB_PATH, account_name, rule.get('bank_code'))
         fields, fields_meta = extract_statement_by_rule(rule, subj, body_text, return_meta=True)
         pre_outer = {k: fields.get(k) for k in fields}
         _apply_statement_date_month_fallbacks(rule, _to_text(msg.get('Date', '')), fields)
@@ -815,7 +808,9 @@ def validate_and_save_email_message(msg, uid, rules=None, account_name=None):
             if v is None:
                 fields_meta[k] = {'value': None, 'source': 'unknown'}
             elif pre_outer.get(k) != v:
-                fields_meta[k] = {'value': v, 'source': 'inferred', 'rule_version': rule_ver}
+                fields_meta[k] = {'value': v, 'source': 'inferred', 'rule_version': rule_ver,
+                    'evidence': {'basis':'statement/date fallback', 'email_date':_to_text(msg.get('Date','')),
+                                 'previous_evidence':fields_meta.get(k)}}
             else:
                 fields_meta[k] = {'value': v, 'source': 'extracted'}
         vr = validate_statement_by_rule(rule, fields)
@@ -897,18 +892,26 @@ def validate_and_save_email_message(msg, uid, rules=None, account_name=None):
         for _t in txns:
             _t.account_name = account_name
 
-        # 币种证据（重构契约 §1.1）：模板声明的入账币种是唯一合法证据来源；
-        # 历史行为兼容——未声明时 currency 保持 CNY 但 currency_source 为 NULL（未知）。
         quality_cfg = rule.get('quality') or {}
-        currency_decl = (quality_cfg.get('currency_declaration') or {})
-        settlement_currency = currency_decl.get('settlement_currency')
-        if settlement_currency:
-            for _t in txns:
-                _t.currency = settlement_currency
-                _t.currency_source = 'rule_declared'
-
+        currency_decl = quality_cfg.get('currency_declaration') or {}
+        settlement_currency = currency_decl.get('settlement_currency') if currency_decl.get('evidence') else None
+        if not confirmed_currency(settlement_currency, 'rule_declared'):
+            settlement_currency = None
+        semantic_txns, semantic_stats, row_diags = parse_semantic_transactions(
+            uid, statement.statement_month, content.get('markdown', ''), rule, _infer_date_from_any)
+        if semantic_txns is not None:
+            txns = semantic_txns
+        else:
+            # Legacy positional extraction is retained as raw evidence, never currency proof.
+            for t in txns:
+                if statement.bank_code=='CITIC' and t.currency_source=='extracted':
+                    continue
+                t.currency = 'UNKNOWN'
+                t.currency_source = None
+        for t in txns:
+            t.account_name = account_name
         # 交易行统计（覆盖缺口诊断输入）：候选/有效/拒绝 + 声明笔数（可配置正则）
-        candidate_rows = _count_candidate_rows(content.get('markdown', ''))
+        candidate_rows = semantic_stats['candidate_row_count'] if semantic_txns is not None else _count_candidate_rows(content.get('markdown', ''))
         declared_txn_count = 0
         declared_pat = quality_cfg.get('declared_txn_pattern')
         if declared_pat:
@@ -922,10 +925,11 @@ def validate_and_save_email_message(msg, uid, rules=None, account_name=None):
             'candidate_row_count': candidate_rows,
             'valid_row_count': len(txns),
             'rejected_row_count': max(0, candidate_rows - len(txns)),
-            'table_block_count': len(split_markdown_table_blocks(content.get('markdown', ''))),
+            'table_block_count': semantic_stats['table_block_count'] if semantic_txns is not None else len(split_markdown_table_blocks(content.get('markdown', ''))),
             'declared_txn_count': declared_txn_count,
-            'original_amount_count': sum(1 for t in txns if t.original_amount),
-            'original_currency_known': sum(1 for t in txns if getattr(t, 'original_currency', None)),
+            'original_amount_count': sum(1 for t in txns if t.original_amount is not None),
+            'original_currency_known': sum(1 for t in txns if t.original_amount is not None and getattr(t, 'original_currency_source', None) in ('extracted','rule_declared') and getattr(t, 'original_currency', None) not in (None,'UNKNOWN')),
+            'settlement_currency_unknown': sum(1 for t in txns if not t.currency_source or t.currency == 'UNKNOWN'),
         }
 
         # 多币种应还余额：模板声明币种 → rule_declared；未声明 → UNKNOWN 显式展示（不猜）
@@ -943,32 +947,58 @@ def validate_and_save_email_message(msg, uid, rules=None, account_name=None):
         template_version = _to_text(rule.get('template_version') or rule.get('rule_id', ''))
         evidence_ref = {'kind': 'statement', 'account': account_name, 'uid': str(uid),
                         'message_id': message_id, 'report_path': out,
-                        'content_hash': hashlib.sha256(body_text.encode()).hexdigest()}
-        diagnostics = []
-        # 校验错误（必填缺失）→ EXTRACTION_FAILED（账单级合法性判据已由 parse_status 承担，这里只加诊断）
+                        'content_hash': hashlib.sha256(body_text.encode()).hexdigest(),
+                        'parser_version': parser_version}
+        diagnostics = list(row_diags)
+        for field,meta in fields_meta.items():
+            if meta.get('source')=='inferred':
+                before=(meta.get('evidence') or {}).get('before_fallback') or {}
+                diag=diagnose_missing_field(field,before.get('source','unknown'),
+                    'Primary extraction unavailable; inferred fallback requires confirmation',evidence_ref)
+                if diag:
+                    diagnostics.append(diag)
+        # Use the same evidence classification for required validation and purpose gates.
         for issue in vr.errors:
             if issue.code == 'PARSE_REQUIRED_FIELD_MISSING' and issue.field:
-                diagnostics.append(Diagnostic(
-                    code='EXTRACTION_FAILED', field=issue.field, severity='warning',
-                    reason='命中账单模板但必填字段未能提取（可能格式变化）',
-                    affected_purposes=[], evidence_ref=evidence_ref,
-                ))
+                meta = fields_meta.get(issue.field) or {}
+                d = diagnose_missing_field(issue.field, meta.get('source', 'unknown'),
+                    (meta.get('evidence') or {}).get('reason', 'missing required field'), evidence_ref)
+                if d:
+                    diagnostics.append(d)
         # 用途级缺失（required_fields_by_purpose）：阻用途不降级 parse_status
         for purpose, missing in (missing_fields_by_purpose(rule, fields_meta) or {}).items():
             for f in missing:
                 meta_src = (fields_meta.get(f) or {}).get('source', 'unknown')
-                diag = diagnose_missing_field(f, meta_src if meta_src in ('source_missing', 'extraction_failed') else 'source_missing',
+                diag = diagnose_missing_field(f, meta_src,
                                               f'{purpose} 需要字段 {f} 但来源状态为 {meta_src}',
                                               evidence_ref=evidence_ref)
                 if diag:
                     diag.affected_purposes = list(set(list(diag.affected_purposes) + [purpose]))
                     if not any(d.code == diag.code and d.field == diag.field for d in diagnostics):
                         diagnostics.append(diag)
+                    else:
+                        for existing_diag in diagnostics:
+                            if existing_diag.code == diag.code and existing_diag.field == diag.field:
+                                existing_diag.affected_purposes = sorted(set(existing_diag.affected_purposes + diag.affected_purposes))
         diagnostics.extend(diagnose_currency(txn_stats, evidence_ref))
         diagnostics.extend(diagnose_coverage(txn_stats, evidence_ref))
         # 结构指纹（仅当模板已配置确认基线才比较；金额/排版变化不进指纹）
-        fingerprint = structure_fingerprint(dedupe_table_blocks(split_markdown_table_blocks(content.get('markdown', ''))))
+        fingerprint = detail_fingerprint(content.get('markdown', ''), rule)
         diagnostics.extend(diagnose_format(fingerprint, rule, evidence_ref))
+        if balances and any(b.currency == 'UNKNOWN' for b in balances):
+            diagnostics.append(Diagnostic(code='CURRENCY_UNKNOWN', field='balance_currency',
+                reason='Statement balance has no independent currency evidence',
+                affected_purposes=['financial_summary','repayment_reminder'], evidence_ref=evidence_ref))
+        quality_data = {'diagnostics': [d.to_dict() for d in diagnostics],
+                        'purpose_availability': purpose_availability(diagnostics, fields_meta),
+                        'txn_stats': txn_stats, 'fingerprint': fingerprint,
+                        'baseline_status': 'reviewed_fixture' if quality_cfg.get('accepted_structure_fingerprints') else 'unavailable',
+                        'parser_version': parser_version}
+        statement.raw_fields_json = json.dumps({'fields': fields, 'meta': fields_meta, 'quality': quality_data}, ensure_ascii=False)
+        report['field_evidence'] = fields_meta
+        report['quality'] = quality_data
+        with open(out, 'w', encoding='utf-8') as report_file:
+            json.dump(report, report_file, ensure_ascii=False, indent=2)
         quality_event_recs = [
             QualityEventRecord(
                 case_key=e['case_key'], event_type=e['event_type'],
@@ -980,9 +1010,32 @@ def validate_and_save_email_message(msg, uid, rules=None, account_name=None):
                                              [evidence_ref])
         ]
 
+        # Missing diagnostics are not proof. Only fields actually evaluated and
+        # confirmed by this parse may close an existing case.
+        verified_fields = {f for f, m in fields_meta.items()
+                           if m.get('source') == 'extracted' and m.get('value') is not None}
+        if semantic_txns is not None and not txn_stats['rejected_row_count']:
+            verified_fields.add('transactions')
+            if quality_cfg.get('accepted_structure_fingerprints') and not any(d.code=='FORMAT_CHANGED' for d in diagnostics):
+                verified_fields.add('structure')
+            if txns and not txn_stats['settlement_currency_unknown']:
+                verified_fields.add('currency')
+            if txn_stats['original_amount_count'] and txn_stats['original_currency_known'] == txn_stats['original_amount_count'] and not any(d.field=='original_amount' for d in diagnostics):
+                verified_fields.update(('original_currency','original_amount'))
+        if settlement_currency:
+            verified_fields.add('balance_currency')
+        verified_fields -= {d.field for d in diagnostics}
+        resolution_results = []
         statement_id, txn_count = save_statement_with_transactions(
             DB_PATH, statement, txns,
             balances=balances, quality_events=quality_event_recs,
+            quality_confirmation={
+                'captured_cases': captured_cases, 'evidence_ref': evidence_ref,
+                'current_case_keys': {e.case_key for e in quality_event_recs},
+                'template_version': template_version, 'parser_version': parser_version,
+                'parse_passed': vr.passed, 'verified_fields': verified_fields,
+                'results': resolution_results,
+            },
         )
 
         run_id = save_validation_run(
@@ -1017,6 +1070,9 @@ def validate_and_save_email_message(msg, uid, rules=None, account_name=None):
             'parse_status': parse_status,
             'diagnostics': [d.to_dict() for d in diagnostics],
             'txn_stats': txn_stats,
+            'purpose_availability': quality_data['purpose_availability'],
+            'baseline_status': quality_data['baseline_status'],
+            'resolution_results': resolution_results,
         }
     except MessageIdentityConflict as exc:
         # Keep the new transport's original body/report and validation audit;

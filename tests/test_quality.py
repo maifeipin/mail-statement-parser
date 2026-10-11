@@ -79,8 +79,10 @@ class TestFieldSources(TempDbMixin, unittest.TestCase):
         d2 = mq.diagnose_missing_field('total_due', 'extraction_failed', '提取失败')
         self.assertEqual((d2.code, d2.severity, d2.affected_purposes),
                          ('EXTRACTION_FAILED', 'error', ['financial_summary', 'repayment_reminder']))
-        # unknown 不能伪装成已确认缺失；inferred 是合法推算：都不诊断
-        self.assertIsNone(mq.diagnose_missing_field('due_date', 'unknown', 'x'))
+        # unknown 保留 unknown 并发出待核查诊断；inferred/extracted 都不诊断
+        d3 = mq.diagnose_missing_field('due_date', 'unknown', 'x')
+        self.assertEqual((d3.code, d3.severity, d3.affected_purposes),
+                         ('FIELD_SOURCE_UNKNOWN', 'warning', ['repayment_reminder']))
         self.assertIsNone(mq.diagnose_missing_field('due_date', 'inferred', 'x'))
         self.assertIsNone(mq.diagnose_missing_field('due_date', 'extracted', 'x'))
 
@@ -596,7 +598,7 @@ class TestEndToEndSave(TempDbMixin, unittest.TestCase):
                                'FROM statement_transactions').fetchone()
         conn.close()
         self.assertEqual(cur_row[0], 'CNY')
-        self.assertIsNone(cur_row[1])
+        self.assertEqual(cur_row[1], 'extracted')
         self.assertEqual(cur_row[2], '2860.00')
         self.assertIsNone(cur_row[3])
 

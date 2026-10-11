@@ -1,0 +1,14 @@
+From: ccsvc@message.cmbchina.com
+To: fixture@sample.invalid
+Subject: 招商银行信用卡电子账单
+Message-ID: <cmb-synthetic-r6@sample.invalid>
+Date: Sat, 10 Oct 2026 10:00:00 +0800
+MIME-Version: 1.0
+Content-Type: text/html; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+<p>2026/09/11 - 2026/10/10</p>
+<table><tr><td>本期应还金额</td><td></td><td></td><td></td><td>¥121.93</td><td></td><td>¥10.00</td></tr>
+<tr><td>上期应还金额</td><td></td><td></td><td></td><td>¥0.00</td><td></td><td>¥0.00</td></tr></table>
+<table><tr><td>序号</td><td>交易日</td><td>记账日</td><td>交易描述</td><td>人民币金额</td><td>币种</td><td>地区</td><td>原币金额</td></tr>
+<tr><td>1</td><td>0813</td><td>0815</td><td>GOOGLE*CHATGPT</td><td>121.93</td><td>CNY</td><td>JP</td><td>2860.00</td></tr></table>

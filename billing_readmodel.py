@@ -19,6 +19,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Optional
 
 from mail_quality import normalize_merchant
+from statement_evidence import stored_purpose, confirmed_currency
 
 MERCHANT_NORM_VERSION = 'v1.0'
 
@@ -67,6 +68,7 @@ def month_start(today, months):
 def _connect_ro(db_path):
     conn = sqlite3.connect(f'file:{db_path}?mode=ro', uri=True)
     conn.row_factory = sqlite3.Row
+    conn.execute('BEGIN')
     return conn
 
 
@@ -93,7 +95,7 @@ def snapshot(db_path, months=1, detail_limit=20, today=None):
         stmt_rows = conn.execute(
             """SELECT s.id, s.account_name, s.bank_code, s.statement_month, s.due_date,
                       s.total_due, s.minimum_due, s.is_paid, s.paid_at, s.parse_status,
-                      s.message_id, s.created_at
+                      s.message_id, s.created_at, s.raw_fields_json
                FROM statements s
                WHERE s.parse_status = 'ok' AND s.statement_month >= ?
                ORDER BY s.account_name, s.bank_code, s.statement_month""",
@@ -115,19 +117,26 @@ def snapshot(db_path, months=1, detail_limit=20, today=None):
             bal = balance_index.get(r['id'])
             if not bal:
                 # 迁移期兜底：无余额行时用兼容字段展示，币种证据按未知处理
-                bal = ([{'currency': 'CNY' if r['total_due'] is not None else 'UNKNOWN',
+                bal = ([{'currency': 'UNKNOWN',
                          'total_due': r['total_due'], 'minimum_due': r['minimum_due'],
                          'currency_source': None}]
                        if (r['total_due'] is not None or r['minimum_due'] is not None) else [])
+            for b in bal:
+                b['currency_confirmed']=bool(confirmed_currency(b['currency'],b['currency_source']))
+                if not b['currency_confirmed']:
+                    b['reported_currency']=b['currency']
+                    b['currency']='UNKNOWN'
             statements.append({
                 'statement_id': r['id'], 'account': r['account_name'], 'bank': r['bank_code'],
                 'month': r['statement_month'], 'due_date': r['due_date'],
+                'purpose_availability': {purpose:stored_purpose(r['raw_fields_json'],purpose) for purpose in ('financial_summary','transaction_trends','fx_analysis','repayment_reminder')},
                 'balances': bal, 'is_paid': r['is_paid'], 'message_id': r['message_id'],
             })
 
         txn_rows = conn.execute(
             """SELECT t.id, t.account_name, t.bank_code, t.txn_date, t.description,
-                      t.amount, t.currency, t.direction, t.original_amount, t.original_currency
+                      t.amount, t.currency, t.direction, t.original_amount, t.original_currency,
+                      t.currency_source, t.original_currency_source, s.raw_fields_json, s.id AS statement_id
                FROM statement_transactions t
                JOIN statements s ON s.id = t.statement_id
                WHERE s.parse_status = 'ok' AND s.statement_month >= ?
@@ -135,15 +144,25 @@ def snapshot(db_path, months=1, detail_limit=20, today=None):
             (start,)).fetchall()
         txn_totals = {}
         unknown_orig_count = 0
+        unknown_curr_txns = []
+        gated_txns = []
         for r in txn_rows:
             d = decimal_amount(r['amount'])
             if d is None:
                 continue
-            key = (r['currency'] or 'UNKNOWN', r['direction'] or 'unknown')
-            agg = txn_totals.setdefault(key, {'count': 0, 'amount': Decimal('0')})
-            agg['count'] += 1
-            agg['amount'] += d
-            if r['original_amount'] and not r['original_currency']:
+            c_src = r['currency_source'] if 'currency_source' in r.keys() else None
+            gate=stored_purpose(r['raw_fields_json'],'transaction_trends')
+            is_confirmed = confirmed_currency(r['currency'],c_src)
+            if gate['status']=='blocked':
+                gated_txns.append({k:r[k] for k in r.keys() if k!='raw_fields_json'})
+            if is_confirmed and gate['status']!='blocked':
+                key = (r['currency'], r['direction'] or 'unknown')
+                agg = txn_totals.setdefault(key, {'count': 0, 'amount': Decimal('0')})
+                agg['count'] += 1
+                agg['amount'] += d
+            elif not is_confirmed:
+                unknown_curr_txns.append({k:r[k] for k in r.keys() if k!='raw_fields_json'})
+            if r['original_amount'] is not None and not confirmed_currency(r['original_currency'],r['original_currency_source']):
                 unknown_orig_count += 1
         transaction_totals = [
             {'currency': k[0], 'direction': k[1], 'count': v['count'], 'amount': str(v['amount'])}
@@ -177,6 +196,9 @@ def snapshot(db_path, months=1, detail_limit=20, today=None):
             'statements': statements,
             'transaction_count': len(txn_rows),
             'transaction_totals': transaction_totals,
+            'transaction_totals_complete': not unknown_curr_txns and not gated_txns and all(s['purpose_availability']['transaction_trends']['status']=='available' for s in statements),
+            'gated_transactions': gated_txns,
+            'unknown_currency_transactions': unknown_curr_txns,
             'unknown_currency_original_amounts': unknown_orig_count,
             'coverage_gaps': coverage_gaps,
             'stale_accounts': stale_accounts,
@@ -217,17 +239,24 @@ def trends(db_path, months=3, merchant=None, account=None):
             params.append(account)
         rows = conn.execute(
             f"""SELECT t.txn_date, t.description, t.amount, t.currency, t.direction,
-                       t.original_amount, t.original_currency, s.statement_month, s.account_name
+                       t.original_amount, t.original_currency, t.currency_source, t.original_currency_source,
+                       s.raw_fields_json, s.id AS statement_id, s.statement_month, s.account_name
                 FROM statement_transactions t
                 JOIN statements s ON s.id = t.statement_id
                 WHERE s.parse_status = 'ok' AND s.statement_month >= ? {acct_clause}
                 ORDER BY t.id""",
             params).fetchall()
+        quality_statements=[{'statement_id':r['id'],'purpose_availability':{
+            p:stored_purpose(r['raw_fields_json'],p) for p in ('transaction_trends','fx_analysis')}}
+            for r in conn.execute(f"SELECT s.id,s.raw_fields_json FROM statements s WHERE s.parse_status='ok' AND s.statement_month>=? {acct_clause}",params)]
     finally:
         conn.close()
 
     m_filter = merchant_of(merchant) if merchant else None
     stats = {}  # (m, month) -> {cur -> cur_agg}
+    excluded=[]
+    fx_excluded=[]
+    partial=[]
     merchant_fx_pairs = {}  # m -> {fx_key -> [{'month': m, 'rate': Decimal, 'settlement': Decimal, 'original': Decimal}]}
 
     for r in rows:
@@ -238,7 +267,14 @@ def trends(db_path, months=3, merchant=None, account=None):
         if m_filter and m != m_filter:
             continue
         month = r['statement_month'] or (r['txn_date'] or '')[:7] or 'unknown'
-        cur = r['currency'] or 'UNKNOWN'
+        gate=stored_purpose(r['raw_fields_json'],'transaction_trends')
+        if gate['status']=='blocked' or not confirmed_currency(r['currency'],r['currency_source']):
+            excluded.append({'statement_id':r['statement_id'],'merchant':m,'month':month,'amount':r['amount'],
+                'reported_currency':r['currency'],'currency_source':r['currency_source'],'purpose_availability':gate})
+            continue
+        if gate['status']=='partial':
+            partial.append({'statement_id':r['statement_id'],'merchant':m,'month':month,'purpose_availability':gate})
+        cur = r['currency']
         raw_dirn = r['direction']
         dirn = (raw_dirn or '').strip().lower()
 
@@ -280,7 +316,9 @@ def trends(db_path, months=3, merchant=None, account=None):
         # A4 核心：实际折算比例（仅当原币币种已知 + 两边金额有效 + 原币非零）
         orig_cur = r['original_currency']
         orig_amt = r['original_amount']
-        if orig_cur and orig_amt:
+        if orig_amt is not None and not confirmed_currency(orig_cur,r['original_currency_source']):
+            fx_excluded.append({'statement_id':r['statement_id'],'merchant':m,'month':month,'original_amount':orig_amt,'reported_currency':orig_cur,'currency_source':r['original_currency_source']})
+        if confirmed_currency(orig_cur,r['original_currency_source']) and orig_amt is not None and stored_purpose(r['raw_fields_json'],'fx_analysis')['status'] != 'blocked':
             od = decimal_amount(orig_amt)
             if od is not None and od != 0:
                 rate = abs(d) / abs(od)
@@ -400,6 +438,12 @@ def trends(db_path, months=3, merchant=None, account=None):
         'merchant_filter': m_filter,
         'account_filter': account,
         'merchants': merchants,
+        'complete': not excluded and not partial and all(s['purpose_availability']['transaction_trends']['status']=='available' for s in quality_statements),
+        'fx_complete': not fx_excluded and all(s['purpose_availability']['fx_analysis']['status']=='available' for s in quality_statements),
+        'fx_excluded_transactions': fx_excluded,
+        'quality_statements': quality_statements,
+        'excluded_transactions': excluded,
+        'partial_statements': list({(r['statement_id'],r['merchant'],r['month']):r for r in partial}.values()),
         'limitations': [
             '商户名为规范化形式（大小写/全半角归一），原始描述保留在交易明细',
             '折算比例为实际入账/原币金额，不等于央行汇率，也不自动认定包含某项费用',

@@ -1017,6 +1017,9 @@ def due_soon_bank_bills(months=3, days=7, output_dir=None):
     due_soon_items = []
     
     for r in rows:
+        if r['repayment_availability']['status'] != 'available':
+            warn_missing_due.append({'bank_code':r['bank_code'],'subject':r['subject'], 'reason':'还款用途未确认，需重解析/人工核查'})
+            continue
         due_date_str = r['due_date']
         if not due_date_str:
             warn_missing_due.append({'bank_code': r['bank_code'], 'subject': r['subject'], 'reason': '无还款日'})
@@ -1031,6 +1034,7 @@ def due_soon_bank_bills(months=3, days=7, output_dir=None):
                     'due_date': due_date_str,
                     'days_left': days_left,
                     'total_due': r['total_due'],
+                    'currency': r['currency'],
                     'subject': r['subject']
                 })
         except ValueError:
@@ -1041,10 +1045,12 @@ def due_soon_bank_bills(months=3, days=7, output_dir=None):
         print("\n=== ⚠️ 临期账单 (<= {}天) ===".format(days))
         for item in due_soon_items:
             print(f"[{item['bank_code']}] {item['subject']}")
-            print(f"   应还: {item['total_due']} RMB | 还款日: {item['due_date']} (剩余 {item['days_left']} 天)")
+            print(f"   应还: {item['total_due']} {item['currency']} | 还款日: {item['due_date']} (剩余 {item['days_left']} 天)")
+    elif warn_missing_due:
+        print("\n⚠️ 存在无法核验还款用途的账单，不能确认是否有临期事项。")
     else:
         print("\n✅ 没有临近 {} 天内的待还账单。".format(days))
-        
+
     if warn_missing_due:
         print("\n=== ⚠️ 异常项 (无法判定临期) ===")
         for w in warn_missing_due:
@@ -1060,7 +1066,7 @@ def show_unpaid_statements():
     print("=== 待还款账单列表 ===")
     for r in rows:
         print(f"[{r['bank_code']}] {r['statement_month']} - {r['subject']}")
-        print(f"   应还: {r['total_due']} RMB | 还款日: {r['due_date'] or '未知'}")
+        print(f"   应还: {r['total_due']} {r['currency']} | 还款日: {r['due_date'] or '未知'} | 用途: {r['repayment_availability']['status']}")
 
 def mark_statement_paid_cmd(bank_code, statement_month=None):
     from statement_db import mark_statement_paid

@@ -109,9 +109,11 @@ def fingerprint_matches_baseline(fingerprint: Dict, accepted: List[Dict]) -> boo
     （避免初始上线制造噪声待办）。"""
     if not accepted:
         return True  # 无基线＝未启用格式告警，静默通过
-    headers = json.dumps(fingerprint.get('table_headers', []), ensure_ascii=False, sort_keys=True)
+    def canonical(headers):
+        return sorted(tuple(sorted(str(c) for c in row if c != 'ignored')) for row in headers)
+    headers = canonical(fingerprint.get('table_headers', []))
     for base in accepted:
-        if json.dumps(base.get('table_headers', []), ensure_ascii=False, sort_keys=True) == headers:
+        if canonical(base.get('table_headers', [])) == headers:
             return True
     return False
 
@@ -196,40 +198,45 @@ def diagnose_missing_field(field: str, source: str, reason: str,
     if source == 'extraction_failed':
         return Diagnostic(code='EXTRACTION_FAILED', field=field, severity='error',
                           reason=reason, affected_purposes=purposes, evidence_ref=evidence_ref)
+    if source == 'unknown':
+        return Diagnostic(code='FIELD_SOURCE_UNKNOWN', field=field, severity='warning',
+                          reason=reason, affected_purposes=purposes, evidence_ref=evidence_ref)
     return None
 
 
 def diagnose_currency(txn_stats: Dict, evidence_ref: Optional[dict] = None) -> List[Diagnostic]:
     """币种诊断：存在原币金额但无原币币种证据 → CURRENCY_UNKNOWN（只阻 fx_analysis）。"""
     diags = []
-    if txn_stats.get('original_amount_count', 0) > 0 and txn_stats.get('original_currency_known', 0) == 0:
+    if txn_stats.get('original_amount_count', 0) > 0 and txn_stats.get('original_currency_known', 0) < txn_stats.get('original_amount_count', 0):
         diags.append(Diagnostic(
             code='CURRENCY_UNKNOWN', field='original_currency', severity='warning',
-            reason=f"{txn_stats['original_amount_count']} 笔交易有原币金额但无币种证据，"
+            reason=f"{txn_stats['original_amount_count']-txn_stats.get('original_currency_known',0)} 笔交易有原币金额但无币种证据，"
                    '不得默认 CNY 或按地区猜测；外汇趋势分析受影响',
             affected_purposes=['fx_analysis'], evidence_ref=evidence_ref,
         ))
+    if txn_stats.get('settlement_currency_unknown', 0):
+        diags.append(Diagnostic(code='CURRENCY_UNKNOWN', field='currency', reason=f"{txn_stats['settlement_currency_unknown']} 笔入账币种无可靠证据", affected_purposes=['financial_summary','transaction_trends','fx_analysis'], evidence_ref=evidence_ref))
     return diags
 
 
 def diagnose_coverage(txn_stats: Dict, evidence_ref: Optional[dict] = None) -> List[Diagnostic]:
     """覆盖缺口：账单声明有交易或存在明细表，但有效行为 0。合法零交易账单不告警。"""
     diags = []
-    if txn_stats.get('declared_txn_count') or txn_stats.get('table_block_count'):
+    if txn_stats.get('declared_txn_count') or txn_stats.get('candidate_row_count') or txn_stats.get('rejected_row_count'):
         if not txn_stats.get('valid_row_count'):
             diags.append(Diagnostic(
                 code='TRANSACTION_COVERAGE_GAP', field='transactions', severity='error',
                 reason=f"存在交易声明/明细表但有效行数为 0"
                        f"（候选 {txn_stats.get('candidate_row_count', 0)} 行，"
                        f"拒绝 {txn_stats.get('rejected_row_count', 0)} 行）",
-                affected_purposes=['financial_summary'], evidence_ref=evidence_ref,
+                affected_purposes=['transaction_trends','fx_analysis'], evidence_ref=evidence_ref,
             ))
     if txn_stats.get('rejected_row_count', 0) > 0 and txn_stats.get('valid_row_count', 0) > 0:
         diags.append(Diagnostic(
             code='TRANSACTION_ROW_INVALID', field='transactions', severity='warning',
             reason=f"{txn_stats['rejected_row_count']} 行被拒（金额/描述无效），"
                    f"有效 {txn_stats['valid_row_count']} 行",
-            affected_purposes=['financial_summary'], evidence_ref=evidence_ref,
+            affected_purposes=['transaction_trends'], evidence_ref=evidence_ref,
         ))
     return diags
 
@@ -244,7 +251,7 @@ def diagnose_format(fingerprint: Dict, rule: Dict, evidence_ref: Optional[dict] 
     return [Diagnostic(
         code='FORMAT_CHANGED', field='structure', severity='warning',
         reason='表头/列数偏离已确认的结构基线，需人工确认新模板',
-        affected_purposes=['financial_summary'], evidence_ref=evidence_ref,
+        affected_purposes=['transaction_trends'], evidence_ref=evidence_ref,
     )]
 
 
@@ -262,7 +269,7 @@ def missing_fields_by_purpose(rule: Dict, fields_meta: Dict) -> Dict[str, List[s
             meta = fields_meta.get(f) or {}
             src = meta.get('source')
             val = meta.get('value')
-            if src in ('source_missing', 'extraction_failed') or (src != 'inferred' and not val):
+            if src in ('source_missing', 'extraction_failed') or (val is None or val == ''):
                 missing.append(f)
         if missing:
             out[purpose] = missing

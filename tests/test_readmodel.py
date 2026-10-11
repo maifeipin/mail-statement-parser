@@ -32,19 +32,20 @@ def _mk_db(self, with_fx_evidence=False):
         StatementTransactionRecord(
             uid='U887', bank_code='CMB', account_name='163box',
             txn_date='2026-08-13', post_date='2026-08-15',
-            description='GOOGLE*CHATGPT', amount='121.93', currency='CNY',
+            description='GOOGLE*CHATGPT', amount='121.93', currency='CNY', currency_source='extracted',
             txn_location_code='JP', original_amount='2860.00',
             original_currency='JPY' if with_fx_evidence else None,
+            original_currency_source='extracted' if with_fx_evidence else None,
             direction='debit'),
         StatementTransactionRecord(
             uid='U887', bank_code='CMB', account_name='163box',
             txn_date='2026-08-20', post_date='2026-08-21',
-            description='某商店退款', amount='-30.00', currency='CNY', direction='credit'),
+            description='某商店退款', amount='-30.00', currency='CNY', currency_source='extracted', direction='credit'),
         StatementTransactionRecord(
             uid='U887', bank_code='CMB', account_name='163box',
             txn_date='2026-08-25', post_date='2026-08-26',
-            description='境外美元消费', amount='70.00', currency='USD',
-            original_amount='10.00', original_currency='USD', direction='debit'),
+            description='境外美元消费', amount='70.00', currency='USD', currency_source='extracted',
+            original_amount='10.00', original_currency='USD', original_currency_source='extracted', direction='debit'),
     ])
 
 
@@ -79,7 +80,7 @@ class TestSnapshot(unittest.TestCase):
     def test_balances_present(self):
         snap = snapshot(self.db, months=6)
         st = snap['statements'][0]
-        self.assertEqual(st['balances'][0]['currency'], 'CNY')
+        self.assertEqual(st['balances'][0]['currency'], 'UNKNOWN')
         self.assertEqual(st['balances'][0]['total_due'], '500.00')
 
     def test_credit_net_not_double_negated(self):

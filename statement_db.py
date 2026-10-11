@@ -339,6 +339,19 @@ def init_db(db_path: str) -> None:
         if "observation_keys_json" not in qe_cols:
             cur.execute("ALTER TABLE quality_events ADD COLUMN observation_keys_json TEXT NOT NULL DEFAULT '[]'")
 
+        cur.execute("""CREATE TABLE IF NOT EXISTS quality_event_sources (
+            event_id TEXT NOT NULL, cycle_id INTEGER NOT NULL, identity_key TEXT NOT NULL,
+            content_hash TEXT, state TEXT NOT NULL DEFAULT 'unresolved',
+            checked_parser_version TEXT, checked_at TEXT,
+            PRIMARY KEY(event_id, cycle_id, identity_key))""")
+
+        for event_id, cycle_id, refs_json in cur.execute(
+                "SELECT event_id,cycle_id,evidence_refs_json FROM quality_events WHERE event_type IN ('quality_detected','quality_updated')").fetchall():
+            for ref in json.loads(refs_json or '[]'):
+                identity=json.dumps(_evidence_identity(ref),ensure_ascii=False)
+                cur.execute("INSERT OR IGNORE INTO quality_event_sources(event_id,cycle_id,identity_key,content_hash,state) VALUES(?,?,?,?,'unresolved')",
+                            (event_id,cycle_id,identity,ref.get('content_hash')))
+
         # ---------- 跨进程互斥租约（重构契约 §1.4）：覆盖并发 cron / 手动命令 / 重试
         cur.execute("""
             CREATE TABLE IF NOT EXISTS sync_leases (
@@ -442,6 +455,16 @@ def _observation_key(diagnostics, refs, template_version):
     return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
 
+def _record_quality_sources_locked(cur, event_id, cycle_id, refs):
+    for ref in refs:
+        identity = json.dumps(_evidence_identity(ref), ensure_ascii=False)
+        cur.execute("""INSERT INTO quality_event_sources(event_id,cycle_id,identity_key,content_hash,state)
+            VALUES(?,?,?,?,'unresolved') ON CONFLICT(event_id,cycle_id,identity_key)
+            DO UPDATE SET content_hash=excluded.content_hash,state='unresolved',
+            checked_parser_version=NULL,checked_at=NULL""",
+            (event_id,cycle_id,identity,ref.get('content_hash')))
+
+
 def _upsert_quality_event_locked(cur, event: 'QualityEventRecord') -> str:
     """Delivery acknowledgment does not resolve a problem. Only new evidence advances it."""
     if event.event_type not in ('quality_detected', 'quality_updated', 'quality_resolved', 'statement_recorded'):
@@ -478,6 +501,8 @@ def _upsert_quality_event_locked(cur, event: 'QualityEventRecord') -> str:
              event.template_version,json.dumps(diagnostics,ensure_ascii=False),
              json.dumps(refs,ensure_ascii=False),len(refs) or 1,
              json.dumps([observation]),now,now))
+        if event.event_type != 'statement_recorded':
+            _record_quality_sources_locked(cur, event_id, 1, refs)
         return event_id
     old_type, old_diag, old_refs_json, rev, cycle, keys_json, old_template = row
     if (old_type == 'statement_recorded') != (event.event_type == 'statement_recorded'):
@@ -505,6 +530,8 @@ def _upsert_quality_event_locked(cur, event: 'QualityEventRecord') -> str:
         (event.event_type,event.account_name,event.bank_code,event.template_version,
          json.dumps(diagnostics,ensure_ascii=False),json.dumps(merged,ensure_ascii=False),
          len(merged) or 1,rev+1,new_cycle,json.dumps(sorted(keys)),now,event_id))
+    if event.event_type != 'statement_recorded':
+        _record_quality_sources_locked(cur, event_id, new_cycle, refs)
     return event_id
 
 def upsert_quality_event(db_path: str, event: 'QualityEventRecord') -> str:
@@ -626,7 +653,8 @@ def save_statement_with_transactions(db_path: str, s: StatementRecord,
                                      txns: Iterable[StatementTransactionRecord],
                                      balances: Optional[list] = None,
                                      quality_events: Optional[list] = None,
-                                     parser_version: Optional[str] = None) -> tuple:
+                                     parser_version: Optional[str] = None,
+                                     quality_confirmation: Optional[dict] = None) -> tuple:
     """账单 + 交易 + 多币种余额 + 质量事件单事务原子保存。
 
     步骤（同一 BEGIN IMMEDIATE 事务内）：
@@ -667,9 +695,9 @@ def save_statement_with_transactions(db_path: str, s: StatementRecord,
             existing_id = int(existing[0])
             for ev in (quality_events or []):
                 _upsert_quality_event_locked(cur, ev)
-            conn.commit()
             cur.execute("SELECT COUNT(*) FROM statement_transactions WHERE statement_id = ?", (existing_id,))
             cnt = int(cur.fetchone()[0])
+            conn.commit()
             return existing_id, cnt
 
         cur.execute(
@@ -707,36 +735,48 @@ def save_statement_with_transactions(db_path: str, s: StatementRecord,
         )
         statement_id = int(cur.fetchone()[0])
 
-        cur.execute(
-            """
-            DELETE FROM statement_transactions
-            WHERE statement_id = ?
-               OR (statement_id IS NULL AND account_name = ? AND uid = ? AND bank_code = ?)
-            """,
-            (statement_id, s.account_name, s.uid, s.bank_code),
-        )
-
-        for t in items:
+        incoming_quality=json.loads(s.raw_fields_json or '{}').get('quality', {})
+        incomplete_detail=any(d.get('field')=='transactions' and d.get('code') in
+            ('TRANSACTION_COVERAGE_GAP','TRANSACTION_ROW_INVALID')
+            for d in incoming_quality.get('diagnostics', []))
+        preserve_detail=bool(existing and existing[4]=='ok' and incomplete_detail)
+        if preserve_detail:
+            incoming_quality['retained_previous_transactions']=True
+            raw=json.loads(s.raw_fields_json or '{}')
+            raw['quality']=incoming_quality
+            cur.execute('UPDATE statements SET raw_fields_json=? WHERE id=?',
+                        (json.dumps(raw,ensure_ascii=False),statement_id))
+        else:
             cur.execute(
                 """
-                INSERT INTO statement_transactions (
-                    account_name, uid, bank_code, statement_id, txn_date, post_date, description,
-                    amount, currency, currency_source, txn_location_code, original_amount,
-                    original_currency, original_currency_source, direction,
-                    raw_row_json, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                DELETE FROM statement_transactions
+                WHERE statement_id = ?
+                   OR (statement_id IS NULL AND account_name = ? AND uid = ? AND bank_code = ?)
                 """,
-                (
-                    t.account_name or s.account_name, t.uid, t.bank_code, statement_id,
-                    t.txn_date, t.post_date, t.description, t.amount, t.currency,
-                    getattr(t, 'currency_source', None),
-                    t.txn_location_code, t.original_amount,
-                    getattr(t, 'original_currency', None),
-                    getattr(t, 'original_currency_source', None),
-                    t.direction,
-                    t.raw_row_json, _utc_now_iso(),
-                ),
+                (statement_id, s.account_name, s.uid, s.bank_code),
             )
+
+            for t in items:
+                cur.execute(
+                    """
+                    INSERT INTO statement_transactions (
+                        account_name, uid, bank_code, statement_id, txn_date, post_date, description,
+                        amount, currency, currency_source, txn_location_code, original_amount,
+                        original_currency, original_currency_source, direction,
+                        raw_row_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        t.account_name or s.account_name, t.uid, t.bank_code, statement_id,
+                        t.txn_date, t.post_date, t.description, t.amount, t.currency,
+                        getattr(t, 'currency_source', None),
+                        t.txn_location_code, t.original_amount,
+                        getattr(t, 'original_currency', None),
+                        getattr(t, 'original_currency_source', None),
+                        t.direction,
+                        t.raw_row_json, _utc_now_iso(),
+                    ),
+                )
 
         # 余额整份替换（含历史 legacy 回填行），无证据币种用 'UNKNOWN' 显式展示
         cur.execute("DELETE FROM statement_balances WHERE statement_id = ?", (statement_id,))
@@ -769,9 +809,15 @@ def save_statement_with_transactions(db_path: str, s: StatementRecord,
 
         for ev in (quality_events or []):
             _upsert_quality_event_locked(cur, ev)
+        if quality_confirmation:
+            args={k:v for k,v in quality_confirmation.items() if k != 'results'}
+            resolution_receipt=_confirm_quality_sources_locked(cur, **args)
 
+        count=cur.execute('SELECT COUNT(*) FROM statement_transactions WHERE statement_id=?', (statement_id,)).fetchone()[0]
         conn.commit()
-        return statement_id, len(items)
+        if quality_confirmation:
+            quality_confirmation['results'].extend(resolution_receipt)
+        return statement_id, count
     except Exception:
         conn.rollback()
         raise
@@ -1205,38 +1251,27 @@ def mark_statement_paid_by_id(db_path: str, statement_id: int) -> int:
     finally:
         conn.close()
 
-def get_unpaid_statements(db_path: str, months: int = None) -> list[sqlite3.Row]:
-    conn = sqlite3.connect(db_path)
+def get_unpaid_statements(db_path: str, months: int = None) -> list:
+    from statement_evidence import stored_purpose, confirmed_currency, number
+    conn = sqlite3.connect('file:' + os.path.abspath(db_path) + '?mode=ro', uri=True)
     conn.row_factory = sqlite3.Row
     try:
-        cur = conn.cursor()
-        
-        query = """
-            WITH latest AS (
-              SELECT uid, bank_code, subject, statement_month, statement_date, due_date, total_due, minimum_due, email_date, updated_at,
-                     ROW_NUMBER() OVER (
-                       PARTITION BY bank_code, statement_month, due_date, total_due
-                       ORDER BY email_date DESC, id DESC
-                     ) AS rn
-              FROM statements
-              WHERE is_paid = 0
-                AND CAST(COALESCE(total_due, '0') AS REAL) > 0
-                AND COALESCE(parse_status, 'ok') != 'failed'
-            )
-            SELECT uid, bank_code, subject, statement_month, statement_date, due_date, total_due, minimum_due
-            FROM latest
-            WHERE rn = 1
-        """
-        
-        params = []
+        conn.execute('BEGIN')
+        query="SELECT * FROM statements WHERE is_paid=0 AND COALESCE(parse_status,'ok')!='failed'"
+        params=[]
         if months is not None:
-            query += " AND date(substr(updated_at, 1, 10)) >= date('now', ?)"
+            query += " AND date(substr(updated_at,1,10)) >= date('now',?)"
             params.append(f'-{months} months')
-            
-        query += " ORDER BY due_date ASC, bank_code ASC"
-        
-        cur.execute(query, params)
-        return list(cur.fetchall())
+        rows=[dict(r) for r in conn.execute(query+' ORDER BY due_date,bank_code,id',params)]
+        rows=[r for r in rows if number(r['total_due']) is None or number(r['total_due'])>0]
+        for row in rows:
+            row['repayment_availability']=stored_purpose(row.get('raw_fields_json'),'repayment_reminder')
+            balances=list(conn.execute('SELECT currency,currency_source FROM statement_balances WHERE statement_id=?',(row['id'],)))
+            currencies={b['currency'] for b in balances if confirmed_currency(b['currency'],b['currency_source'])}
+            row['currency']=next(iter(currencies)) if len(currencies)==1 and len(balances)==1 else 'UNKNOWN'
+            if row['currency']=='UNKNOWN' or number(row['total_due']) is None:
+                row['repayment_availability']={'status':'blocked','reasons':[{'code':'BALANCE_CURRENCY_UNCONFIRMED'}]}
+        return rows
     finally:
         conn.close()
 
@@ -1516,5 +1551,87 @@ def get_potential_missed_emails(db_path: str, limit: int = 15) -> list[sqlite3.R
             (cutoff_date, limit)
         )
         return list(cur.fetchall())
+    finally:
+        conn.close()
+
+
+def capture_quality_cases(db_path, account_name, bank_code):
+    """Capture CAS tokens before parsing. Read-only; unavailable old schemas return no tokens."""
+    if not os.path.exists(db_path):
+        return []
+    conn = sqlite3.connect('file:' + db_path + '?mode=ro', uri=True)
+    conn.row_factory = sqlite3.Row
+    try:
+        return [dict(r) for r in conn.execute("""SELECT event_id,case_key,template_version,revision,cycle_id,
+            evidence_refs_json,diagnostics_json FROM quality_events WHERE account_name=? AND bank_code=?
+            AND event_type IN ('quality_detected','quality_updated')""", (account_name,bank_code))]
+    except sqlite3.OperationalError as exc:
+        if 'no such table' in str(exc) or 'no such column' in str(exc):
+            return []
+        raise
+    finally:
+        conn.close()
+
+
+def _confirm_quality_sources_locked(cur, captured_cases, evidence_ref, current_case_keys,
+                                    template_version, parser_version, parse_passed,
+                                    verified_fields=None):
+    """Confirm the same source/content and captured revision under the financial write lock."""
+    if not parse_passed or not evidence_ref.get('content_hash') or not parser_version or not verified_fields:
+        return []
+    identity = json.dumps(_evidence_identity(evidence_ref), ensure_ascii=False)
+    results=[]
+    for captured in captured_cases:
+        if captured['case_key'] in current_case_keys or captured['template_version'] != template_version:
+            continue
+        # Do not resolve merely because a diagnostic disappeared; require a
+        # positively evaluated field and reject any remaining diagnostic on it.
+        diagnostics=json.loads(captured.get('diagnostics_json') or '[]')
+        if not diagnostics or any(not d.get('field') or d['field'] not in verified_fields for d in diagnostics):
+            continue
+        row=cur.execute('SELECT revision,cycle_id,event_type FROM quality_events WHERE event_id=?',
+                        (captured['event_id'],)).fetchone()
+        if not row or row[:2] != (captured['revision'],captured['cycle_id']) or row[2] not in ('quality_detected','quality_updated'):
+            results.append({'event_id':captured['event_id'],'status':'stale'})
+            continue
+        source=cur.execute('SELECT content_hash FROM quality_event_sources WHERE event_id=? AND cycle_id=? AND identity_key=?',
+                           (captured['event_id'],captured['cycle_id'],identity)).fetchone()
+        if not source or source[0] != evidence_ref['content_hash']:
+            continue
+        # Every source is a stable identity/content pair, including sources not in this parse.
+        cur.execute("""UPDATE quality_event_sources SET state='resolved',checked_parser_version=?,checked_at=?
+            WHERE event_id=? AND cycle_id=? AND identity_key=? AND content_hash=?""",
+            (parser_version,_utc_now_iso(),captured['event_id'],captured['cycle_id'],identity,evidence_ref['content_hash']))
+        all_sources=cur.execute('SELECT state,checked_parser_version,content_hash FROM quality_event_sources WHERE event_id=? AND cycle_id=?',
+                               (captured['event_id'],captured['cycle_id'])).fetchall()
+        # Untracked legacy refs cannot be ignored merely because one source was rechecked.
+        expected={json.dumps(_evidence_identity(r),ensure_ascii=False) for r in json.loads(captured['evidence_refs_json'] or '[]')}
+        tracked={r[0] for r in cur.execute('SELECT identity_key FROM quality_event_sources WHERE event_id=? AND cycle_id=?',
+                                          (captured['event_id'],captured['cycle_id']))}
+        complete=(all_sources and expected == tracked and all(r[0]=='resolved' and r[1]==parser_version and r[2] for r in all_sources))
+        if complete:
+            _upsert_quality_event_locked(cur,QualityEventRecord(case_key=captured['case_key'],event_type='quality_resolved',
+                template_version=template_version,revision=captured['revision'],cycle_id=captured['cycle_id'],
+                evidence_refs=[dict(evidence_ref,verified_source_count=len(all_sources))]))
+            results.append({'event_id':captured['event_id'],'status':'resolved','verified_source_count':len(all_sources)})
+        else:
+            results.append({'event_id':captured['event_id'],'status':'source_verified','verified_source_count':sum(r[0]=='resolved' and r[1]==parser_version for r in all_sources)})
+    return results
+
+
+def confirm_quality_sources(db_path, captured_cases, evidence_ref, current_case_keys,
+                            template_version, parser_version, parse_passed,
+                            verified_fields=None):
+    """Standalone verifier for tools; parser calls the locked helper inside atomic save."""
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute('BEGIN IMMEDIATE')
+        results=_confirm_quality_sources_locked(conn.cursor(), captured_cases, evidence_ref,
+            current_case_keys, template_version, parser_version, parse_passed, verified_fields)
+        conn.commit()
+        return results
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()

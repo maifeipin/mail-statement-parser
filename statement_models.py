@@ -34,12 +34,13 @@ FIELD_SOURCES = ('extracted', 'source_missing', 'extraction_failed',
                  'not_applicable', 'inferred', 'unknown')
 
 # 质量事件影响的业务用途：互相隔离（缺还款日不阻财务统计）
-QUALITY_PURPOSES = ('financial_summary', 'repayment_reminder', 'fx_analysis')
+QUALITY_PURPOSES = ('financial_summary', 'repayment_reminder', 'fx_analysis', 'transaction_trends')
 
 # 诊断代码（重构契约 §2.1）
 DIAGNOSTIC_CODES = (
     'FORMAT_CHANGED',              # 结构指纹偏离已确认基线
     'EXTRACTION_FAILED',           # 原文有字段但提取失败/错位
+    'FIELD_SOURCE_UNKNOWN',        # source evidence insufficient, require review
     'SOURCE_FIELD_MISSING',        # 原文未提供该字段
     'CURRENCY_UNKNOWN',            # 原币币种无证据（不得默认 CNY / 猜地区币种）
     'TRANSACTION_ROW_INVALID',     # 明细行解析被拒（金额/描述无效）

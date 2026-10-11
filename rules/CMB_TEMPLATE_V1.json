@@ -37,21 +37,33 @@
         "type": "regex",
         "source": "body_text",
         "pattern": "(?:到期还款日|最后还款日)[:：]?\\s*(20\\d{2}[-/.年]\\d{1,2}[-/.月]\\d{1,2}(?:日)?)",
-        "required": false
+        "required": false,
+        "source_probe": {
+          "label_pattern": "(?:到期还款日|最后还款日|Payment\\s*Due\\s*Date)",
+          "region_pattern": "(?:本期应还金额|账单日|上期应还金额)"
+        }
       },
       "total_due": {
         "type": "regex",
         "source": "body_text",
         "pattern": "\\|\\s*\\|\\s*\\|\\s*[¥￥]\\s*(-?[0-9,]+(?:\\.[0-9]{1,2})?)\\s*\\|\\s*\\|\\s*[¥￥]\\s*(-?[0-9,]+(?:\\.[0-9]{1,2})?)\\s*\\|",
         "group": 1,
-        "required": true
+        "required": true,
+        "source_probe": {
+          "label_pattern": "本期应还金额",
+          "region_pattern": "(?:本期应还金额|账单日|上期应还金额)"
+        }
       },
       "minimum_due": {
         "type": "regex",
         "source": "body_text",
         "pattern": "\\|\\s*\\|\\s*\\|\\s*[¥￥]\\s*(-?[0-9,]+(?:\\.[0-9]{1,2})?)\\s*\\|\\s*\\|\\s*[¥￥]\\s*(-?[0-9,]+(?:\\.[0-9]{1,2})?)\\s*\\|",
         "group": 2,
-        "required": true
+        "required": true,
+        "source_probe": {
+          "label_pattern": "最低还款(?:金额|额)",
+          "region_pattern": "(?:本期应还金额|账单日|上期应还金额)"
+        }
       }
     }
   },
@@ -124,7 +136,27 @@
         "POST DATE"
       ]
     },
-    "accepted_structure_fingerprints": [],
-    "currency_declaration": {}
+    "accepted_structure_fingerprints": [
+      {
+        "table_headers": [
+          [
+            "ignored",
+            "txn_date",
+            "post_date",
+            "description",
+            "amount",
+            "currency",
+            "location",
+            "original_amount"
+          ]
+        ]
+      }
+    ],
+    "currency_declaration": {},
+    "baseline_provenance": {
+      "fixture": "tests/fixtures/cmb_reviewed_statement.eml",
+      "basis": "Synthetic regression derived from the existing eight-column CMB parser contract and user-supplied GOOGLE*CHATGPT row; not a newly collected bank template",
+      "scope": "Current eight-column contract only; real bank template coverage awaits sanitized source samples"
+    }
   }
 }
