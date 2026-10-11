@@ -18,6 +18,15 @@ import statement_identity as si
 
 class TestStatementIdentityContract(unittest.TestCase):
 
+    def test_sender_metadata_spacing_preserves_identity_boundaries(self):
+        self.assertTrue(si.sender_metadata_equal('Bank <billing@example.invalid>',
+                                                'Bank<billing@example.invalid>'))
+        for candidate in ('Other <billing@example.invalid>', 'Bank <other@example.invalid>',
+                          'Bank <billing@example.invalid>, Other <other@example.invalid>',
+                          'Bank', ''):
+            with self.subTest(candidate=candidate):
+                self.assertFalse(si.sender_metadata_equal('Bank <billing@example.invalid>', candidate))
+
     def test_excluded_headers_lock(self):
         """排除头白名单锁定测试：确保传输跳板头被排除在内容签名之外，且普通作者头不被漏算"""
         locked_headers = {

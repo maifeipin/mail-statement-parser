@@ -340,6 +340,23 @@ def _parse_date_to_ymd(d_str: Optional[str]) -> Optional[str]:
         pass
     return None
 
+def sender_metadata_equal(left: str, right: str) -> bool:
+    """Compare parsed sender metadata; leave the v1 content digest unchanged."""
+    if left == right:
+        return True
+    try:
+        lhs = email.utils.getaddresses([left])
+        rhs = email.utils.getaddresses([right])
+    except (TypeError, ValueError):
+        return False
+    # Only unambiguous single mailbox syntax may ignore presentation spacing.
+    if len(lhs) != 1 or len(rhs) != 1:
+        return False
+    if any(not address or '@' not in address for _, address in lhs + rhs):
+        return False
+    return lhs == rhs
+
+
 def compare_evidence(
     source_ev: Dict[str, Any],
     target_ev: Dict[str, Any]
@@ -414,7 +431,7 @@ def compare_evidence(
                 elif sv != tv:
                     reasons.append(f'关键头硬矛盾: date (src={sv[:40]!r} != tgt={tv[:40]!r})')
                     return 'identity_conflict', reasons, details
-            elif sv != tv:
+            elif not (sender_metadata_equal(sv, tv) if key == 'from' else sv == tv):
                 reasons.append(f'关键头硬矛盾: {key} (src={sv[:40]!r} != tgt={tv[:40]!r})')
                 return 'identity_conflict', reasons, details
 

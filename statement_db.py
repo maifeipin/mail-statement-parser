@@ -2092,7 +2092,7 @@ def associate_transport_identity(
 
         # 3) From / Sender
         tgt_sender = target_row[8]
-        if src_from and tgt_sender and src_from != tgt_sender:
+        if src_from and tgt_sender and not si.sender_metadata_equal(src_from, tgt_sender):
             raise ValueError(f"硬元数据矛盾：发件人不匹配: src={src_from!r} != tgt={tgt_sender!r}")
 
         # 4) Date / email_date
