@@ -942,7 +942,7 @@ def validate_recent_bank_emails(months=3, *, context=None):
         )
 
 
-def sync_recent_bank_emails(months=3, account_budget_s=60, total_budget_s=270, *, context=None):
+def sync_recent_bank_emails(months=3, account_budget_s=60, total_budget_s=270, *, context=None, account=None, provider=None):
     """Scan, archive and parse in one POP3 session, with bounded account deadlines.
 
     No LLM is used. The global deadline leaves room for the caller's 300s limit
@@ -950,9 +950,18 @@ def sync_recent_bank_emails(months=3, account_budget_s=60, total_budget_s=270, *
     """
     if context is None:
         context = resolve_parser_paths()
+    # Validate explicit scope before creating stores or opening any mailbox.
+    accounts = load_accounts()
+    if account and provider:
+        raise ValueError('account 和 provider 不能同时指定')
+    if account:
+        accounts = [a for a in accounts if a.get('account') == account]
+    elif provider:
+        accounts = [a for a in accounts if a.get('provider') == provider]
+    if (account or provider) and not accounts:
+        raise ValueError('指定账单邮箱范围未匹配已配置账户，拒绝扩大到其他邮箱')
     init_db(context.db_path)
     rules = load_rule_files(context=context)
-    accounts = load_accounts()
     validate_write_target(context, context.download_dir)
     os.makedirs(context.download_dir, exist_ok=True)
     target_banks = {'HX', 'CMB', 'SPDB', 'CMBC', 'ICBC', 'CITIC'}
@@ -960,9 +969,10 @@ def sync_recent_bank_emails(months=3, account_budget_s=60, total_budget_s=270, *
     overall_deadline = time.monotonic() + total_budget_s
     for account_config in accounts:
         account_name = account_config.get('account', 'default')
+        is_graph = is_graph_api(account_config)
         acct = {'account': account_name, 'status': 'ok', 'candidates': 0,
                 'downloaded': 0, 'saved': 0, 'parse_failed': 0, 'gated': 0,
-                'skipped_dup': 0, 'errors': 0, 'scan_errors': 0}
+                'skipped_dup': 0, 'associated_existing': 0, 'errors': 0, 'scan_errors': 0}
         account_results.append(acct)
         allowed = min(account_budget_s, overall_deadline - time.monotonic())
         print(f'\n🚀 账户 {account_name} 单次遍历同步（最近 {months} 个月，预算 {max(0, allowed):.1f}s）')
@@ -992,7 +1002,7 @@ def sync_recent_bank_emails(months=3, account_budget_s=60, total_budget_s=270, *
                     raw_bytes=raw_bytes, transport_kind=t_kind, is_synthesized=is_synth
                 )
                 key = {'saved': 'saved', 'parse_failed': 'parse_failed',
-                       'not_statement': 'gated'}.get((result or {}).get('status'), 'errors')
+                       'not_statement': 'gated', 'associated_existing': 'associated_existing'}.get((result or {}).get('status'), 'errors')
                 acct[key] += 1
 
         try:
@@ -1028,7 +1038,7 @@ def sync_recent_bank_emails(months=3, account_budget_s=60, total_budget_s=270, *
                },
                'totals': {key: sum(a[key] for a in account_results) for key in
                           ('candidates', 'downloaded', 'saved', 'parse_failed', 'gated',
-                           'skipped_dup', 'errors', 'scan_errors')}}
+                           'skipped_dup', 'associated_existing', 'errors', 'scan_errors')}}
     print('--- JSON_SUMMARY_START ---')
     print(json.dumps(summary, ensure_ascii=False))
     print('--- JSON_SUMMARY_END ---')
@@ -2268,8 +2278,24 @@ def main():
         download_recent_bank_emails(months)
 
     elif cmd == 'sync3m':
-        months = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2].isdigit() else 3
-        sync_recent_bank_emails(months)
+        opts, _, errs = _parse_cmd_args(sys.argv[2:], {
+            'months': {'type': 'int', 'default': 3, 'min': 1},
+            'account': {'type': 'str'}, 'provider': {'type': 'str'}
+        }, ('months',))
+        if opts['account'] is not None and not opts['account'].strip():
+            errs.append('--account 不能为空')
+        if opts['provider'] is not None and not opts['provider'].strip():
+            errs.append('--provider 不能为空')
+        if opts['account'] and opts['provider']:
+            errs.append('--account 与 --provider 不能同时指定')
+        if errs:
+            _emit_envelope('sync3m', None, errs)
+            sys.exit(1)
+        try:
+            sync_recent_bank_emails(opts['months'], account=opts['account'], provider=opts['provider'])
+        except ValueError as exc:
+            _emit_envelope('sync3m', None, [str(exc)])
+            sys.exit(1)
 
     elif cmd == 'reparse_cached':
         if len(sys.argv) < 4:
