@@ -61,7 +61,7 @@ python .\mail_client.py download_bank_bills 3
 可用别名：
 
 ```powershell
-python .\mail_client.py exec3m 3
+python .\mail_client.py sync3m 3
 ```
 
 ### 步骤 2：对邮件做解析校验并写库

@@ -13,7 +13,7 @@ if sys.platform.startswith('win'):
     except Exception:
         pass
 from statement_models import EmailSummaryRecord
-from statement_db import init_db, get_recent_statements, get_summary_by_bank_month, get_reconciliation_rows, uid_exists, get_transactions_above_amount, upsert_email_summary, get_email_summary_status, get_email_summary_by_id, get_recent_email_headers, get_potential_missed_emails, get_unacked_quality_events, ack_quality_event, mark_statement_paid_by_id
+from statement_db import init_db, get_recent_statements, get_summary_by_bank_month, get_reconciliation_rows, uid_exists, get_transactions_above_amount, upsert_email_summary, get_email_summary_status, get_email_summary_by_id, get_recent_email_headers, get_potential_missed_emails, get_unacked_quality_events, ack_quality_event, mark_statement_paid_by_id, update_summary_status, load_noise_rules, add_noise_rule, delete_noise_rule
 
 
 from mail_connect import (MailAuthError, AccountBudgetExceeded, account_deadline, retry_with_backoff, is_graph_api, connect_pop3, connect_smtp, connect_imap, _graph_api_request, fetch_summaries_graph, send_email_graph, _month_subtract, pop3_uidl_map, pop3_retr_by_uid)
@@ -1275,49 +1275,67 @@ def interactive_menu():
             
         input("\n按回车键继续...")
 
-def show_headers(limit=15):
-    """CLI subcommand: 打印最近拉取的邮件标题列表，输出格式为 JSON"""
-    init_db(DB_PATH)
-    rows = get_recent_email_headers(DB_PATH, limit)
-    result = []
-    for r in rows:
-        result.append({
-            "id": r["id"],
-            "account_name": r["account_name"],
-            "uid": r["uid"],
-            "sender": r["sender"],
-            "subject": r["subject"],
-            "email_date": r["email_date"],
-            "category": r["category"],
-            "importance": r["importance"],
-            "status": r["status"],
-            "processed_at": r["processed_at"]
-        })
-    print(json.dumps(result, ensure_ascii=False))
+def cli_mail_headers(limit=15):
+    errors = []
+    data = {'headers': []}
+    try:
+        conn = _connect_ro(DB_PATH)
+        try:
+            rows = conn.execute("""SELECT id,account_name,uid,sender,subject,email_date,
+                category,importance,status,processed_at FROM email_summaries
+                ORDER BY email_date DESC,id DESC LIMIT ?""", (min(100,int(limit)),)).fetchall()
+            data['headers'] = [dict(row) for row in rows]
+        finally:
+            conn.close()
+    except Exception as exc:
+        errors.append(f'mail_headers: {exc}')
+    return _emit_envelope('mail_headers', data, errors)
 
 
-def show_missed(limit=15):
-    """CLI subcommand: 打印可能错过的非高优邮件列表，输出格式为 JSON"""
-    init_db(DB_PATH)
-    rows = get_potential_missed_emails(DB_PATH, limit)
-    result = []
-    for r in rows:
-        result.append({
-            "id": r["id"],
-            "account_name": r["account_name"],
-            "uid": r["uid"],
-            "sender": r["sender"],
-            "subject": r["subject"],
-            "email_date": r["email_date"],
-            "category": r["category"],
-            "importance": r["importance"],
-            "summary": r["summary"],
-            "status": r["status"]
-        })
-    print(json.dumps(result, ensure_ascii=False))
+def _fetch_missed_emails(db_path: str, limit: int = 15) -> list:
+    conn = _connect_ro(db_path)
+    try:
+        cur = conn.cursor()
+        import datetime
+        cutoff_date = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=7)).isoformat()
+        cur.execute(
+            """
+            SELECT id, account_name, uid, sender, subject, email_date, category, importance, status, summary, processed_at
+            FROM email_summaries
+            WHERE importance != 'high'
+              AND category != 'Spam'
+              AND status IN ('processed', 'skipped')
+              AND email_date >= ?
+            ORDER BY email_date DESC, id DESC
+            LIMIT ?
+            """,
+            (cutoff_date, limit)
+        )
+        return list(cur.fetchall())
+    finally:
+        conn.close()
 
 
-# ---------------- 契约 CLI（重构契约 §3：统一 envelope，schema_version=1） ----------------
+def cli_mail_missed(limit=15):
+    errors = []
+    data = {'missed': []}
+    try:
+        data['missed'] = [dict(row) for row in _fetch_missed_emails(DB_PATH,min(100,int(limit)))]
+    except Exception as exc:
+        errors.append(f'mail_missed: {exc}')
+    return _emit_envelope('mail_missed', data, errors)
+
+
+def _connect_ro(db_path: str):
+    """URI 编码的只读连接。若文件不存在抛出 FileNotFoundError，绝不自动建库。"""
+    if not os.path.exists(db_path):
+        raise FileNotFoundError(f"数据库文件不存在：{db_path}")
+    import urllib.parse
+    quoted = urllib.parse.quote(os.path.abspath(db_path), safe="/")
+    conn = sqlite3.connect(f"file:{quoted}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    return conn
+
 
 def _emit_envelope(command, data=None, errors=None):
     """版本化 JSON 回执：lite_agent integrations/mail/client.py 的消费契约。"""
@@ -1371,13 +1389,12 @@ def cli_quality_ack(event_id, todo_id, revision=None):
     return _emit_envelope('quality_ack', data, errors)
 
 
-def cli_billing_snapshot(months=1, detail_limit=20):
+def cli_billing_snapshot(months=1, detail_limit=20, as_of=None):
     from billing_readmodel import snapshot
     errors = []
     data = {}
     try:
-        # 只读命令严禁调用 init_db 触发迁移
-        data = snapshot(DB_PATH, months=max(1, int(months)), detail_limit=max(1, int(detail_limit)))
+        data = snapshot(DB_PATH, months=max(1, int(months)), detail_limit=max(0, int(detail_limit)), today=as_of)
     except Exception as exc:
         errors.append(f'billing_snapshot: {exc}')
     return _emit_envelope('billing_snapshot', data, errors)
@@ -1836,6 +1853,294 @@ def cli_identity_status(statement_id: Optional[int] = None, account: Optional[st
     return _emit_envelope('identity_status', data, errors)
 
 
+
+
+def cli_mail_stats():
+    errors = []
+    data = {}
+    try:
+        import urllib.parse
+        quoted = urllib.parse.quote(os.path.abspath(DB_PATH), safe="/")
+        conn = sqlite3.connect(f"file:{quoted}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        try:
+            cur = conn.cursor()
+            total = cur.execute("SELECT count(*) FROM email_summaries").fetchone()[0]
+            if total == 0:
+                data = {"total": 0, "categories": [], "importance": [], "statuses": {}, "accounts": [], "success_rate": 0.0}
+            else:
+                cat_rows = [dict(r) for r in cur.execute("SELECT category, count(*) as cnt FROM email_summaries GROUP BY category ORDER BY cnt DESC").fetchall()]
+                imp_rows = [dict(r) for r in cur.execute("SELECT importance, count(*) as cnt FROM email_summaries GROUP BY importance ORDER BY cnt DESC").fetchall()]
+                status_rows = cur.execute("SELECT status, count(*) as cnt FROM email_summaries GROUP BY status").fetchall()
+                status_map = {r["status"]: r["cnt"] for r in status_rows}
+                acct_rows = [dict(r) for r in cur.execute("SELECT account_name, count(*) as cnt FROM email_summaries GROUP BY account_name ORDER BY cnt DESC").fetchall()]
+                success_rate = round((status_map.get("processed", 0) + status_map.get("noise", 0)) / total * 100, 1) if total > 0 else 0.0
+                data = {
+                    "total": total,
+                    "categories": cat_rows,
+                    "importance": imp_rows,
+                    "statuses": status_map,
+                    "accounts": acct_rows,
+                    "success_rate": success_rate,
+                }
+        finally:
+            conn.close()
+    except Exception as exc:
+        errors.append(f"mail_stats: {exc}")
+    return _emit_envelope('mail_stats', data, errors)
+
+
+def cli_mail_search(keyword, limit=20, account_name=None, offset=0):
+    errors = []
+    data = {"results": [], "total": 0}
+    if not keyword:
+        errors.append("必须提供搜索关键词")
+        return _emit_envelope('mail_search', data, errors)
+    try:
+        limit_num = max(1, min(100, int(limit)))
+    except (ValueError, TypeError):
+        limit_num = 20
+    try:
+        import urllib.parse
+        quoted = urllib.parse.quote(os.path.abspath(DB_PATH), safe="/")
+        conn = sqlite3.connect(f"file:{quoted}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        try:
+            sql = (
+                "SELECT es.subject, es.sender, es.email_date, es.category, es.importance, "
+                "es.status, es.account_name, es.uid, "
+                "substr(CAST(eb.plain_text AS BLOB),1,8192) AS plain_text, "
+                "length(CAST(eb.plain_text AS BLOB)) AS body_bytes "
+                "FROM email_bodies eb JOIN email_summaries es "
+                "ON eb.account_name=es.account_name AND eb.uid=es.uid "
+                "WHERE (eb.plain_text LIKE ? OR es.subject LIKE ? OR es.sender LIKE ?) "
+            )
+            params = [f"%{keyword}%"] * 3
+            if account_name:
+                sql += "AND es.account_name = ? "
+                params.append(account_name)
+            sql += "ORDER BY es.id DESC LIMIT ? OFFSET ?"
+            params.extend([limit_num + 1, max(0, int(offset))])
+            rows = [dict(r) for r in conn.execute(sql, params).fetchall()]
+            data['has_more'] = len(rows) > limit_num
+            rows = rows[:limit_num]
+            for row in rows:
+                row['plain_text'] = (row['plain_text'] or b'').decode('utf-8', errors='ignore')
+                row['is_truncated'] = (row.pop('body_bytes') or 0) > 8192
+            data["results"] = rows
+            data["total"] = len(rows)
+            data['offset'] = max(0, int(offset))
+        finally:
+            conn.close()
+    except Exception as exc:
+        errors.append(f"mail_search: {exc}")
+    return _emit_envelope('mail_search', data, errors)
+
+
+def _truncate_utf8(text: str, max_bytes: int) -> Tuple[str, bool]:
+    encoded = text.encode('utf-8')
+    if len(encoded) <= max_bytes:
+        return text, False
+    chunk = encoded[:max_bytes]
+    while chunk:
+        try:
+            return chunk.decode('utf-8'), True
+        except UnicodeDecodeError:
+            chunk = chunk[:-1]
+    return "", True
+
+
+def cli_mail_summary_get(summary_id):
+    errors = []
+    data = {"summary": None}
+    try:
+        sid = int(summary_id)
+        conn = _connect_ro(DB_PATH)
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT * FROM email_summaries WHERE id = ?", (sid,))
+            row = cur.fetchone()
+            if row:
+                data["summary"] = dict(row)
+            else:
+                errors.append(f"未找到 ID={sid} 的邮件摘要记录")
+        finally:
+            conn.close()
+    except Exception as exc:
+        errors.append(f"mail_summary_get: {exc}")
+    return _emit_envelope('mail_summary_get', data, errors)
+
+
+def cli_mail_mark_processed(summary_id):
+    errors = []
+    data = {"summary_id": summary_id, "updated": False}
+    try:
+        sid = int(summary_id)
+        success = update_summary_status(DB_PATH, sid, 'processed')
+        data["updated"] = bool(success)
+        if not success:
+            errors.append(f"标记邮件 ID={sid} 失败")
+    except Exception as exc:
+        errors.append(f"mail_mark_processed: {exc}")
+    return _emit_envelope('mail_mark_processed', data, errors)
+
+
+def cli_mail_noise_rules_list():
+    errors = []
+    data = {"rules": []}
+    try:
+        conn = _connect_ro(DB_PATH)
+        try:
+            has_table = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='noise_rules'").fetchone()
+            if has_table:
+                cur = conn.cursor()
+                cur.execute("SELECT pattern_type, pattern_value FROM noise_rules")
+                data["rules"] = [tuple(r) for r in cur.fetchall()]
+            else:
+                data["rules"] = []
+        finally:
+            conn.close()
+    except Exception as exc:
+        errors.append(f"mail_noise_rules_list: {exc}")
+    return _emit_envelope('mail_noise_rules_list', data, errors)
+
+
+def cli_mail_noise_rule_add(pattern_type, pattern_value, summary_id=None):
+    errors = []
+    data = {"pattern_type": pattern_type, "pattern_value": pattern_value, "added": False}
+    try:
+        if not pattern_type or not pattern_value:
+            errors.append("必须提供 pattern_type 和 pattern_value")
+        elif pattern_type not in ('sender_domain', 'sender_email'):
+            errors.append(f"不支持的降噪规则类型：{pattern_type}（仅支持 sender_domain 或 sender_email）")
+        else:
+            val = pattern_value.strip().lower() if pattern_type == 'sender_domain' else pattern_value.strip()
+            conn = sqlite3.connect(DB_PATH)
+            try:
+                conn.execute('BEGIN IMMEDIATE')
+                now = datetime.now(timezone.utc).isoformat()
+                if summary_id is not None:
+                    sid = int(summary_id)
+                    row = conn.execute("SELECT id FROM email_summaries WHERE id = ?", (sid,)).fetchone()
+                    if not row:
+                        conn.rollback()
+                        errors.append(f"未找到 ID={sid} 的邮件摘要记录")
+                        return _emit_envelope('mail_noise_rule_add', data, errors)
+
+                    cur_u = conn.execute(
+                        "UPDATE email_summaries SET status = ?, processed_at = ? WHERE id = ?",
+                        ('noise', now, sid)
+                    )
+                    if cur_u.rowcount == 0:
+                        conn.rollback()
+                        errors.append(f"更新邮件摘要 ID={sid} 状态失败")
+                        return _emit_envelope('mail_noise_rule_add', data, errors)
+
+
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO noise_rules (pattern_type, pattern_value, created_at)
+                    VALUES (?, ?, ?)
+                    """,
+                    (pattern_type, val, now)
+                )
+                conn.commit()
+                data["added"] = True
+                if summary_id is not None:
+                    data["summary_id"] = sid
+                    data["status"] = "noise"
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+    except Exception as exc:
+        errors.append(f"mail_noise_rule_add: {exc}")
+    return _emit_envelope('mail_noise_rule_add', data, errors)
+
+
+def cli_mail_noise_rule_delete(pattern_value, pattern_type=None):
+    errors = []
+    data = {"pattern_value": pattern_value, "deleted": False}
+    try:
+        if not pattern_value:
+            errors.append("必须提供待删除的 pattern_value")
+        else:
+            val = pattern_value.strip()
+            conn = sqlite3.connect(DB_PATH)
+            try:
+                conn.execute('BEGIN IMMEDIATE')
+                deleted_count = 0
+                if pattern_type is None:
+                    c1 = conn.execute("DELETE FROM noise_rules WHERE pattern_type = 'sender_domain' AND pattern_value = ?", (val.lower(),))
+                    c2 = conn.execute("DELETE FROM noise_rules WHERE pattern_type = 'sender_email' AND pattern_value = ?", (val,))
+                    deleted_count = c1.rowcount + c2.rowcount
+                elif pattern_type in ('sender_domain', 'sender_email'):
+                    c = conn.execute("DELETE FROM noise_rules WHERE pattern_type = ? AND pattern_value = ?", (pattern_type, val.lower() if pattern_type == 'sender_domain' else val))
+                    deleted_count = c.rowcount
+                else:
+                    errors.append(f"不支持的 pattern_type: {pattern_type}")
+
+                if deleted_count > 0:
+                    conn.commit()
+                    data["deleted"] = True
+                else:
+                    conn.rollback()
+                    if not errors:
+                        errors.append(f"未找到匹配的降噪过滤规则值：{val}")
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+    except Exception as exc:
+        errors.append(f"mail_noise_rule_delete: {exc}")
+    return _emit_envelope('mail_noise_rule_delete', data, errors)
+
+
+def cli_mail_view_original(account, uid, max_bytes=50000):
+    errors = []
+    data = {"subject": "", "sender": "", "email_date": "", "content": "", "is_truncated": False}
+    try:
+        if not account or not uid:
+            errors.append("必须提供 account 和 uid")
+        else:
+            try:
+                max_bytes_int = max(1, min(50000, int(max_bytes)))
+            except (ValueError, TypeError):
+                max_bytes_int = 50000
+
+            conn = _connect_ro(DB_PATH)
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT es.subject, es.sender, es.email_date, eb.raw_html, eb.plain_text "
+                    "FROM email_bodies eb "
+                    "JOIN email_summaries es ON eb.account_name=es.account_name AND eb.uid=es.uid "
+                    "WHERE eb.account_name=? AND eb.uid=?",
+                    (account, uid)
+                )
+                row = cur.fetchone()
+                if not row:
+                    errors.append(f"找不到该邮件原文 (Account: {account}, UID: {uid})")
+                else:
+                    subject, sender, date, raw_html, plain_text = row
+                    content = raw_html if raw_html else (plain_text or "")
+                    content_truncated, is_truncated = _truncate_utf8(content, max_bytes_int)
+                    data = {
+                        "subject": subject or "",
+                        "sender": sender or "",
+                        "email_date": date or "",
+                        "content": content_truncated,
+                        "is_truncated": is_truncated,
+                    }
+            finally:
+                conn.close()
+    except Exception as exc:
+        errors.append(f"mail_view_original: {exc}")
+    return _emit_envelope('mail_view_original', data, errors)
+
+
 def _parse_cmd_args(argv, allowed_options, positional_options=()):
     """严格解析命令行选项（契约 §3）。
     allowed_options: {'flag_name': {'type': 'int'|'str', 'default': val, 'min': 1}}
@@ -1922,7 +2227,7 @@ def main():
         interactive_menu()
         sys.exit(0)
     cmd = sys.argv[1]
-    if cmd in ('menu', 'interactive'):
+    if cmd == 'menu':
         interactive_menu()
     elif cmd == 'test':
         test_connection()
@@ -1958,11 +2263,11 @@ def main():
         args = [arg for arg in sys.argv[3:] if not arg.startswith('--')]
         account_name = args[0] if args else None
         download_email_pop3(uid, format=format, account_name=account_name)
-    elif cmd in ('download_bank_bills', 'exec3m'):
+    elif cmd == 'download_bank_bills':
         months = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2].isdigit() else 3
         download_recent_bank_emails(months)
 
-    elif cmd in ('sync_bank_bills', 'sync3m'):
+    elif cmd == 'sync3m':
         months = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2].isdigit() else 3
         sync_recent_bank_emails(months)
 
@@ -1976,24 +2281,14 @@ def main():
     elif cmd == 'unpaid':
         show_unpaid_statements()
     elif cmd == 'mark_paid':
-        args = sys.argv[2:]
-        if any(arg.startswith('--') for arg in args):
-            opts, _, errs = _parse_cmd_args(args, {
-                'statement-id': {'type': 'int', 'min': 1}
-            })
-            if opts['statement-id'] is None:
-                errs.append('必须提供 --statement-id')
-            if errs:
-                _emit_envelope('mark_paid', {'updated': False}, errs)
-                sys.exit(1)
-            res = cli_mark_paid_by_id(opts['statement-id'])
-            if res.get('status') != 'ok':
-                sys.exit(1)
-        elif not 1 <= len(args) <= 2:
-            print('用法：mark_paid <bank_code> [statement_month] | mark_paid --statement-id <id>')
+        opts, _, errs = _parse_cmd_args(sys.argv[2:], {'statement-id': {'type':'int','min':1}})
+        if opts['statement-id'] is None:
+            errs.append('必须提供 --statement-id')
+        if errs:
+            _emit_envelope('mark_paid', {'updated':False}, errs)
             sys.exit(1)
-        else:
-            mark_statement_paid_cmd(args[0], args[1] if len(args) > 1 else None)
+        if cli_mark_paid_by_id(opts['statement-id'])['status'] != 'ok':
+            sys.exit(1)
 
     elif cmd == 'identity_preview':
         opts, _, errs = _parse_cmd_args(sys.argv[2:], {
@@ -2088,12 +2383,13 @@ def main():
     elif cmd == 'billing_snapshot':
         opts, _, errs = _parse_cmd_args(sys.argv[2:], {
             'months': {'type': 'int', 'default': 1, 'min': 1},
-            'detail-limit': {'type': 'int', 'default': 20, 'min': 1}
+            'detail-limit': {'type': 'int', 'default': 20, 'min': 0},
+            'as-of': {'type': 'str'}
         }, ('months', 'detail-limit'))
         if errs:
             _emit_envelope('billing_snapshot', {}, errs)
             sys.exit(1)
-        res = cli_billing_snapshot(opts['months'], opts['detail-limit'])
+        res = cli_billing_snapshot(opts['months'], opts['detail-limit'], opts.get('as-of'))
         if res.get('status') != 'ok':
             sys.exit(1)
 
@@ -2122,13 +2418,15 @@ def main():
     elif cmd == 'enrich_pending':
         limit = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2].isdigit() else 30
         reprocess_by_status(status='pending', limit=limit)
-    elif cmd == 'show_headers':
-        limit = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2].isdigit() else 15
-        show_headers(limit)
-    elif cmd == 'show_missed':
-        limit = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2].isdigit() else 15
-        show_missed(limit)
-    elif cmd in ('validate_bank_bills', 'validate3m'):
+    elif cmd in ('mail_headers','mail_missed'):
+        opts, _, errs = _parse_cmd_args(sys.argv[2:], {'limit': {'type': 'int', 'default':15,'min':1}})
+        if errs:
+            _emit_envelope(cmd, {}, errs)
+            sys.exit(1)
+        res = (cli_mail_headers if cmd == 'mail_headers' else cli_mail_missed)(opts['limit'])
+        if res['status'] != 'ok':
+            sys.exit(1)
+    elif cmd == 'validate_bank_bills':
         months = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2].isdigit() else 3
         validate_recent_bank_emails(months)
     elif cmd == 'classify':
@@ -2158,10 +2456,95 @@ def main():
         amount = float(sys.argv[2])
         months = int(sys.argv[3]) if len(sys.argv) > 3 and sys.argv[3].isdigit() else None
         show_transactions_over(amount, months)
-    elif cmd in ('reprocess_failed', 'reprocess'):
+
+    elif cmd == 'mail_stats':
+        res = cli_mail_stats()
+        if res.get('status') != 'ok':
+            sys.exit(1)
+
+    elif cmd == 'mail_search':
+        opts, _, errs = _parse_cmd_args(sys.argv[2:], {
+            'keyword': {'type': 'str'},
+            'limit': {'type': 'int', 'default': 20, 'min': 1},
+            'account': {'type': 'str'},
+            'offset': {'type': 'int', 'default': 0, 'min': 0}
+        }, ('keyword',))
+        if errs:
+            _emit_envelope('mail_search', {'results': [], 'total': 0}, errs)
+            sys.exit(1)
+        res = cli_mail_search(opts['keyword'], opts.get('limit', 20), opts.get('account'), opts.get('offset', 0))
+        if res.get('status') != 'ok':
+            sys.exit(1)
+
+    elif cmd == 'mail_summary_get':
+        opts, _, errs = _parse_cmd_args(sys.argv[2:], {
+            'id': {'type': 'int', 'min': 1}
+        }, ('id',))
+        if errs:
+            _emit_envelope('mail_summary_get', {'summary': None}, errs)
+            sys.exit(1)
+        res = cli_mail_summary_get(opts['id'])
+        if res.get('status') != 'ok':
+            sys.exit(1)
+
+    elif cmd == 'mail_mark_processed':
+        opts, _, errs = _parse_cmd_args(sys.argv[2:], {
+            'id': {'type': 'int', 'min': 1}
+        }, ('id',))
+        if errs:
+            _emit_envelope('mail_mark_processed', {'updated': False}, errs)
+            sys.exit(1)
+        res = cli_mail_mark_processed(opts['id'])
+        if res.get('status') != 'ok':
+            sys.exit(1)
+
+    elif cmd == 'mail_noise_rules_list':
+        res = cli_mail_noise_rules_list()
+        if res.get('status') != 'ok':
+            sys.exit(1)
+
+    elif cmd == 'mail_noise_rule_add':
+        opts, _, errs = _parse_cmd_args(sys.argv[2:], {
+            'type': {'type': 'str'},
+            'value': {'type': 'str'},
+            'summary-id': {'type': 'int', 'min': 1}
+        }, ('type', 'value'))
+        if errs:
+            _emit_envelope('mail_noise_rule_add', {'added': False}, errs)
+            sys.exit(1)
+        res = cli_mail_noise_rule_add(opts['type'], opts['value'], opts.get('summary-id'))
+        if res.get('status') != 'ok':
+            sys.exit(1)
+
+    elif cmd == 'mail_noise_rule_delete':
+        opts, _, errs = _parse_cmd_args(sys.argv[2:], {
+            'value': {'type': 'str'},
+            'type': {'type': 'str'}
+        }, ('value',))
+        if errs:
+            _emit_envelope('mail_noise_rule_delete', {'deleted': False}, errs)
+            sys.exit(1)
+        res = cli_mail_noise_rule_delete(opts['value'], opts.get('type'))
+        if res.get('status') != 'ok':
+            sys.exit(1)
+
+    elif cmd == 'mail_view_original':
+        opts, _, errs = _parse_cmd_args(sys.argv[2:], {
+            'account': {'type': 'str'},
+            'uid': {'type': 'str'},
+            'max-bytes': {'type': 'int', 'default': 50000, 'min': 1}
+        }, ('account', 'uid'))
+        if errs:
+            _emit_envelope('mail_view_original', {}, errs)
+            sys.exit(1)
+        res = cli_mail_view_original(opts['account'], opts['uid'], opts.get('max-bytes', 50000))
+        if res.get('status') != 'ok':
+            sys.exit(1)
+
+    elif cmd == 'reprocess_failed':
         reprocess_failed_emails()
     else:
-        print(f'未知命令：{cmd}')
+        _emit_envelope(cmd, {}, [f'不支持的命令：{cmd}'])
         sys.exit(1)
 
 if __name__ == '__main__':

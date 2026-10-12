@@ -13,6 +13,7 @@
 
 import json
 import os
+import re
 import sqlite3
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -56,17 +57,13 @@ def decimal_amount(value) -> Optional[Decimal]:
 
 
 def month_start(today, months):
-    y, m = today.year, today.month
-    for _ in range(months):
-        m -= 1
-        if m == 0:
-            m = 12
-            y -= 1
-    return f'{y:04d}-{m:02d}'
+    index = today.year * 12 + today.month - 1 - (months - 1)
+    return f'{index // 12:04d}-{index % 12 + 1:02d}'
 
 
 def _connect_ro(db_path):
-    conn = sqlite3.connect(f'file:{db_path}?mode=ro', uri=True)
+    from urllib.parse import quote
+    conn = sqlite3.connect('file:' + quote(os.path.abspath(db_path), safe='/') + '?mode=ro', uri=True)
     conn.row_factory = sqlite3.Row
     conn.execute('BEGIN')
     return conn
@@ -87,94 +84,145 @@ def _months_list(start_month, today):
 
 
 def snapshot(db_path, months=1, detail_limit=20, today=None):
-    """版本化账单快照（billing_snapshot CLI 的 data 部分，契约 §4）。"""
-    today = today or datetime.now(timezone.utc)
-    start = month_start(today, months)
+    """版本化账单快照（billing_snapshot CLI 的 data 部分，权威财务读模型契约 §4）。"""
+    from datetime import date
+    if isinstance(today, str):
+        today_dt = datetime.fromisoformat(today.replace('Z', '+00:00'))
+        today_date = today_dt.date()
+    elif isinstance(today, datetime):
+        today_dt = today
+        today_date = today.date()
+    elif isinstance(today, date):
+        today_dt = datetime(today.year, today.month, today.day, tzinfo=timezone.utc)
+        today_date = today
+    else:
+        today_dt = datetime.now(timezone.utc)
+        today_date = today_dt.date()
+
+    months = max(1, min(24, int(months)))
+    detail_limit = max(0, min(100, int(detail_limit)))
+    start = month_start(today_dt, months)
     conn = _connect_ro(db_path)
     try:
-        stmt_rows = conn.execute(
-            """SELECT s.id, s.account_name, s.bank_code, s.statement_month, s.due_date,
-                      s.total_due, s.minimum_due, s.is_paid, s.paid_at, s.parse_status,
-                      s.message_id, s.created_at, s.raw_fields_json
-               FROM statements s
-               WHERE s.parse_status = 'ok' AND s.statement_month >= ?
-               ORDER BY s.account_name, s.bank_code, s.statement_month""",
-            (start,)).fetchall()
-        statements = []
-        balance_index = {}
-        if stmt_rows:
-            ids = [r['id'] for r in stmt_rows]
-            ph = ','.join('?' * len(ids))
-            for b in conn.execute(
-                f"""SELECT statement_id, currency, total_due, minimum_due, currency_source
-                    FROM statement_balances WHERE statement_id IN ({ph})""",
-                    ids):
-                balance_index.setdefault(b['statement_id'], []).append({
-                    'currency': b['currency'], 'total_due': b['total_due'],
-                    'minimum_due': b['minimum_due'], 'currency_source': b['currency_source'],
-                })
-        for r in stmt_rows:
-            bal = balance_index.get(r['id'])
-            if not bal:
-                # 迁移期兜底：无余额行时用兼容字段展示，币种证据按未知处理
-                bal = ([{'currency': 'UNKNOWN',
-                         'total_due': r['total_due'], 'minimum_due': r['minimum_due'],
-                         'currency_source': None}]
-                       if (r['total_due'] is not None or r['minimum_due'] is not None) else [])
-            for b in bal:
-                b['currency_confirmed']=bool(confirmed_currency(b['currency'],b['currency_source']))
+        # Latest month per mailbox/bank, including older data as an explicit fallback.
+        database_rows = [dict(r) for r in conn.execute(
+            "SELECT * FROM statements ORDER BY bank_code, statement_month DESC, id DESC"
+        ).fetchall()]
+        failed_rows = [r for r in database_rows if r.get('parse_status') == 'failed']
+        all_rows = [r for r in database_rows if r.get('parse_status', 'ok') == 'ok']
+        unscoped_rows = [r for r in all_rows if not re.fullmatch(
+            r'[1-9][0-9]{3}-(?:0[1-9]|1[0-2])', str(r.get('statement_month') or ''))]
+        all_rows = [r for r in all_rows if r not in unscoped_rows]
+
+        latest = {}
+        for row in all_rows:
+            key = (row['account_name'], row['bank_code'])
+            latest[key] = max(latest.get(key, ''), row['statement_month'] or '')
+
+        selected = [row for row in all_rows if (row['statement_month'] or '') >= start or
+                    row['statement_month'] == latest.get((row['account_name'], row['bank_code']))]
+
+        availability = {
+            r['id']: {
+                purpose: stored_purpose(r.get('raw_fields_json'), purpose)
+                for purpose in ('financial_summary', 'transaction_trends', 'fx_analysis', 'repayment_reminder')
+            }
+            for r in selected
+        }
+
+        balances = {}
+        balance_table = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='statement_balances'").fetchone()
+        for row in selected:
+            entries = [dict(b) for b in conn.execute(
+                "SELECT currency, total_due, minimum_due, currency_source FROM statement_balances WHERE statement_id=?",
+                (row['id'],)
+            ).fetchall()] if balance_table else []
+            if not entries:
+                entries = [{'currency': 'UNKNOWN', 'currency_source': None, 'total_due': row['total_due'], 'minimum_due': row['minimum_due']}]
+            for b in entries:
+                b['currency_confirmed'] = bool(confirmed_currency(b.get('currency'), b.get('currency_source')))
                 if not b['currency_confirmed']:
-                    b['reported_currency']=b['currency']
-                    b['currency']='UNKNOWN'
-            statements.append({
-                'statement_id': r['id'], 'account': r['account_name'], 'bank': r['bank_code'],
-                'month': r['statement_month'], 'due_date': r['due_date'],
-                'purpose_availability': {purpose:stored_purpose(r['raw_fields_json'],purpose) for purpose in ('financial_summary','transaction_trends','fx_analysis','repayment_reminder')},
-                'balances': bal, 'is_paid': r['is_paid'], 'message_id': r['message_id'],
-            })
+                    b['reported_currency'] = b['currency']
+                    b['currency'] = 'UNKNOWN'
+            balances[row['id']] = entries
 
-        txn_rows = conn.execute(
-            """SELECT t.id, t.account_name, t.bank_code, t.txn_date, t.description,
-                      t.amount, t.currency, t.direction, t.original_amount, t.original_currency,
-                      t.currency_source, t.original_currency_source, s.raw_fields_json, s.id AS statement_id
-               FROM statement_transactions t
-               JOIN statements s ON s.id = t.statement_id
-               WHERE s.parse_status = 'ok' AND s.statement_month >= ?
-               ORDER BY t.id""",
-            (start,)).fetchall()
-        txn_totals = {}
-        unknown_orig_count = 0
-        unknown_curr_txns = []
+        txns = []
+        anchored = 'statement_id' in {row[1] for row in conn.execute("PRAGMA table_info(statement_transactions)")}
+        for row in selected:
+            query = ("SELECT * FROM statement_transactions WHERE statement_id=? ORDER BY txn_date, id"
+                     if anchored else "SELECT * FROM statement_transactions WHERE bank_code=? AND uid=? AND account_name=? ORDER BY txn_date, id")
+            params = (row['id'],) if anchored else (row['bank_code'], row['uid'], row['account_name'])
+            for txn in conn.execute(query, params).fetchall():
+                item = dict(txn)
+                item['purpose_availability'] = availability[row['id']]
+                txns.append(item)
+        txns = list({row['id']: row for row in txns}.values())
+
+        anomalies = [f"账单 #{row['id']} 解析失败，已排除出账期选择、金额汇总及交易明细，需离线重解析。"
+                     for row in failed_rows]
+        anomalies.extend(f"账单 #{row['id']} 账期缺失或格式异常，未纳入账期金额统计。" for row in unscoped_rows)
+        groups = {}
+        for row in selected:
+            groups.setdefault((row['account_name'], row['bank_code'], row['statement_month']), []).append(row['id'])
+            amount = decimal_amount(row['total_due'])
+            if amount is None:
+                anomalies.append(f"账单 #{row['id']} 应还金额缺失或无法无歧义解析：{row['total_due']!r}。")
+            if row['statement_month'] and row['statement_month'] > today_date.strftime('%Y-%m'):
+                anomalies.append(f"账单 #{row['id']} 账期晚于当前月份，需核对解析。")
+            if not row['is_paid']:
+                due = str(row.get('due_date') or '')
+                try:
+                    days = (date.fromisoformat(due[:10]) - today_date).days
+                    if days < 0:
+                        anomalies.append(f"账单 #{row['id']} 数据库仍标为未还款，记录的到期日 {due} 已过；需核实实际还款状态。")
+                    elif days <= 7:
+                        anomalies.append(f"账单 #{row['id']} 数据库标为未还款，{days} 天内到期（{due}）。")
+                except ValueError:
+                    anomalies.append(f"账单 #{row['id']} 未还款记录的到期日缺失或格式异常：{due!r}。")
+        for key, ids in groups.items():
+            if len(ids) > 1:
+                anomalies.append(f"{key[1]} / {key[2]} / {key[0]} 有 {len(ids)} 条账单（ID {ids}）；可能包含多卡或重复记录，未经核实不合并计费。")
+        for (account, bank), month in latest.items():
+            if month < today_date.strftime('%Y-%m'):
+                anomalies.append(f'{bank} / {account} 最新账期为 {month}，当前月账单尚未入库；本报告包含该最新历史账期。')
+
+        sums = {}
+        counts = {}
+        unknown_txns = []
         gated_txns = []
-        for r in txn_rows:
-            d = decimal_amount(r['amount'])
-            if d is None:
+        unknown_orig_count = 0
+        for txn in txns:
+            amount = decimal_amount(txn['amount'])
+            if amount is None:
+                anomalies.append(f"交易 #{txn['id']} 金额缺失或无法解析。")
                 continue
-            c_src = r['currency_source'] if 'currency_source' in r.keys() else None
-            gate=stored_purpose(r['raw_fields_json'],'transaction_trends')
-            is_confirmed = confirmed_currency(r['currency'],c_src)
-            if gate['status']=='blocked':
-                gated_txns.append({k:r[k] for k in r.keys() if k!='raw_fields_json'})
-            if is_confirmed and gate['status']!='blocked':
-                key = (r['currency'], r['direction'] or 'unknown')
-                agg = txn_totals.setdefault(key, {'count': 0, 'amount': Decimal('0')})
-                agg['count'] += 1
-                agg['amount'] += d
+            c_src = txn.get('currency_source')
+            is_confirmed = confirmed_currency(txn.get('currency'), c_src)
+            gate = txn['purpose_availability']['transaction_trends']
+            if gate['status'] == 'blocked':
+                gated_txns.append(txn)
+            if is_confirmed and gate['status'] != 'blocked':
+                key = (txn.get('currency'), txn.get('direction') or '未标方向')
+                sums[key] = sums.get(key, Decimal('0')) + amount
+                counts[key] = counts.get(key, 0) + 1
             elif not is_confirmed:
-                unknown_curr_txns.append({k:r[k] for k in r.keys() if k!='raw_fields_json'})
-            if r['original_amount'] is not None and not confirmed_currency(r['original_currency'],r['original_currency_source']):
+                unknown_txns.append(txn)
+            if txn.get('original_amount') is not None and not confirmed_currency(txn.get('original_currency'), txn.get('original_currency_source')):
                 unknown_orig_count += 1
-        transaction_totals = [
-            {'currency': k[0], 'direction': k[1], 'count': v['count'], 'amount': str(v['amount'])}
-            for k, v in sorted(txn_totals.items())
-        ]
 
-        # 覆盖缺口：每个 (账户, 银行) 在「首期~末期」区间内应连续（区间外不推断，
-        # 单期账户无缺口；当前月通常尚未出账单，不算缺口）。尾部落后单独表达。
+        if unknown_txns:
+            anomalies.append(f"存在 {len(unknown_txns)} 笔未确认币种的交易，未纳入确认合计，需核实。")
+        for row in selected:
+            for purpose, gate in availability[row['id']].items():
+                if gate['status'] != 'available':
+                    anomalies.append(f"账单 #{row['id']} 用途 {purpose}: {gate['status']}；原因 {gate['reasons']}。")
+        if not selected:
+            anomalies.append('数据库无账单，无法生成账单分析。')
+
         seen_pairs = {}
-        for r in stmt_rows:
+        for r in selected:
             seen_pairs.setdefault((r['account_name'], r['bank_code']), []).append(r['statement_month'])
-        py, pm = (today.year, today.month - 1) if today.month > 1 else (today.year - 1, 12)
+        py, pm = (today_date.year, today_date.month - 1) if today_date.month > 1 else (today_date.year - 1, 12)
         prev_full_month = f'{py:04d}-{pm:02d}'
         coverage_gaps = []
         stale_accounts = []
@@ -187,27 +235,63 @@ def snapshot(db_path, months=1, detail_limit=20, today=None):
             if last < prev_full_month:
                 stale_accounts.append({'account': acct, 'bank': bank, 'last_statement_month': last})
 
+        compact_statements = []
+        for row in selected:
+            item = {
+                'id': row['id'],
+                'statement_id': row['id'],
+                'account': row['account_name'],
+                'account_name': row['account_name'],
+                'bank': row['bank_code'],
+                'bank_code': row['bank_code'],
+                'month': row['statement_month'],
+                'statement_month': row['statement_month'],
+                'due_date': row['due_date'],
+                'total_due': row['total_due'],
+                'minimum_due': row['minimum_due'],
+                'is_paid': row['is_paid'],
+                'created_at': row['created_at'],
+                'message_id': row.get('message_id'),
+                'purpose_availability': availability[row['id']],
+                'balances': balances[row['id']],
+            }
+            compact_statements.append(item)
+
+        transaction_totals = [
+            {'currency': k[0], 'direction': k[1], 'amount': str(v), 'count': counts[k]}
+            for k, v in sorted(sums.items())
+        ]
+
         return {
             'schema_version': 1,
             'generated_at': datetime.now(timezone.utc).isoformat(),
+            'as_of': today_date.isoformat(),
             'months': months,
             'scope_start_month': start,
-            'statement_count': len(statements),
-            'statements': statements,
-            'transaction_count': len(txn_rows),
+            'scope': f'账期 {start} 起，另含各邮箱/银行最新历史账期',
+            'latest_months': [{'account': key[0], 'bank': key[1], 'month': value} for key, value in latest.items()],
+            'database_statement_count': len(database_rows),
+            'failed_statement_count': len(failed_rows),
+            'unscoped_statement_count': len(unscoped_rows),
+            'statement_count': len(selected),
+            'statements': compact_statements,
+            'transaction_count': len(txns),
             'transaction_totals': transaction_totals,
-            'transaction_totals_complete': not unknown_curr_txns and not gated_txns and all(s['purpose_availability']['transaction_trends']['status']=='available' for s in statements),
+            'unknown_currency_transactions': unknown_txns,
             'gated_transactions': gated_txns,
-            'unknown_currency_transactions': unknown_curr_txns,
+            'transaction_totals_complete': not unscoped_rows and not unknown_txns and not gated_txns and all(g['transaction_trends']['status'] == 'available' for g in availability.values()),
+            'transactions': txns,
             'unknown_currency_original_amounts': unknown_orig_count,
             'coverage_gaps': coverage_gaps,
             'stale_accounts': stale_accounts,
-            'model_detail_limit': detail_limit,
+            'anomalies': anomalies,
             'limitations': [
-                '交易分组金额按入账币种与方向分别求和，不等同消费净额',
-                '原币币种未知的交易不参与折算比例计算',
-                '缺失账单月份标记为未覆盖，不补零',
+                '账单应还金额没有独立币种字段，不跨账单直接求和。',
+                '交易按原币种和原方向分别汇总，不把还款、退款或外币直接当作消费。',
+                '未还款状态来自数据库标记，不能据此确认现实中的逾期。',
+                '余额、上期结转和利息等口径未核实，交易合计与应还金额不直接作为对账差异。',
             ],
+            'model_detail_limit': detail_limit,
         }
     finally:
         conn.close()
