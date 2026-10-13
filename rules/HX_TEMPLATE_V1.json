@@ -110,6 +110,7 @@
     },
     "table_header_aliases": {},
     "accepted_structure_fingerprints": [],
-    "currency_declaration": {}
+    "currency_declaration": {},
+    "settlement_cell_symbol": {"￥": "CNY", "¥": "CNY"}
   }
 }

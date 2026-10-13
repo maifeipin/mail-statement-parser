@@ -87,8 +87,18 @@ def parse_semantic_transactions(uid, month, markdown, rule, date_parser):
    def cur_for(curkey,amountkey,declkey):
     # Explicit currency cells are claims: ambiguous/unsupported text must not
     # fall through to an otherwise valid currency-qualified amount header.
+    # 结算列单元格符号证据(￥/¥→CNY): 仅模板在 quality.settlement_cell_symbol 中
+    # 显式声明的银行/列启用; 不覆盖显式币种与冲突证据, 且仅作用于结算列。
+    symbols=(rule.get('quality') or {}).get('settlement_cell_symbol') if declkey=='settlement_currency' else None
+    def symbol_hit():
+     if not symbols: return None
+     hits={c for s,c in symbols.items() if s and s in get(amountkey)}
+     return next(iter(hits)) if len(hits)==1 else None
     if get(curkey) and not currency_evidence(get(curkey)):
-     return None,None
+     # 已复核声明符号映射的模板: 无证据的币种列文本(如商户代码)仍阻断表头/单元格
+     # 显式证据, 但允许单元格符号兜底; 未声明模板维持原样拒绝。
+     hit=symbol_hit()
+     return (hit,'cell_symbol') if hit else (None,None)
     evidences=[currency_evidence(get(curkey)),currency_evidence(get(amountkey))]
     if amountkey in mapping: evidences.append(currency_evidence(headers[mapping[amountkey]]))
     explicit={x for x in evidences if x}
@@ -96,7 +106,10 @@ def parse_semantic_transactions(uid, month, markdown, rule, date_parser):
     if explicit: return next(iter(explicit)),'extracted'
     # Only independently reviewed declarations, never hard-coded historical defaults.
     declared=declaration.get(declkey) if declaration.get('evidence') else None
-    return (declared,'rule_declared') if declared in set(CURRENCIES.values()) else (None,None)
+    if declared in set(CURRENCIES.values()):
+     return declared,'rule_declared'
+    hit=symbol_hit()
+    return (hit,'cell_symbol') if hit else (None,None)
    cur,cur_source=cur_for('currency','amount','settlement_currency')
    orig,orig_source=cur_for('original_currency','original_amount','original_currency')
    original=number(get('original_amount')) if get('original_amount') else None
@@ -208,4 +221,4 @@ def stored_purpose(raw_fields_json, purpose):
 
 
 def confirmed_currency(currency, source):
- return source in ('extracted','rule_declared') and currency in set(CURRENCIES.values())
+ return source in ('extracted','rule_declared','cell_symbol') and currency in set(CURRENCIES.values())

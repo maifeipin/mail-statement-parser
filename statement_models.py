@@ -97,7 +97,7 @@ class StatementBalanceRecord:
     currency: str                   # 'CNY' / 'USD' / ...；无证据用 'UNKNOWN'
     total_due: Optional[str] = None
     minimum_due: Optional[str] = None
-    currency_source: Optional[str] = None   # rule_declared / legacy_assumed / NULL
+    currency_source: Optional[str] = None   # rule_declared / cell_symbol / legacy_assumed / NULL
     evidence: dict = _dc_field(default_factory=dict)
 
 
@@ -132,7 +132,7 @@ class StatementTransactionRecord:
     description: str = ""
     amount: Optional[str] = None
     currency: str = "CNY"
-    # 币种证据来源：rule_declared / legacy_assumed / NULL（未知）。禁止从地区代码推导。
+    # 币种证据来源：extracted / rule_declared / cell_symbol / legacy_assumed / NULL（未知）。禁止从地区代码推导。
     currency_source: Optional[str] = None
     txn_location_code: Optional[str] = None
     original_amount: Optional[str] = None

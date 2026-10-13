@@ -156,6 +156,7 @@
       }
     ],
     "currency_declaration": {},
+    "settlement_cell_symbol": {"￥": "CNY", "¥": "CNY"},
     "baseline_provenance": {
       "fixture": "tests/fixtures/cmb_reviewed_statement.eml",
       "basis": "Synthetic regression derived from the existing eight-column CMB parser contract and user-supplied GOOGLE*CHATGPT row; not a newly collected bank template",
