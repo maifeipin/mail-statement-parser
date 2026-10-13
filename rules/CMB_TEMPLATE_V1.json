@@ -116,6 +116,7 @@
   },
   "template_version": "CMB_TEMPLATE_V1.20261011",
   "quality": {
+    "monitor_structure": true,
     "required_fields_by_purpose": {
       "financial_summary": [
         "statement_month",
@@ -157,6 +158,7 @@
     ],
     "currency_declaration": {},
     "settlement_cell_symbol": {"￥": "CNY", "¥": "CNY"},
+    "settlement_numeric_code_column": true,
     "baseline_provenance": {
       "fixture": "tests/fixtures/cmb_reviewed_statement.eml",
       "basis": "Synthetic regression derived from the existing eight-column CMB parser contract and user-supplied GOOGLE*CHATGPT row; not a newly collected bank template",

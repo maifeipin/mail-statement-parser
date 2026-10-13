@@ -204,6 +204,21 @@ def diagnose_missing_field(field: str, source: str, reason: str,
     return None
 
 
+def diagnose_configured_missing(rule: Dict, fields_meta: Dict, evidence_ref=None) -> List[Diagnostic]:
+    """Configured critical fields need an alert even if parse_status permits them."""
+    diagnostics = []
+    fields = (rule.get('extract_rules') or {}).get('statement_fields') or {}
+    for field in fields:
+        meta = fields_meta.get(field) or {}
+        if field not in FIELD_PURPOSE_MATRIX or meta.get('value') not in (None, ''):
+            continue
+        diag = diagnose_missing_field(field, meta.get('source', 'unknown'),
+            (meta.get('evidence') or {}).get('reason', '关键字段未取得可靠值'), evidence_ref)
+        if diag:
+            diagnostics.append(diag)
+    return diagnostics
+
+
 def diagnose_currency(txn_stats: Dict, evidence_ref: Optional[dict] = None) -> List[Diagnostic]:
     """币种诊断：存在原币金额但无原币币种证据 → CURRENCY_UNKNOWN（只阻 fx_analysis）。"""
     diags = []
@@ -242,9 +257,13 @@ def diagnose_coverage(txn_stats: Dict, evidence_ref: Optional[dict] = None) -> L
 
 
 def diagnose_format(fingerprint: Dict, rule: Dict, evidence_ref: Optional[dict] = None) -> List[Diagnostic]:
-    """格式变化：结构指纹偏离人工确认基线 → FORMAT_CHANGED。无基线时静默。"""
+    """格式变化与缺失基线分开诊断；不自动把新结构批准为基线。"""
     accepted = ((rule.get('quality') or {}).get('accepted_structure_fingerprints') or [])
     if not accepted:
+        if (rule.get('quality') or {}).get('monitor_structure') and fingerprint.get('table_block_count', 0):
+            return [Diagnostic(code='FORMAT_BASELINE_MISSING', field='structure', severity='warning',
+                reason='已检测到交易表，但尚无已确认格式基线；请核对模板后建立基线',
+                affected_purposes=['transaction_trends', 'fx_analysis'], evidence_ref=evidence_ref)]
         return []
     if fingerprint_matches_baseline(fingerprint, accepted):
         return []

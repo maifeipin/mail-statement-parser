@@ -154,6 +154,7 @@ def snapshot(db_path, months=1, detail_limit=20, today=None):
             params = (row['id'],) if anchored else (row['bank_code'], row['uid'], row['account_name'])
             for txn in conn.execute(query, params).fetchall():
                 item = dict(txn)
+                item.update(original_currency_display(item))
                 item['purpose_availability'] = availability[row['id']]
                 txns.append(item)
         txns = list({row['id']: row for row in txns}.values())
@@ -295,6 +296,32 @@ def snapshot(db_path, months=1, detail_limit=20, today=None):
         }
     finally:
         conn.close()
+
+
+def original_currency_display(txn):
+    """Display source tokens separately from confirmed currencies and locations."""
+    try:
+        raw = json.loads(txn.get('raw_row_json') or '{}')
+    except (TypeError, ValueError):
+        raw = {}
+    if not isinstance(raw, dict):
+        raw = {}
+    evidence = raw.get('currency_evidence') or {}
+    original = (evidence.get('original') or {}) if isinstance(evidence, dict) else {}
+    if not isinstance(original, dict):
+        original = {}
+    cell = str(original.get('cell') or '')
+    amount_cell = str(original.get('amount_cell') or '')
+    if not amount_cell and isinstance(raw.get('column_semantics'), list) and isinstance(raw.get('cols'), list):
+        semantics, cols = raw['column_semantics'], raw['cols']
+        if semantics.count('original_amount') == 1:
+            index = semantics.index('original_amount')
+            if index < len(cols):
+                amount_cell = str(cols[index] or '')
+    tokens = list(dict.fromkeys(re.findall(r'(?<![A-Za-z])[A-Za-z]{3}(?![A-Za-z])|[￥¥$＄€£₩]', amount_cell)))
+    return {'original_currency_token': cell[:100] or '/'.join(tokens)[:100],
+            'original_amount_raw': amount_cell[:200],
+            'original_currency_confirmed': confirmed_currency(txn.get('original_currency'), txn.get('original_currency_source'))}
 
 
 def merchant_of(desc):

@@ -22,10 +22,15 @@ CURRENCIES = {'CNY':'CNY','RMB':'CNY','人民币':'CNY','USD':'USD','美元':'US
  'GBP':'GBP','英镑':'GBP','AUD':'AUD','澳元':'AUD','CAD':'CAD','加元':'CAD',
  'SGD':'SGD','新加坡元':'SGD','CHF':'CHF','瑞士法郎':'CHF','KRW':'KRW','韩元':'KRW'}
 
-def currency_evidence(text):
+def currency_claims(text):
  tokens = re.findall(r'(?<![A-Za-z])[A-Za-z]{3}(?![A-Za-z])|人民币|美元|日元|欧元|港币|英镑|澳元|加元|新加坡元|瑞士法郎|韩元', text or '')
- currencies = {CURRENCIES[t.upper() if t.isascii() else t] for t in tokens if (t.upper() if t.isascii() else t) in CURRENCIES}
+ return {CURRENCIES[t.upper() if t.isascii() else t] for t in tokens
+         if (t.upper() if t.isascii() else t) in CURRENCIES}
+
+def currency_evidence(text):
+ currencies = currency_claims(text)
  return next(iter(currencies)) if len(currencies)==1 else None
+
 
 def number(text):
  cleaned = re.sub(r'CNY|RMB|USD|JPY|EUR|HKD|GBP|AUD|CAD|SGD|CHF|KRW|人民币|美元|日元|欧元|港币|英镑|澳元|加元|新加坡元|瑞士法郎|韩元', '', text or '', flags=re.I)
@@ -95,13 +100,19 @@ def parse_semantic_transactions(uid, month, markdown, rule, date_parser):
      hits={c for s,c in symbols.items() if s and s in get(amountkey)}
      return next(iter(hits)) if len(hits)==1 else None
     if get(curkey) and not currency_evidence(get(curkey)):
-     # 已复核声明符号映射的模板: 无证据的币种列文本(如商户代码)仍阻断表头/单元格
-     # 显式证据, 但允许单元格符号兜底; 未声明模板维持原样拒绝。
-     hit=symbol_hit()
-     return (hit,'cell_symbol') if hit else (None,None)
-    evidences=[currency_evidence(get(curkey)),currency_evidence(get(amountkey))]
-    if amountkey in mapping: evidences.append(currency_evidence(headers[mapping[amountkey]]))
-    explicit={x for x in evidences if x}
+     # Only a separately opted-in numeric code column is non-currency data.
+     # Ambiguous/unsupported currency claims never reach symbol fallback.
+     code_column = (declkey == 'settlement_currency' and symbols and
+                    (rule.get('quality') or {}).get('settlement_numeric_code_column') and
+                    re.fullmatch(r'[0-9]{4}', get(curkey).strip()))
+     if not code_column:
+      return None,None
+    claims = [currency_claims(get(curkey)), currency_claims(get(amountkey))]
+    if amountkey in mapping:
+     claims.append(currency_claims(headers[mapping[amountkey]]))
+    if any(len(c) > 1 for c in claims):
+     return None,None
+    explicit = set().union(*claims)
     if len(explicit)>1: return None,None
     if explicit: return next(iter(explicit)),'extracted'
     # Only independently reviewed declarations, never hard-coded historical defaults.

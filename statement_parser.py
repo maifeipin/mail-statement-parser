@@ -33,7 +33,7 @@ from mail_quality import (
     split_markdown_table_blocks, dedupe_table_blocks, structure_fingerprint,
     detect_suspicious_statement, diagnose_currency, diagnose_coverage, diagnose_format,
     diagnose_missing_field, missing_fields_by_purpose, events_from_diagnostics,
-    make_case_key,
+    make_case_key, diagnose_configured_missing,
 )
 
 from statement_evidence import html_element_values, field_meta, parse_semantic_transactions, detail_fingerprint, purpose_availability, confirmed_currency
@@ -1177,6 +1177,9 @@ def validate_and_save_email_message(msg, uid, rules=None, account_name=None, *, 
                         for existing_diag in diagnostics:
                             if existing_diag.code == diag.code and existing_diag.field == diag.field:
                                 existing_diag.affected_purposes = sorted(set(existing_diag.affected_purposes + diag.affected_purposes))
+        for diag in diagnose_configured_missing(rule, fields_meta, evidence_ref):
+            if not any(d.code == diag.code and d.field == diag.field for d in diagnostics):
+                diagnostics.append(diag)
         diagnostics.extend(diagnose_currency(txn_stats, evidence_ref))
         diagnostics.extend(diagnose_coverage(txn_stats, evidence_ref))
         # 结构指纹（仅当模板已配置确认基线才比较；金额/排版变化不进指纹）

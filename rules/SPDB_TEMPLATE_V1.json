@@ -95,6 +95,7 @@
   },
   "template_version": "SPDB_TEMPLATE_V1.20261011",
   "quality": {
+    "monitor_structure": true,
     "required_fields_by_purpose": {
       "financial_summary": [
         "statement_month",

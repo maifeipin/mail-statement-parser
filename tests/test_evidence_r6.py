@@ -89,9 +89,9 @@ class TestR6Evidence(unittest.TestCase):
         # CMB 八列契约: "币种"语义列实际是商户代码(如 5510), 无币种证据;
         # 声明符号映射的模板用结算单元格符号兜底, 未声明模板维持 UNKNOWN。
         md='| 交易日期 | 记账日 | 交易说明 | 人民币金额 | 币种 | 地区 | 原币金额 |\n| 0912 | 0915 | GOOGLE*CHATGPT | ¥ 125.55 | 5510 | JP | 2,860.00 |'
-        rows,_,_=parse_semantic_transactions('u','2026-10',md,self._HX_SYMBOL_RULE,_infer_date_from_any)
+        rows,_,_=parse_semantic_transactions('u','2026-10',md,{'bank_code':'CMB','quality':{'settlement_cell_symbol':{'¥':'CNY'},'settlement_numeric_code_column':True}},_infer_date_from_any)
         self.assertEqual(rows[0].currency,'CNY')
-        self.assertEqual(rows[0].currency_source,'cell_symbol')
+        self.assertEqual(rows[0].currency_source,'extracted')
         plain,_,_=parse_semantic_transactions('u','2026-10',md,{'bank_code':'CMB'},_infer_date_from_any)
         self.assertEqual(plain[0].currency,'UNKNOWN')
 
@@ -114,3 +114,38 @@ class TestR6Evidence(unittest.TestCase):
     def test_empty_detail_table_does_not_imply_missing_transactions(self):
         from mail_quality import diagnose_coverage
         self.assertEqual(diagnose_coverage({'table_block_count':1,'candidate_row_count':0,'valid_row_count':0}),[])
+
+
+class TestEvidenceMonitoring(unittest.TestCase):
+    def test_numeric_code_does_not_override_explicit_or_conflicting_currency(self):
+        rule={'bank_code':'CMB','quality':{'settlement_cell_symbol':{'¥':'CNY','￥':'CNY'},'settlement_numeric_code_column':True}}
+        for header,cell,code,expected in [('日元金额','￥100','5510','JPY'),('交易金额','JPY ￥100','5510','JPY'),('交易金额','￥100','USD/JPY','UNKNOWN'),('人民币金额','JPY ￥100','5510','UNKNOWN')]:
+            md=f'| 交易日期 | 交易描述 | {header} | 币种 |\n| 1001 | SHOP | {cell} | {code} |'
+            rows,_,_=parse_semantic_transactions('u','2026-10',md,rule,_infer_date_from_any)
+            self.assertEqual(rows[0].currency,expected)
+
+    def test_baseline_missing_changed_and_reviewed_are_distinct(self):
+        from mail_quality import diagnose_format
+        fp={'table_headers':[['txn_date','description','amount']], 'column_counts':[3], 'table_block_count':1}
+        rule={'quality':{'monitor_structure':True}}
+        self.assertEqual(diagnose_format(fp,rule)[0].code,'FORMAT_BASELINE_MISSING')
+        self.assertFalse(diagnose_format(dict(fp,table_block_count=0),rule))
+        rule['quality']['accepted_structure_fingerprints']=[fp]
+        self.assertFalse(diagnose_format(fp,rule))
+        changed=dict(fp,table_headers=[['txn_date','description','amount','original_amount']])
+        self.assertEqual(diagnose_format(changed,rule)[0].code,'FORMAT_CHANGED')
+
+    def test_all_configured_critical_missing_fields_keep_source_reason_and_zero(self):
+        from mail_quality import diagnose_configured_missing
+        rule={'extract_rules':{'statement_fields':{f:{} for f in ('due_date','statement_date','minimum_due','total_due')}}}
+        meta={'due_date':{'value':None,'source':'source_missing'},'statement_date':{'value':None,'source':'extraction_failed'},'minimum_due':{'value':None,'source':'unknown'},'total_due':{'value':'0','source':'extracted'}}
+        self.assertEqual({(d.code,d.field) for d in diagnose_configured_missing(rule,meta)}, {('SOURCE_FIELD_MISSING','due_date'),('EXTRACTION_FAILED','statement_date'),('FIELD_SOURCE_UNKNOWN','minimum_due')})
+
+    def test_original_display_keeps_symbol_and_never_guesses_currency_from_location(self):
+        from billing_readmodel import original_currency_display
+        for raw,token in [({'currency_evidence':{'original':{'amount_cell':'$2.80','cell':''}}},'$'),({'currency_evidence':{'original':{'amount_cell':'2860.00','cell':'JPY'}}},'JPY'),({'column_semantics':['original_amount'],'cols':['¥2860.00']},'¥')]:
+            result=original_currency_display({'raw_row_json':json.dumps(raw),'txn_location_code':'JP','original_currency':None})
+            self.assertEqual(result['original_currency_token'],token)
+            self.assertFalse(result['original_currency_confirmed'])
+        for raw in ('bad','[]','null'):
+            self.assertEqual(original_currency_display({'raw_row_json':raw})['original_currency_token'],'')

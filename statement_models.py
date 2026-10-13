@@ -38,7 +38,7 @@ QUALITY_PURPOSES = ('financial_summary', 'repayment_reminder', 'fx_analysis', 't
 
 # 诊断代码（重构契约 §2.1）
 DIAGNOSTIC_CODES = (
-    'FORMAT_CHANGED',              # 结构指纹偏离已确认基线
+    'FORMAT_CHANGED', 'FORMAT_BASELINE_MISSING',              # 结构指纹偏离已确认基线
     'EXTRACTION_FAILED',           # 原文有字段但提取失败/错位
     'FIELD_SOURCE_UNKNOWN',        # source evidence insufficient, require review
     'SOURCE_FIELD_MISSING',        # 原文未提供该字段
