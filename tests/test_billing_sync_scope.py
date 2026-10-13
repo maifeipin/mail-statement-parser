@@ -72,3 +72,26 @@ class BillingScopeTests(unittest.TestCase):
             self.assertEqual(result['accounts'][0]['status'], 'ok', result['accounts'])
             self.assertEqual(result['totals']['errors'], 0)
             self.assertEqual(result['totals']['associated_existing'], 1)
+
+    def test_ordinary_fetch_summaries_zero_candidate_counters_initialized(self):
+        """普通 fetch_summaries 路径: 全部命中去重时,三类计数器不得未初始化(生产 UnboundLocalError 回归)。"""
+        import mail_sync
+        with tempfile.TemporaryDirectory() as temp:
+            context = client.resolve_parser_paths(data_root=temp)
+            fake_mail = MagicMock()
+            fake_mail.list.return_value = (b'+OK', [b'1'])
+            with patch.object(mail_sync, 'init_db'), \
+                 patch.object(mail_sync, 'load_rule_files', return_value=[]), \
+                 patch('mail_client.load_accounts', return_value=[{'account': 'a@b.c', 'provider': '163'}]), \
+                 patch.object(mail_sync, 'is_graph_api', return_value=False), \
+                 patch.object(mail_sync, 'connect_pop3', return_value=fake_mail), \
+                 patch.object(mail_sync, 'pop3_uidl_map', return_value={1: 'uid-xyz'}), \
+                 patch.object(mail_sync, 'uid_exists', return_value=True), \
+                 patch.object(mail_sync, 'get_email_summary_status', return_value=('processed', 0)), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                result = mail_sync.fetch_recent_emails_and_summarize(1, context=context)
+            totals = result['totals']
+            self.assertEqual(totals['skipped_dup'], 1)
+            for key in ('associated_existing', 'identity_conflict', 'insufficient_evidence'):
+                self.assertEqual(totals[key], 0, totals)
+            self.assertEqual(result['accounts'][0]['status'], 'ok', result['accounts'])

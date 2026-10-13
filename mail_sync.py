@@ -95,6 +95,9 @@ def fetch_recent_emails_and_summarize(months=1, llm_enabled=True, account_budget
     new_summaries_total = 0
     skipped_dup_total = 0
     errors_total = 0
+    associated_existing_total = 0
+    identity_conflict_total = 0
+    insufficient_evidence_total = 0
     account_results = []
 
     high_importance_summaries = []
