@@ -152,6 +152,9 @@ def fetch_recent_emails_and_summarize(months=1, llm_enabled=True, account_budget
         new_summaries = 0
         skipped_dup = 0
         errors = 0
+        associated_existing = 0
+        identity_conflict = 0
+        insufficient_evidence = 0
 
         try:
             consecutive_old = 0
