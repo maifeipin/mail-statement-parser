@@ -102,7 +102,7 @@ class TestParserPathsIsolation(unittest.TestCase):
         msg = self._make_sample_email(uid='U-REPARSE')
         rules = statement_parser.load_rule_files()
         res1 = statement_parser.validate_and_save_email_message(
-            msg, 'U-REPARSE', rules=rules, account_name='acc_a', context=self.context_a
+            msg, 'U-REPARSE', rules=rules, account_name='acc_a', context=self.context_a, raw_bytes=msg.as_bytes()
         )
         self.assertEqual(res1.get('status'), 'saved')
 
@@ -122,6 +122,75 @@ class TestParserPathsIsolation(unittest.TestCase):
         )
         self.assertEqual(err_res.get('status'), 'error')
         self.assertEqual(err_res.get('error'), 'no_cached_body')
+
+    def test_reparse_rejects_corrupted_original_without_financial_mutation(self):
+        msg = self._make_sample_email(uid='CORRUPT')
+        result = statement_parser.validate_and_save_email_message(msg, 'CORRUPT',
+            account_name='acc_a', context=self.context_a, raw_bytes=msg.as_bytes())
+        evidence = sd.get_statement_evidence(self.context_a.db_path, result['statement_id'])
+        import sqlite3
+        with sqlite3.connect(self.context_a.db_path) as conn:
+            before = conn.execute('SELECT total_due, minimum_due, due_date FROM statements').fetchall()
+        with open(evidence['archive_path'], 'wb') as fp:
+            fp.write(b'corrupted')
+        self.assertEqual(statement_parser.reparse_cached_statement('acc_a', 'CORRUPT',
+            context=self.context_a)['error'], 'original_mime_hash_mismatch')
+        with sqlite3.connect(self.context_a.db_path) as conn:
+            self.assertEqual(conn.execute('SELECT total_due, minimum_due, due_date FROM statements').fetchall(), before)
+
+    def test_missing_original_refuses_body_reconstruction(self):
+        msg = self._make_sample_email(uid='BODY_ONLY')
+        statement_parser.validate_and_save_email_message(msg, 'BODY_ONLY',
+            account_name='acc_a', context=self.context_a)
+        result = statement_parser.reparse_cached_statement('acc_a', 'BODY_ONLY', context=self.context_a)
+        self.assertEqual(result['error'], 'no_original_mime_evidence')
+
+    def test_normal_sync_still_skips_but_explicit_reparse_runs_validation(self):
+        msg = self._make_sample_email(uid='ORIGINAL')
+        raw = msg.as_bytes()
+        first = statement_parser.validate_and_save_email_message(msg, 'ORIGINAL',
+            account_name='acc_a', context=self.context_a, raw_bytes=raw)
+        repeated = statement_parser.validate_and_save_email_message(msg, 'ORIGINAL',
+            account_name='acc_a', context=self.context_a, raw_bytes=raw)
+        self.assertEqual(repeated['status'], 'associated_existing')
+        reparsed = statement_parser.reparse_cached_statement('acc_a', 'ORIGINAL', context=self.context_a)
+        self.assertEqual(reparsed['status'], 'saved')
+        self.assertEqual(reparsed['statement_id'], first['statement_id'])
+        self.assertGreater(reparsed['run_id'], first['run_id'])
+
+    def test_reparse_blocks_confirmed_currency_downgrade(self):
+        msg = self._make_sample_email(uid='CURRENCY_GUARD')
+        first = statement_parser.validate_and_save_email_message(msg, 'CURRENCY_GUARD',
+            account_name='acc_a', context=self.context_a, raw_bytes=msg.as_bytes())
+        import sqlite3
+        with sqlite3.connect(self.context_a.db_path) as conn:
+            conn.execute("UPDATE statement_transactions SET currency='JPY', currency_source='extracted' WHERE statement_id=?", (first['statement_id'],))
+        result = statement_parser.reparse_cached_statement('acc_a', 'CURRENCY_GUARD', context=self.context_a)
+        self.assertEqual(result['status'], 'reparse_blocked')
+        self.assertIn('currency', result['changed_fields'])
+        with sqlite3.connect(self.context_a.db_path) as conn:
+            self.assertEqual(conn.execute('SELECT currency FROM statement_transactions').fetchone()[0], 'JPY')
+
+    def test_original_reparse_without_transport_anchor_does_not_create_one(self):
+        msg = self._make_sample_email(uid='HISTORICAL')
+        first = statement_parser.validate_and_save_email_message(msg, 'HISTORICAL',
+            account_name='acc_a', context=self.context_a, raw_bytes=msg.as_bytes())
+        import sqlite3
+        with sqlite3.connect(self.context_a.db_path) as conn:
+            conn.execute('DELETE FROM statement_transport_identities')
+        result = statement_parser.reparse_cached_statement('acc_a', 'HISTORICAL', context=self.context_a)
+        self.assertEqual(result['status'], 'saved')
+        self.assertEqual(result['statement_id'], first['statement_id'])
+        with sqlite3.connect(self.context_a.db_path) as conn:
+            self.assertEqual(conn.execute('SELECT COUNT(*) FROM statement_transport_identities').fetchone()[0], 0)
+
+    def test_reviewed_hx_baseline_is_narrow(self):
+        from mail_quality import diagnose_format
+        rule = next(r for r in statement_parser.load_rule_files() if r['bank_code']=='HX')
+        reviewed = {'table_headers':[['txn_date','post_date','description',None,'amount']], 'table_block_count':1}
+        self.assertFalse(diagnose_format(reviewed, rule))
+        historical = {'table_headers':reviewed['table_headers'] + [['txn_date','post_date','description',None,'amount','amount']], 'table_block_count':2}
+        self.assertEqual(diagnose_format(historical, rule)[0].code, 'FORMAT_CHANGED')
 
     def test_concurrent_contexts_no_crosstalk(self):
         """同一进程并发使用 context_a 与 context_b 处理不同邮件，互不串库"""

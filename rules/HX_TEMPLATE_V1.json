@@ -110,8 +110,33 @@
       ]
     },
     "table_header_aliases": {},
-    "accepted_structure_fingerprints": [],
+    "accepted_structure_fingerprints": [
+      {
+        "table_headers": [
+          [
+            "txn_date",
+            "post_date",
+            "description",
+            null,
+            "amount"
+          ]
+        ],
+        "column_counts": [
+          5
+        ],
+        "table_block_count": 1
+      }
+    ],
     "currency_declaration": {},
-    "settlement_cell_symbol": {"￥": "CNY", "¥": "CNY"}
+    "settlement_cell_symbol": {
+      "￥": "CNY",
+      "¥": "CNY"
+    },
+    "baseline_provenance": {
+      "basis": "Reviewed original MIME, verified SHA-256 and 111-row detail table; isolated reparse preserves monetary fields and transaction multiplicity",
+      "source_raw_sha256": "7a1e2c2ef8e4b8542fbb7e5b17e9526a4c563d802a2517ad21b73b2b9c449b9c",
+      "reviewed_on": "2026-10-14",
+      "scope": "Five-column HX detail table only; historical two-table variants not approved"
+    }
   }
 }

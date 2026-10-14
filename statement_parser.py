@@ -768,7 +768,7 @@ def _validation_result_to_dict(vr):
         ],
     }
 
-def validate_and_save_email_message(msg, uid, rules=None, account_name=None, *, context=None, raw_bytes=None, transport_kind='pop3_uidl', is_synthesized=False):
+def validate_and_save_email_message(msg, uid, rules=None, account_name=None, *, context=None, raw_bytes=None, transport_kind='pop3_uidl', is_synthesized=False, reparse_existing=False, reparse_statement_id=None):
     """从已下载的 msg 解析、校验并落库账单（三态分流）。
 
     返回 dict，status 取值：
@@ -875,7 +875,24 @@ def validate_and_save_email_message(msg, uid, rules=None, account_name=None, *, 
         canonical = find_canonical_by_transport(
             context.db_path, account_name, str(uid), bank_code=bank_code, transport_kind=transport_kind
         )
-        if canonical:
+        if reparse_existing:
+            # A canonical record may still have its historical numeric UID.
+            # Verify the immutable original against its statement index, not a
+            # fabricated transport key; replay never creates a new UID mapping.
+            import sqlite3
+            with sqlite3.connect('file:' + context.db_path + '?mode=ro', uri=True) as replay_conn:
+                replay_conn.row_factory = sqlite3.Row
+                replay_row = replay_conn.execute('SELECT * FROM statements WHERE id=? AND account_name=? AND uid=? AND bank_code=? AND message_id=?',
+                    (reparse_statement_id, account_name, str(uid), bank_code, message_id)).fetchone()
+            indexed = get_statement_evidence(context.db_path, reparse_statement_id) if replay_row else None
+            valid = (raw_bytes and not is_synthesized and indexed and
+                     indexed['raw_content_hash'] == hashlib.sha256(raw_bytes).hexdigest() and
+                     indexed['account_name'] == account_name and indexed['bank_code'] == bank_code and
+                     indexed['message_id'] == message_id)
+            if not valid or (canonical and canonical['id'] != reparse_statement_id):
+                return {'status': 'error', 'error': 'reparse_requires_original_canonical_evidence'}
+            canonical = dict(replay_row)
+        elif canonical:
             # U3: Parser 调用统一事务服务 associate_transport_identity，复用内容等价规范化规则
             source_ev = si.build_evidence_from_email_message(
                 msg, raw_bytes=raw_bytes, account_name=account_name, bank_code=bank_code,
@@ -898,14 +915,15 @@ def validate_and_save_email_message(msg, uid, rules=None, account_name=None, *, 
                 reason='canonical identity verification'
             )
             if assoc_res.get('status') in ('already_associated', 'associated'):
-                return {
-                    'status': 'associated_existing',
-                    'statement_id': canonical['id'],
-                    'uid': str(uid),
-                    'bank_code': bank_code,
-                    'message_id': message_id,
-                    'idempotent': True,
-                }
+                if not reparse_existing:
+                    return {
+                        'status': 'associated_existing',
+                        'statement_id': canonical['id'],
+                        'uid': str(uid),
+                        'bank_code': bank_code,
+                        'message_id': message_id,
+                        'idempotent': True,
+                    }
             elif assoc_res.get('status') == 'repeated_key_unverified':
                 return {
                     'status': 'repeated_key_unverified',
@@ -1107,6 +1125,31 @@ def validate_and_save_email_message(msg, uid, rules=None, account_name=None, *, 
                 t.currency_source = None
         for t in txns:
             t.account_name = account_name
+        if reparse_existing:
+            # Quality refresh cannot silently alter already recorded financial facts.
+            from collections import Counter
+            import sqlite3
+            with sqlite3.connect('file:' + context.db_path + '?mode=ro', uri=True) as guard_conn:
+                guard_conn.row_factory = sqlite3.Row
+                old_statement = guard_conn.execute('SELECT * FROM statements WHERE id=?', (canonical['id'],)).fetchone()
+                old_txns = [dict(t) for t in guard_conn.execute('SELECT * FROM statement_transactions WHERE statement_id=?', (canonical['id'],))]
+            protected = ('statement_month', 'statement_date', 'due_date', 'total_due', 'minimum_due')
+            changed = [f for f in protected if old_statement[f] not in (None, '') and str(old_statement[f]) != str(fields.get(f))]
+            def txn_key(t):
+                return (t.get('txn_date'), t.get('post_date'), t.get('description'),
+                        _safe_decimal(str(t.get('amount'))), _safe_decimal(str(t.get('original_amount'))),
+                        t.get('direction'), t.get('txn_location_code'))
+            new_txns = [vars(t) for t in txns]
+            if Counter(txn_key(t) for t in old_txns) != Counter(txn_key(t) for t in new_txns):
+                changed.append('transaction_content_or_multiplicity')
+            for currency_field, source_field in (('currency', 'currency_source'), ('original_currency', 'original_currency_source')):
+                old_known = Counter((txn_key(t), t.get(currency_field)) for t in old_txns if confirmed_currency(t.get(currency_field), t.get(source_field)))
+                new_known = Counter((txn_key(t), t.get(currency_field)) for t in new_txns if confirmed_currency(t.get(currency_field), t.get(source_field)))
+                if old_known - new_known:
+                    changed.append(currency_field)
+            if changed:
+                return {'status': 'reparse_blocked', 'statement_id': canonical['id'],
+                        'error': 'reparse_changes_financial_evidence', 'changed_fields': changed}
         # 交易行统计（覆盖缺口诊断输入）：候选/有效/拒绝 + 声明笔数（可配置正则）
         candidate_rows = semantic_stats['candidate_row_count'] if semantic_txns is not None else _count_candidate_rows(content.get('markdown', ''))
         declared_txn_count = 0
@@ -1260,23 +1303,24 @@ def validate_and_save_email_message(msg, uid, rules=None, account_name=None, *, 
                         archive_path=archive_path,
                         evidence_version=si.NORMALIZATION_VERSION
                     )
-                    associate_transport_identity(
-                        context.db_path,
-                        account_name=account_name,
-                        transport_kind=transport_kind,
-                        transport_uid=str(uid),
-                        bank_code=bank_code,
-                        statement_id=statement_id,
-                        message_id=message_id,
-                        evidence_digest=source_ev.get("complete_content_digest"),
-                        evidence_version=si.NORMALIZATION_VERSION,
-                        raw_content_hash=raw_hash,
-                        method="digest_equal",
-                        actor="auto_sync",
-                        reason="initial statement parse",
-                        source_evidence=source_ev,
-                        target_evidence=source_ev
-                    )
+                    if not reparse_existing:
+                        associate_transport_identity(
+                            context.db_path,
+                            account_name=account_name,
+                            transport_kind=transport_kind,
+                            transport_uid=str(uid),
+                            bank_code=bank_code,
+                            statement_id=statement_id,
+                            message_id=message_id,
+                            evidence_digest=source_ev.get("complete_content_digest"),
+                            evidence_version=si.NORMALIZATION_VERSION,
+                            raw_content_hash=raw_hash,
+                            method="digest_equal",
+                            actor="auto_sync",
+                            reason="initial statement parse",
+                            source_evidence=source_ev,
+                            target_evidence=source_ev
+                        )
             except Exception as e_ev:
                 ev_err = f"证据归档/索引失败: {e_ev}"
                 vr.warnings.append(ValidationIssue(code='EVIDENCE_INDEX_FAILED', field='evidence', severity='warning'))
@@ -1359,10 +1403,9 @@ def validate_and_save_email_message(msg, uid, rules=None, account_name=None, *, 
 
 
 def reparse_cached_statement(account_name, uid, *, context=None):
-    """离线重解析：优先使用 email_bodies 已缓存正文重建邮件，避免网络重拉。
+    """离线重解析已确认账单：仅使用摘要核验通过的原始 MIME 归档。
 
-    元数据（主题/发件人/日期/Message-ID）取 statements 或 email_summaries 已存记录。
-    返回与 validate_and_save_email_message 相同的 dict。
+    缓存正文不能替代原始 MIME；无可信归档时返回明确错误，不网络重拉。
     """
     if context is None:
         kwargs = {}
@@ -1380,34 +1423,36 @@ def reparse_cached_statement(account_name, uid, *, context=None):
 
     validate_write_target(context, context.db_path)
     import sqlite3
-    from email.message import EmailMessage
-    init_db(context.db_path)
-    conn = sqlite3.connect(context.db_path)
+    from urllib.parse import quote
+    if not os.path.isfile(context.db_path):
+        return {'status': 'error', 'error': 'no_cached_body'}
+    conn = sqlite3.connect('file:' + quote(context.db_path, safe='/') + '?mode=ro', uri=True)
     conn.row_factory = sqlite3.Row
     try:
-        body = conn.execute(
-            "SELECT raw_html, plain_text, markdown_tables FROM email_bodies WHERE account_name = ? AND uid = ?",
-            (account_name, str(uid))).fetchone()
-        if not body or not (body['raw_html'] or body['plain_text'] or body['markdown_tables']):
-            return {'status': 'error', 'error': 'no_cached_body'}
-        meta = conn.execute(
-            "SELECT subject, sender, email_date, message_id FROM statements WHERE account_name = ? AND uid = ? LIMIT 1",
-            (account_name, str(uid))).fetchone()
-        if not meta:
-            meta = conn.execute(
-                "SELECT subject, sender, email_date, NULL AS message_id FROM email_summaries WHERE account_name = ? AND uid = ? LIMIT 1",
-                (account_name, str(uid))).fetchone()
+        rows = conn.execute('SELECT id, bank_code FROM statements WHERE account_name=? AND uid=?',
+                            (account_name, str(uid))).fetchall()
     finally:
         conn.close()
-
-    msg = EmailMessage()
-    msg['Subject'] = (meta['subject'] if meta else '') or ''
-    msg['From'] = (meta['sender'] if meta else '') or ''
-    msg['Date'] = (meta['email_date'] if meta else '') or ''
-    if meta and meta['message_id']:
-        msg['Message-ID'] = meta['message_id']
-    msg.set_content(body['plain_text'] or '(无纯文本正文)')
-    if body['raw_html']:
-        msg.add_alternative(body['raw_html'], subtype='html')
-    return validate_and_save_email_message(msg, uid, account_name=account_name, context=context)
-
+    if not rows:
+        return {'status': 'error', 'error': 'no_cached_body'}
+    if len(rows) != 1:
+        return {'status': 'error', 'error': 'reparse_requires_unique_statement'}
+    evidence = get_statement_evidence(context.db_path, rows[0]['id'])
+    if not evidence or not evidence.get('archive_path') or not evidence.get('raw_content_hash'):
+        return {'status': 'error', 'error': 'no_original_mime_evidence'}
+    expected_path = si.get_evidence_archive_path(context.data_root, evidence['raw_content_hash'])
+    if os.path.realpath(evidence['archive_path']) != os.path.realpath(expected_path):
+        return {'status': 'error', 'error': 'original_mime_path_mismatch'}
+    validate_write_target(context, expected_path)
+    try:
+        with open(expected_path, 'rb') as source:
+            raw = source.read()
+    except OSError:
+        return {'status': 'error', 'error': 'original_mime_unavailable'}
+    if hashlib.sha256(raw).hexdigest() != evidence['raw_content_hash']:
+        return {'status': 'error', 'error': 'original_mime_hash_mismatch'}
+    from email.parser import BytesParser
+    from email import policy
+    original = BytesParser(policy=policy.default).parsebytes(raw)
+    return validate_and_save_email_message(original, uid, account_name=account_name,
+        context=context, raw_bytes=raw, reparse_existing=True, reparse_statement_id=rows[0]['id'])
