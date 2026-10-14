@@ -83,6 +83,18 @@ def _months_list(start_month, today):
     return out
 
 
+def _field_source(raw, field, value):
+    try:
+        meta=json.loads(raw or '{}').get('meta', {}).get(field, {})
+        return meta.get('source') if meta.get('value') == value else None
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+
+def _due_date_source(raw, due_date):
+    return _field_source(raw, 'due_date', due_date)
+
+
 def snapshot(db_path, months=1, detail_limit=20, today=None):
     """版本化账单快照（billing_snapshot CLI 的 data 部分，权威财务读模型契约 §4）。"""
     from datetime import date
@@ -247,7 +259,10 @@ def snapshot(db_path, months=1, detail_limit=20, today=None):
                 'bank_code': row['bank_code'],
                 'month': row['statement_month'],
                 'statement_month': row['statement_month'],
+                'updated_at': row.get('updated_at'),
+                'due_date_source': _due_date_source(row.get('raw_fields_json'), row['due_date']),
                 'due_date': row['due_date'],
+                'total_due_source': _field_source(row.get('raw_fields_json'), 'total_due', row['total_due']),
                 'total_due': row['total_due'],
                 'minimum_due': row['minimum_due'],
                 'is_paid': row['is_paid'],
