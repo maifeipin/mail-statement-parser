@@ -90,7 +90,10 @@ def _build_llm_request(endpoint, prompt, system_instruction, json_mode):
     model = endpoint.get("model", "gpt-4o-mini")
 
     if provider == "gemini":
-        if "generativelanguage.googleapis.com" not in base_url and "api.openai.com" in base_url:
+        # base_url 可能是 OpenAI 兼容格式（如 .../v1beta/openai 或 .../v1beta/openai/），
+        # 由上游（如 lite_agent 的 LLM_POOL）注入；原生 generateContent 端点必须去掉该后缀，
+        # 否则拼出的 URL 形如 .../v1beta/openai/v1beta/models/... 必然 404，导致端点池降级失效。
+        if "generativelanguage.googleapis.com" not in base_url or base_url.rstrip("/").endswith("/v1beta/openai"):
             base_url = "https://generativelanguage.googleapis.com"
         url = f"{base_url.rstrip('/')}/v1beta/models/{model}:generateContent?key={api_key}"
         payload = {"contents": [{"parts": [{"text": prompt}]}]}
