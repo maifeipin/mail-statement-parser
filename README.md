@@ -32,6 +32,8 @@
 
 ## 环境要求
 
+配置 LLM 端点 `proxy` 或 `LLM_PROXY` 时需要系统安装 `curl`。支持 SOCKS5（代理端解析 DNS）、HTTP、HTTPS 代理；代理不可用时按端点池规则报错或轮换，不回退直连。未配置代理时使用 Python 标准库请求。
+
 - Python 3.11+
 - Windows PowerShell 或任意可运行 Python 的终端
 

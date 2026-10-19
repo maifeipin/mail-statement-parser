@@ -64,6 +64,7 @@ def _resolve_llm_pool():
     base_url = os.environ.get("LLM_BASE_URL", "https://api.openai.com/v1")
     provider = os.environ.get("LLM_PROVIDER", "openai").lower()
     model = os.environ.get("LLM_MODEL", "gpt-4o-mini")
+    proxy = os.environ.get("LLM_PROXY", "")
     if not api_key:
         try:
             from mail_client import load_config  # 延迟导入避免循环依赖
@@ -78,7 +79,178 @@ def _resolve_llm_pool():
                 model = llm_cfg.get("model")
         except Exception:
             pass
-    return [{"api_key": api_key, "base_url": base_url, "provider": provider, "model": model}]
+    return [{"api_key": api_key, "base_url": base_url, "provider": provider, "model": model,
+             "proxy": proxy}]
+
+
+_OFFICIAL_GEMINI_HOST = "generativelanguage.googleapis.com"
+# 需要剥离的兼容路径后缀（仅在本 host 的路径末尾命中时剥离）
+_GEMINI_COMPAT_SUFFIXES = ("/v1beta/openai", "/v1beta")
+# 历史兜底：provider=gemini 但 base_url 仍是 OpenAI 默认值（未配置 Gemini 地址）时指向官方主机。
+# 这是既有行为，与“把任意非官方地址改为直连”无关；自定义网关一律不动。
+_GEMINI_DEFAULT_FALLBACK_HOSTS = ("api.openai.com",)
+
+
+def _normalize_gemini_base(base_url):
+    """把 Gemini 端点的 base_url 归一化为原生 generateContent 可用的基地址。
+
+    规则（按 host 精确判断，避免误伤自定义网关）：
+      - 官方主机 generativelanguage.googleapis.com：
+          * 路径以 /v1beta/openai 结尾（OpenAI 兼容层）→ 归一为 scheme://host
+          * 路径以 /v1beta 结尾（官方 API 前缀）→ 归一为 scheme://host（保证不出现重复 /v1beta）
+          * 其他路径 → 保留（拼接时会得到 .../v1beta/models/...）
+      - api.openai.com 默认值（provider=gemini 却未配置地址）→ 官方主机（历史兜底）
+      - 其他自定义网关：保留 scheme/authority/路径前缀；仅当路径以已知兼容后缀结尾时
+        剥离该后缀，网关地址本身不变。
+    """
+    from urllib.parse import urlsplit, urlunsplit
+
+    raw = (base_url or "").strip()
+    if not raw:
+        return f"https://{_OFFICIAL_GEMINI_HOST}"
+
+    parts = urlsplit(raw)
+    host = (parts.hostname or "").lower()
+    path = (parts.path or "").rstrip("/")
+    scheme = parts.scheme or "https"
+
+    if host == _OFFICIAL_GEMINI_HOST:
+        for suffix in _GEMINI_COMPAT_SUFFIXES:
+            if path.endswith(suffix):
+                path = path[: -len(suffix)]
+                break
+        return urlunsplit((scheme, parts.netloc, path, "", ""))
+
+    if host in _GEMINI_DEFAULT_FALLBACK_HOSTS:
+        return f"https://{_OFFICIAL_GEMINI_HOST}"
+
+    for suffix in _GEMINI_COMPAT_SUFFIXES:
+        if path.endswith(suffix):
+            path = path[: -len(suffix)]
+            break
+    return urlunsplit((scheme, parts.netloc, path, "", ""))
+
+
+def _curl_proxy_args(proxy):
+    """Validate proxy settings, preserving credentials and IPv6 addresses.
+
+    SOCKS5 resolves target names at the proxy, matching the production egress
+    requirement. Unsupported protocols fail explicitly rather than going direct.
+    """
+    from urllib.parse import urlsplit, urlunsplit
+    import urllib.error
+
+    raw = (proxy or "").strip()
+    if not raw:
+        return []
+    try:
+        parts = urlsplit(raw if "://" in raw else "socks5://" + raw)
+        scheme = parts.scheme.lower()
+        if scheme not in ("socks5", "socks5h", "http", "https"):
+            raise ValueError("unsupported proxy protocol")
+        if not parts.hostname or parts.path not in ("", "/") or parts.query or parts.fragment:
+            raise ValueError("invalid proxy address")
+        if parts.port is not None and not 0 < parts.port <= 65535:
+            raise ValueError("invalid proxy port")
+        scheme = "socks5h" if scheme == "socks5" else scheme
+        return ["--proxy", urlunsplit((scheme, parts.netloc, "", "", ""))]
+    except ValueError as exc:
+        raise urllib.error.URLError("Invalid or unsupported proxy configuration") from exc
+
+
+def _curl_post_json(url, headers, body_bytes, proxy, timeout):
+    """POST via configured proxy, with bounded transfer and private curl input.
+
+    Credentials go through stdin, never process arguments. The private temporary
+    directory also protects response content and is removed on every exit path.
+    Redirects are rejected rather than forwarding credential headers elsewhere.
+    """
+    import subprocess
+    import tempfile
+    import urllib.error
+
+    proxy_args = _curl_proxy_args(proxy)
+
+    def quoted(value):
+        value = str(value)
+        if any(ch in value for ch in ("\r", "\n", "\x00")):
+            raise urllib.error.URLError("Invalid curl configuration value")
+        return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+    with tempfile.TemporaryDirectory(prefix="llm_request_") as tmp:
+        req_path = os.path.join(tmp, "request.json")
+        resp_path = os.path.join(tmp, "response.json")
+        with open(req_path, "wb") as request_file:
+            request_file.write(body_bytes)
+        settings = [
+            "silent", "show-error", 'request = "POST"',
+            "max-time = " + quoted(timeout),
+            "output = " + quoted(resp_path),
+            'write-out = "%{http_code}"',
+            "url = " + quoted(url),
+            "data-binary = " + quoted("@" + req_path),
+            # Explicit proxy must not be bypassed by inherited NO_PROXY.
+            'noproxy = ""',
+        ]
+        for key, value in headers.items():
+            settings.append("header = " + quoted(f"{key}: {value}"))
+        if proxy_args:
+            settings.append("proxy = " + quoted(proxy_args[1]))
+        try:
+            proc = subprocess.run(
+                ["curl", "-q", "--config", "-"],
+                input="\n".join(settings) + "\n",
+                capture_output=True, text=True, timeout=timeout + 15,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise urllib.error.URLError(f"curl timed out ({timeout}s)") from exc
+        except OSError as exc:
+            raise urllib.error.URLError("curl unavailable or failed to start") from exc
+        # A received HTTP header is not proof that its response body completed.
+        if proc.returncode != 0:
+            raise urllib.error.URLError(f"curl transfer failed (rc={proc.returncode})")
+        try:
+            status = int((proc.stdout or "").strip())
+        except ValueError as exc:
+            raise urllib.error.URLError("curl returned an invalid HTTP status") from exc
+        if not 100 <= status <= 599:
+            raise urllib.error.URLError("curl returned no HTTP response")
+        if not 200 <= status < 300:
+            raise urllib.error.HTTPError(url, status, "HTTP request failed", {}, None)
+        try:
+            with open(resp_path, "r", encoding="utf-8") as response_file:
+                return response_file.read()
+        except (OSError, UnicodeError) as exc:
+            raise urllib.error.URLError("Cannot read completed curl response") from exc
+
+
+def _open_request(req, proxy, timeout):
+    """发请求：配置了代理就走 curl(--socks5-hostname)，否则保持 urllib 直连。"""
+    import urllib.request
+
+    if not (proxy or "").strip():
+        return urllib.request.urlopen(req, timeout=timeout)
+
+    url = req.full_url
+    headers = {k: v for k, v in req.headers.items()}
+    body = _curl_post_json(url, headers, req.data or b"", proxy, timeout)
+    return _FakeResponse(body)
+
+
+class _FakeResponse:
+    """把 curl 返回的文本包装成 urlopen 响应（仅 call_llm 用到的 read/上下文协议）。"""
+
+    def __init__(self, text):
+        self._data = text.encode("utf-8")
+
+    def read(self):
+        return self._data
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
 
 
 def _build_llm_request(endpoint, prompt, system_instruction, json_mode):
@@ -90,12 +262,13 @@ def _build_llm_request(endpoint, prompt, system_instruction, json_mode):
     model = endpoint.get("model", "gpt-4o-mini")
 
     if provider == "gemini":
-        # base_url 可能是 OpenAI 兼容格式（如 .../v1beta/openai 或 .../v1beta/openai/），
-        # 由上游（如 lite_agent 的 LLM_POOL）注入；原生 generateContent 端点必须去掉该后缀，
-        # 否则拼出的 URL 形如 .../v1beta/openai/v1beta/models/... 必然 404，导致端点池降级失效。
-        if "generativelanguage.googleapis.com" not in base_url or base_url.rstrip("/").endswith("/v1beta/openai"):
-            base_url = "https://generativelanguage.googleapis.com"
-        url = f"{base_url.rstrip('/')}/v1beta/models/{model}:generateContent?key={api_key}"
+        # 上游（如 lite_agent 的 LLM_POOL）可能注入 OpenAI 兼容格式的 base_url
+        # （.../v1beta/openai），原生 generateContent 端点必须先剥离兼容后缀，
+        # 否则拼出 .../v1beta/openai/v1beta/models/... 必然 404，端点池降级随之失效。
+        # 原生 REST 分支（SDK 不可用时的兜底）：鉴权走 Gemini 自有的
+        # x-goog-api-key 头，不是 OpenAI 的 Authorization: Bearer。
+        base_url = _normalize_gemini_base(base_url)
+        url = f"{base_url.rstrip('/')}/v1beta/models/{model}:generateContent"
         payload = {"contents": [{"parts": [{"text": prompt}]}]}
         if system_instruction:
             payload["systemInstruction"] = {"parts": [{"text": system_instruction}]}
@@ -104,7 +277,7 @@ def _build_llm_request(endpoint, prompt, system_instruction, json_mode):
             generation_config["responseMimeType"] = "application/json"
         if generation_config:
             payload["generationConfig"] = generation_config
-        req_headers = {"Content-Type": "application/json"}
+        req_headers = {"Content-Type": "application/json", "x-goog-api-key": api_key}
     else:
         url = f"{base_url.rstrip('/')}/chat/completions"
         messages = []
@@ -147,9 +320,11 @@ def call_llm(prompt: str, system_instruction: str = None, json_mode: bool = Fals
 
     last_err = None
     for endpoint in pool:
-        req, provider = _build_llm_request(endpoint, prompt, system_instruction, json_mode)
+        provider = (endpoint.get("provider") or "openai").lower()
+        proxy = endpoint.get("proxy") or ""
         try:
-            with urllib.request.urlopen(req, timeout=120) as response:
+            req, provider = _build_llm_request(endpoint, prompt, system_instruction, json_mode)
+            with _open_request(req, proxy, 120) as response:
                 resp_data = json.loads(response.read().decode('utf-8'))
             return _parse_llm_response(resp_data, provider)
         except urllib.error.HTTPError as e:
