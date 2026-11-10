@@ -13,9 +13,12 @@
 import json
 import os
 import sys
+import re
+import hashlib
 import email
 import time
 from datetime import datetime, timezone, timedelta
+from typing import Optional
 
 from statement_db import (
     init_db,
@@ -49,6 +52,71 @@ from statement_parser import (
     identify_rule,
     validate_and_save_email_message,
 )
+
+
+def _is_valid_message_id(mid_str: str) -> bool:
+    """按 RFC 5322 校验 Message-ID 是否有效且无解析缺陷（保留合法 domain-literal 与标准域名）。"""
+    if not mid_str or not isinstance(mid_str, str):
+        return False
+    clean = mid_str.strip()
+    if not (clean.startswith('<') and clean.endswith('>') and '@' in clean):
+        return False
+    test_msg = email.message.EmailMessage()
+    try:
+        test_msg['Message-ID'] = clean
+        h = test_msg['Message-ID']
+        return len(h.defects) == 0
+    except Exception:
+        return False
+
+
+def resolve_safe_message_id(raw_mid: Optional[str], account_name: str, uid: str) -> str:
+    """根据 RFC 5322 解析规则安全解析 Message-ID。
+
+    1. 若原值无缺陷（如 <a@b.com>、<a@[127.0.0.1]>），100% 原样保留，避免合法 ID 被篡改或合并；
+    2. 仅对已知的外层方括号格式（如微软 Graph API 返回的 <[...]@domain> 或 <[...] >）尝试剥除方括号修复；
+    3. 其余异常或含缺陷值（如 'bad'、缺失域名、乱码或 None），按账户名与 UID 生成稳定、带域名的合法备用 ID。
+    """
+    if raw_mid:
+        clean = str(raw_mid).strip()
+        # 1. 原值无缺陷，原样保留
+        if _is_valid_message_id(clean):
+            return clean
+
+        # 2. 针对已知外层方括号进行精准修复，修复后仍须无缺陷
+        if clean.startswith('<') and clean.endswith('>'):
+            inner = clean[1:-1].strip()
+            # 场景 A: 整串被方括号包裹 <[...] >
+            if inner.startswith('[') and inner.endswith(']'):
+                cand = f"<{inner[1:-1].strip()}>"
+                if _is_valid_message_id(cand):
+                    return cand
+            # 场景 B: 仅 local-part 外层被方括号包裹 <[...]@domain>
+            if '@' in inner:
+                local_part, domain_part = inner.split('@', 1)
+                if local_part.startswith('[') and local_part.endswith(']'):
+                    cand = f"<{local_part[1:-1].strip()}@{domain_part}>"
+                    if _is_valid_message_id(cand):
+                        return cand
+
+    # 3. 其余异常值对完整账户与 UID 的结构化组合计算稳定哈希摘要，生成合法且可区分的备用 ID（杜绝碰撞与格式缺陷）
+    key = f"{len(str(account_name))}:{account_name}:{len(str(uid))}:{uid}".encode("utf-8")
+    digest = hashlib.sha256(key).hexdigest()[:32]
+    fallback = f"<graph.{digest}@mail.local>"
+    return fallback
+
+
+def _safe_set_message_id(msg, raw_mid: Optional[str], account_name: str, uid: str) -> None:
+    """安全设置 EmailMessage 的 Message-ID，无缺陷且绝不中断处理流程。"""
+    resolved = resolve_safe_message_id(raw_mid, account_name, uid)
+    try:
+        msg['Message-ID'] = resolved
+    except Exception:
+        if 'Message-ID' in msg:
+            del msg['Message-ID']
+        key = f"{len(str(account_name))}:{account_name}:{len(str(uid))}:{uid}".encode("utf-8")
+        digest = hashlib.sha256(key).hexdigest()[:32]
+        msg['Message-ID'] = f"<fallback.{digest}@mail.local>"
 
 
 def fetch_recent_emails_and_summarize(months=1, llm_enabled=True, account_budget_s=180, *, context=None):
@@ -239,7 +307,7 @@ def fetch_recent_emails_and_summarize(months=1, llm_enabled=True, account_budget
                         msg['Subject'] = subj
                         msg['From'] = frm
                         msg['Date'] = date_str
-                        msg['Message-ID'] = msg_obj.get('internet_message_id') or f'<graph-{account_name}-{uid}>'
+                        _safe_set_message_id(msg, msg_obj.get('internet_message_id'), account_name, uid)
                         msg.set_content(body_text)
                         # 保留 HTML 原文，使账单交易明细解析器能从 HTML 表格提取 markdown
                         if msg_obj.get('html'):

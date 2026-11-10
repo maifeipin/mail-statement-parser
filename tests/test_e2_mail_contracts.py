@@ -140,3 +140,55 @@ class TestE2MailContracts(unittest.TestCase):
         self.assertEqual(result['unscoped_statement_count'],1)
         self.assertEqual(result['statement_count'],0)
         self.assertTrue(any('账期缺失' in row for row in result['anomalies']))
+
+    def test_safe_set_message_id_handles_invalid_brackets_and_fallbacks(self):
+        from email.message import EmailMessage
+        from mail_sync import _safe_set_message_id, resolve_safe_message_id, _is_valid_message_id
+
+        # 1. 合法标准 ID 原样保留，无 defects
+        res1 = resolve_safe_message_id('<valid.123@example.com>', 'acct1', 'u1')
+        self.assertEqual(res1, '<valid.123@example.com>')
+        self.assertTrue(_is_valid_message_id(res1))
+
+        # 2. 合法 domain-literal 与普通域名严格区分并原样保留，禁止合并
+        res_dl = resolve_safe_message_id('<a@[127.0.0.1]>', 'acct1', 'u2')
+        res_plain = resolve_safe_message_id('<a@127.0.0.1>', 'acct1', 'u3')
+        self.assertEqual(res_dl, '<a@[127.0.0.1]>')
+        self.assertEqual(res_plain, '<a@127.0.0.1>')
+        self.assertNotEqual(res_dl, res_plain)
+        self.assertTrue(_is_valid_message_id(res_dl))
+        self.assertTrue(_is_valid_message_id(res_plain))
+
+        # 3. 微软 Graph 邮件包含外层方括号的极端 Message-ID 精准修复
+        raw_mid = '<[488e674be63f45e4800dcd96eb1e14e6-JFZGS42D=@microsoft.com]>'
+        res_nuget = resolve_safe_message_id(raw_mid, 'ms4ai@outlook.com', 'u4')
+        self.assertEqual(res_nuget, '<488e674be63f45e4800dcd96eb1e14e6-JFZGS42D=@microsoft.com>')
+        self.assertTrue(_is_valid_message_id(res_nuget))
+
+        # 4. 备用 ID 结构化摘要：解决边界组合碰撞与连续点缺陷
+        # 4.1 组合碰撞反例验证：("a-b", "c") 与 ("a", "b-c") 必须生成不同备用 ID
+        res_comb1 = resolve_safe_message_id('bad', 'a-b', 'c')
+        res_comb2 = resolve_safe_message_id('bad', 'a', 'b-c')
+        self.assertNotEqual(res_comb1, res_comb2)
+        self.assertTrue(_is_valid_message_id(res_comb1))
+        self.assertTrue(_is_valid_message_id(res_comb2))
+
+        # 4.2 连续点反例验证：UID 为 "x..y" 时生成的备用 ID 绝无 RFC 格式缺陷
+        res_dots = resolve_safe_message_id('bad', 'my_acct', 'x..y')
+        self.assertTrue(_is_valid_message_id(res_dots))
+
+        # 4.3 None 也能生成合法的稳定备用 ID
+        res_none = resolve_safe_message_id(None, 'my_account', 'uid_777')
+        self.assertTrue(_is_valid_message_id(res_none))
+
+        # 5. 设置进 EmailMessage 断言无 defect 且成功序列化
+        msg = EmailMessage()
+        _safe_set_message_id(msg, raw_mid, 'ms4ai@outlook.com', 'u4')
+        self.assertEqual(msg['Message-ID'], '<488e674be63f45e4800dcd96eb1e14e6-JFZGS42D=@microsoft.com>')
+        self.assertEqual(len(msg['Message-ID'].defects), 0)
+        self.assertTrue(len(msg.as_bytes()) > 0)
+
+        msg_bad = EmailMessage()
+        _safe_set_message_id(msg_bad, 'bad', 'acct', 'u_bad')
+        self.assertTrue(_is_valid_message_id(str(msg_bad['Message-ID'])))
+        self.assertEqual(len(msg_bad['Message-ID'].defects), 0)
